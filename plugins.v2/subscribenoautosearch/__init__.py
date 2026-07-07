@@ -19,7 +19,7 @@ class SubscribeNoAutoSearch(_PluginBase):
     plugin_author = "local"
     plugin_config_prefix = "subscribenoautosearch_"
     plugin_order = 19
-    auth_level = 1
+    auth_level = 2
 
     _enabled = False
 
