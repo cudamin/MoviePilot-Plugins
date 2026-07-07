@@ -31,7 +31,7 @@ class SpaceCleaner(_PluginBase):
     plugin_icon = "delete.png"
     plugin_version = "3.0.0"
     plugin_label = "系统工具"
-    plugin_author = "tafei"
+    plugin_author = "cudamin"
     author_url = "https://github.com/cudamin"
     plugin_config_prefix = "spacecleaner_"
     plugin_order = 10
