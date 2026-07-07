@@ -16,7 +16,8 @@ class SubscribeNoAutoSearch(_PluginBase):
     plugin_icon = "pause.png"
     plugin_version = "1.2.0"
     plugin_label = "订阅管理"
-    plugin_author = "local"
+    plugin_author = "tafei"
+    author_url = "https://github.com/cudamin/MoviePilot-Plugins"
     plugin_config_prefix = "subscribenoautosearch_"
     plugin_order = 19
     auth_level = 2
