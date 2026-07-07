@@ -4,6 +4,7 @@
     "description": "剩余空间不足时自动删除已观看资源；智能RSS下载自动跳过已看完剧集",
     "labels": "清理",
     "version": "1.0",
+    "icon": "rss.png",
     "author": "tafei",
     "level": 2
   },
@@ -12,6 +13,7 @@
     "description": "扫描下载器种子，识别媒体信息并添加 tmdbid标签。",
     "labels": "分类",
     "version": "1.0",
+    "icon": "rss.png",
     "author": "tafei",
     "level": 2
   },
@@ -20,6 +22,7 @@
     "description": "添加订阅后阻止自动搜索资源，RSS订阅下载和手动搜索不受影响。",
     "labels": "订阅",
     "version": "1.0",
+    "icon": "rss.png",
     "author": "tafei",
     "level": 2
   }
