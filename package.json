@@ -7,9 +7,7 @@
     "icon": "rss.png",
     "author": "tafei",
     "level": 2
-  }
-}
-{
+  },
   "torrenttagger": {
     "name": "种子标签器",
     "description": "扫描下载器种子，识别媒体信息并添加 tmdbid标签。",
