@@ -31,10 +31,10 @@ class SpaceCleaner(_PluginBase):
     plugin_icon = "delete.png"
     plugin_version = "3.0.0"
     plugin_label = "系统工具"
-    plugin_author = "tafei"
+    plugin_author = "local"
     plugin_config_prefix = "spacecleaner_"
     plugin_order = 10
-    auth_level = 2
+    auth_level = 1
 
     # === 空间清理配置 ===
     _enabled = False
@@ -461,6 +461,23 @@ class SpaceCleaner(_PluginBase):
         delete_history = self._get_delete_history()
         pb = self._get_playback_pb()
         cards = []
+
+        # 新增：Webhook 配置提示
+        cards.append({
+            "component": "VAlert",
+            "props": {
+                "type": "info",
+                "variant": "tonal",
+                "dismissible": True,
+                "class": "mb-4"
+            },
+            "content": [
+                {
+                    "component": "span",
+                    "text": "如需播放进度缓存，请在 Emby 设置中配置 Webhooks 通知：Events 处勾选“播放”，目标网址格式：http://MP容器地址:3001/api/v1/webhook?token=MP设置处的API令牌。"
+                }
+            ]
+        })
 
         # 区块1：磁盘空间
         if space_info:
