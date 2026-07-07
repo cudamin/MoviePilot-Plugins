@@ -32,6 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_version = "3.0.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
+    author_url = "https://github.com/cudamin/MoviePilot-Plugins"
     plugin_config_prefix = "spacecleaner_"
     plugin_order = 10
     auth_level = 2
