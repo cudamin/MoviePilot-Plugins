@@ -31,7 +31,7 @@ class SpaceCleaner(_PluginBase):
     plugin_icon = "delete.png"
     plugin_version = "3.0.0"
     plugin_label = "系统工具"
-    plugin_author = "local"
+    plugin_author = "tafei"
     plugin_config_prefix = "spacecleaner_"
     plugin_order = 10
     auth_level = 2
