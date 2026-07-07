@@ -16,5 +16,14 @@
     "icon": "rss.png",
     "author": "tafei",
     "level": 2
+  },
+  "subscribenoautosearch": {
+    "name": "新增订阅不自动搜索",
+    "description": "添加订阅后阻止自动搜索资源，RSS订阅下载和手动搜索不受影响。",
+    "labels": "订阅",
+    "version": "1.0",
+    "icon": "rss.png",
+    "author": "tafei",
+    "level": 2
   }
 }
