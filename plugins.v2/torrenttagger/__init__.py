@@ -16,8 +16,8 @@ class TorrentTagger(_PluginBase):
     plugin_icon = "label.png"
     plugin_version = "1.2.0"
     plugin_label = "系统工具"
-    plugin_author = "tafei"
-    author_url = "https://github.com/cudamin/MoviePilot-Plugins"
+    plugin_author = "cudamin"
+    author_url = "https://github.com/cudamin"
     plugin_config_prefix = "torrenttagger_"
     plugin_order = 11
     auth_level = 2
