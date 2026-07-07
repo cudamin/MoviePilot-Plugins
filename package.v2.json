@@ -14,7 +14,7 @@
     "labels": "订阅管理",
     "version": "1.2.0",
     "icon": "pause.png",
-    "author": "local",
+    "author": "tafei",
     "level": 2
   },
   "torrenttagger": {
@@ -23,7 +23,7 @@
     "labels": "系统工具",
     "version": "1.2.0",
     "icon": "label.png",
-    "author": "local",
+    "author": "tafei",
     "level": 2
   }
 }
