@@ -34,7 +34,7 @@ class SpaceCleaner(_PluginBase):
     plugin_author = "tafei"
     plugin_config_prefix = "spacecleaner_"
     plugin_order = 10
-    auth_level = 1
+    auth_level = 2
 
     # === 空间清理配置 ===
     _enabled = False
