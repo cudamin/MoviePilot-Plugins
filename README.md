@@ -1,6 +1,4 @@
-# MoviePilot-Plugins
-
-自用AI插件库
+# 自用AI插件库
 
 空间清理器使用方法
 
