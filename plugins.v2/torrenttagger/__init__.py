@@ -19,7 +19,7 @@ class TorrentTagger(_PluginBase):
     plugin_author = "local"
     plugin_config_prefix = "torrenttagger_"
     plugin_order = 11
-    auth_level = 1
+    auth_level = 2
 
     _enabled = False
     _downloaders: List[str] = []
