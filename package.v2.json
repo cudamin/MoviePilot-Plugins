@@ -5,7 +5,7 @@
     "labels": "系统工具",
     "version": "3.0.0",
     "icon": "delete.png",
-    "author": "tafei",
+    "author": "cudamin",
     "level": 2
   },
   "subscribenoautosearch": {
@@ -14,7 +14,7 @@
     "labels": "订阅管理",
     "version": "1.2.0",
     "icon": "pause.png",
-    "author": "tafei",
+    "author": "cudamin",
     "level": 2
   },
   "torrenttagger": {
@@ -23,7 +23,7 @@
     "labels": "系统工具",
     "version": "1.2.0",
     "icon": "label.png",
-    "author": "tafei",
+    "author": "cudamin",
     "level": 2
   }
 }
