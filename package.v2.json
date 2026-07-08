@@ -7,9 +7,6 @@
     "icon": "delete.png",
     "author": "cudamin",
     "level": 1
-    "history": {
-      "v3.0.0": "无"
-      "v3.0.1": "更改删种逻辑",
   },
   "subscribenoautosearch": {
     "name": "新增订阅不自动搜索",
@@ -19,8 +16,6 @@
     "icon": "pause.png",
     "author": "cudamin",
     "level": 1
-    "history": {
-      "v1.2.0": "无",
   },
   "torrenttagger": {
     "name": "种子标签器",
@@ -30,7 +25,5 @@
     "icon": "label.png",
     "author": "cudamin",
     "level": 1
-    "history": {
-      "v1.2.0": "无",
   }
 }
