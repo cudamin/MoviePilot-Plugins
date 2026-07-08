@@ -7,6 +7,8 @@
     "icon": "delete.png",
     "author": "tafei",
     "level": 1,
+    "history": {
+      "v3.1.0": "无"
     }
   },
   "subscribenoautosearch": {
@@ -17,6 +19,8 @@
     "icon": "pause.png",
     "author": "tafei",
     "level": 1,
+    "history": {
+      "v1.2.0": "无"
     }
   },
   "torrenttagger": {
@@ -27,6 +31,8 @@
     "icon": "label.png",
     "author": "tafei",
     "level": 1,
+    "history": {
+      "v1.2.0": "无"
     }
   }
 }
