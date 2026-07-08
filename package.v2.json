@@ -20,8 +20,6 @@
     "icon": "pause.png",
     "author": "tafei",
     "level": 1,
-    "history": {
-      "v1.2.0": "无"
     }
   },
   "torrenttagger": {
@@ -32,8 +30,6 @@
     "icon": "label.png",
     "author": "tafei",
     "level": 1,
-    "history": {
-      "v1.2.0": "无"
     }
   }
 }
