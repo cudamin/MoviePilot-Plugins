@@ -13,3 +13,9 @@ http://<MP容器IP地址>:3001/api/v1/webhook?token=<MP设置里的API令牌>
 该功能需配合插件种子标签器使用
 
 <img width="347" height="175" alt="image" src="https://github.com/user-attachments/assets/acf8d9e2-9896-4756-a485-0f51679653fd" />
+
+# 同一集只下载一次
+R到多个组的时候只下第一个发布的，避免重复下载
+
+# rss下载中的阈值
+缓存中观看进度大于阈值的将被跳过下载
