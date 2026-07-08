@@ -11,4 +11,5 @@ http://<MP容器IP地址>:3001/api/v1/webhook?token=<MP设置里的API令牌>
 
 #联动删除辅种(同tmdbid标签)
 该功能需配合插件种子标签器使用
+
 <img width="347" height="175" alt="image" src="https://github.com/user-attachments/assets/acf8d9e2-9896-4756-a485-0f51679653fd" />
