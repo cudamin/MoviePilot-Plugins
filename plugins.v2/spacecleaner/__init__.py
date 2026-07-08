@@ -466,14 +466,9 @@ class SpaceCleaner(_PluginBase):
         cards.append({
             "component": "VCard",
             "props": {"variant": "flat", "class": "mb-4"},
-            "content": [
-                {"component": "VCardTitle", "props": {"class": "text-subtitle-1 font-weight-bold"}, "text": "使用提示"},
-                {"component": "VCardText", "content": [
                     {"component": "div", "text": "使用时需在 EMBY 设置中的通知处配置 Webhooks，Events 需勾选播放。"},
                     {"component": "div", "props": {"class": "mt-2"}, "text": "网址格式："},
                     {"component": "div", "props": {"class": "text-mono text-caption bg-grey-lighten-4 pa-2 rounded mt-1"}, "text": "http://<MP容器IP地址>:3001/api/v1/webhook?token=<MP设置里的API令牌>"},
-                    {"component": "div", "props": {"class": "mt-3 text-caption"}, "text": "项目地址：https://github.com/cudamin/MoviePilot-Plugins"},
-                    {"component": "div", "props": {"class": "text-caption"}, "text": "作者：tafei"},
                 ]},
             ],
         })
