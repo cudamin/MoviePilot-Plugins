@@ -5,7 +5,7 @@
     "labels": "系统工具",
     "version": "3.0.0",
     "icon": "delete.png",
-    "author": "cudamin",
+    "author": "tafei",
     "level": 1
     "history": {
       "v3.0.1": "无",
@@ -16,7 +16,7 @@
     "labels": "订阅管理",
     "version": "1.2.0",
     "icon": "pause.png",
-    "author": "cudamin",
+    "author": "tafei",
     "level": 1
     "history": {
       "v1.2.0": "无",
@@ -27,7 +27,7 @@
     "labels": "系统工具",
     "version": "1.2.0",
     "icon": "label.png",
-    "author": "cudamin",
+    "author": "tafei",
     "level": 1
     "history": {
       "v1.2.0": "无",
