@@ -18,8 +18,7 @@
     "version": "1.2.0",
     "icon": "pause.png",
     "author": "tafei",
-    "level": 1,
-    }
+    "level": 1
   },
   "torrenttagger": {
     "name": "种子标签器",
@@ -28,7 +27,6 @@
     "version": "1.2.0",
     "icon": "label.png",
     "author": "tafei",
-    "level": 1,
-    }
+    "level": 1
   }
 }
