@@ -9,7 +9,8 @@
     "level": 1,
     "history": {
       "v3.1.0": "修复bug",
-      "v3.1.1": "修复bug"
+      "v3.1.1": "修复bug",
+      "v3.1.2": "修复bug"
     }
   },
   "subscribenoautosearch": {
