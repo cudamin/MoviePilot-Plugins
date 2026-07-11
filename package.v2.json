@@ -3,7 +3,7 @@
     "name": "空间清理器",
     "description": "剩余空间不足时自动删除已观看资源；智能RSS下载自动跳过已看完剧集。",
     "labels": "系统工具",
-    "version": "3.3.0",
+    "version": "3.4.0",
     "icon": "delete.png",
     "author": "tafei",
     "level": 1,
@@ -11,8 +11,9 @@
       "v3.1.0": "修复bug",
       "v3.1.1": "修复bug",
       "v3.1.2": "修复bug",
-      "v3.2.0": "更改RSS过滤逻辑",
-      "v3.3.0": "新增删除同名种子"
+      "v3.2.0": "更改RSS过滤逻辑",     
+      "v3.3.0": "新增删除同名种子",
+      "v3.4.0": "调整RSS下载",
     }
   },
   "subscribenoautosearch": {
