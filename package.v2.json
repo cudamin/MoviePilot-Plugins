@@ -3,7 +3,7 @@
     "name": "空间清理器",
     "description": "剩余空间不足时自动删除已观看资源；智能RSS下载自动跳过已看完剧集；tmdbid标签识别。",
     "labels": "系统工具",
-    "version": "4.0.0",
+    "version": "4.0.1",
     "icon": "delete.png",
     "author": "tafei",
     "level": 1,
@@ -14,7 +14,8 @@
       "v3.2.0": "更改RSS过滤逻辑",     
       "v3.3.0": "新增删除同名种子",
       "v3.4.0": "调整RSS下载",
-      "v4.0.0": "新增自动TMDBid标签"
+      "v4.0.0": "新增自动TMDBid标签",
+      "v4.0.1": "TMDBid标签识别时优先调用本地缓存"
     }
   },
   "subscribenoautosearch": {
@@ -23,15 +24,6 @@
     "labels": "订阅管理",
     "version": "1.2.0",
     "icon": "pause.png",
-    "author": "tafei",
-    "level": 1
-  },
-  "torrenttagger": {
-    "name": "种子标签器",
-    "description": "扫描下载器种子，识别媒体信息并添加 tmdbid 标签。",
-    "labels": "系统工具",
-    "version": "1.2.0",
-    "icon": "label.png",
     "author": "tafei",
     "level": 1
   }
