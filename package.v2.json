@@ -1,6 +1,5 @@
-[
-  {
-    "id": "spacecleaner",
+{
+  "spacecleaner": {
     "name": "空间清理器",
     "description": "剩余空间不足时自动删除已观看资源；智能RSS下载自动跳过已看完剧集；tmdbid标签识别。",
     "labels": "系统工具",
@@ -12,7 +11,7 @@
       "v3.1.0": "修复bug",
       "v3.1.1": "修复bug",
       "v3.1.2": "修复bug",
-      "v3.2.0": "更改RSS过滤逻辑",
+      "v3.2.0": "更改RSS过滤逻辑",     
       "v3.3.0": "新增删除同名种子",
       "v3.4.0": "调整RSS下载",
       "v4.0.0": "新增自动TMDBid标签",
@@ -22,8 +21,7 @@
       "v4.1.2": "新增RSS板块识别错误自动发送通知；优化日志"
     }
   },
-  {
-    "id": "subscribenoautosearch",
+  "subscribenoautosearch": {
     "name": "新增订阅不自动搜索",
     "description": "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。",
     "labels": "订阅管理",
@@ -31,9 +29,11 @@
     "icon": "pause.png",
     "author": "tafei",
     "level": 1
+    "history": {
+    "v1.2.0": "初始版本"
+    }
   },
-  {
-    "id": "Unit3dChineseSubFilter",
+  "Unit3dChineseSubFilter": {
     "name": "UNIT3D 中文字幕过滤",
     "description": "在 MoviePilot 选择或下载 UNIT3D RSS 资源前，通过 API 检查 MediaInfo/BDInfo/外挂字幕。",
     "labels": "订阅,字幕,UNIT3D",
@@ -46,4 +46,4 @@
       "v0.1.0": "首个原型：ResourceSelection 候选过滤、ResourceDownload 下载前兜底、UNIT3D API 多站点配置。"
     }
   }
-]
+}
