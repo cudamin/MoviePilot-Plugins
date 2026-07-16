@@ -1,5 +1,5 @@
 {
-  "spacecleaner": {
+  "Spacecleaner": {
     "name": "空间清理器",
     "description": "剩余空间不足时自动删除已观看资源；智能RSS下载自动跳过已看完剧集；tmdbid标签识别。",
     "labels": "系统工具",
@@ -22,7 +22,7 @@
       "v4.1.3": "优化洗版过滤逻辑"
     }
   },
-  "subscribenoautosearch": {
+  "Subscribenoautosearch": {
     "name": "新增订阅不自动搜索",
     "description": "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。",
     "labels": "订阅管理",
@@ -35,7 +35,7 @@
       "v1.2.1": "2.0"
     }
   },
-  "unit3dChineseSubFilter": {
+  "Unit3dChineseSubFilter": {
     "name": "UNIT3D 简中 RSS 后备订阅",
     "description": "BLU/ATR 独立 RSS 后备源；正常站点无资源时，经订阅识别与规则过滤后用 API 检查 MediaInfo 简体中文字幕。",
     "labels": "订阅,字幕,UNIT3D",
@@ -48,7 +48,7 @@
       "v0.2.0": "重构为 BLU/ATR 双站点 RSS 后备订阅；仅检查 MediaInfo 简体字幕；接入自定义识别词、订阅过滤规则组与最低优先级缺集保护。"
     }
   },
-  "agentconfigprofile": {
+  "Agentconfigprofile": {
     "name": "智能助手配置模板",
     "description": "持久化保存智能助手的 LLM 配置与人格，支持多个模板一键快速切换。",
     "labels": "智能助手",
