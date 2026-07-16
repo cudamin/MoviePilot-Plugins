@@ -22,7 +22,7 @@
       "v4.1.3": "优化洗版过滤逻辑"
     }
   },
-  "subscribenoautosearch": {
+  "SubscribeNoAutoSearch": {
     "name": "新增订阅不自动搜索",
     "description": "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。",
     "labels": "订阅管理",
