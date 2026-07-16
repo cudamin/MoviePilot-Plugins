@@ -52,13 +52,14 @@
     "name": "智能助手配置模板",
     "description": "持久化保存智能助手的 LLM 配置与人格，支持多个模板一键快速切换。",
     "labels": "智能助手",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "icon": "agentresourceofficer.png",
     "author": "tafei",
     "level": 1,
     "history": {
       "v1.0.0": "初始版本",
-      "v1.1.0": "去除冗余功能"
+      "v1.1.0": "去除冗余功能",
+      "v1.1.1": "修复bug"
     }
   }
 }
