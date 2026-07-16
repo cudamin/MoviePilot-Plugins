@@ -39,7 +39,7 @@ class Unit3dChineseSubFilter(_PluginBase):
     plugin_icon = "rss.png"
     plugin_version = "0.2.0"
     plugin_author = "Community"
-    author_url = ""
+    author_url = "https://github.com/cudamin/MoviePilot-Plugins"
     plugin_config_prefix = "unit3d_chinese_sub_filter_"
     plugin_order = 35
     auth_level = 1
