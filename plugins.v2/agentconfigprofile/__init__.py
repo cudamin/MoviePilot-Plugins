@@ -29,7 +29,7 @@ class AgentConfigProfile(_PluginBase):
     plugin_name = "智能助手配置模板"
     plugin_desc = "持久化保存智能助手的 LLM 配置与人格，支持多个模板一键快速切换。"
     plugin_icon = "agentresourceofficer.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
     plugin_config_prefix = "agentconfigprofile_"
