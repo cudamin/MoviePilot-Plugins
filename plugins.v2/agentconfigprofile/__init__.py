@@ -8,7 +8,7 @@ from app.core.config import settings
 from app.log import logger
 from app.plugins import _PluginBase
 
-class agentconfigprofile(_PluginBase):
+class AgentConfigProfile(_PluginBase):
     """
     智能助手配置模板插件。
 
