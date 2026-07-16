@@ -40,10 +40,21 @@
     "version": "0.1.0",
     "icon": "Moviepilot_A.png",
     "author": "Community",
-    "system_version": ">=2.12.0",
     "level": 1,
     "history": {
       "v0.1.0": "首个原型：ResourceSelection 候选过滤、ResourceDownload 下载前兜底、UNIT3D API 多站点配置。"
+    }
+  },
+  "agentconfigprofile": {
+    "name": "智能助手配置模板",
+    "description": "持久化保存智能助手的 LLM 配置与人格，支持多个模板一键快速切换。",
+    "labels": "智能助手",
+    "version": "1.0.0",
+    "icon": "agentresourceofficer.png",
+    "author": "tafei",
+    "level": 1
+    "history": {
+      "v1.0.0": "初始版本"
     }
   }
 }
