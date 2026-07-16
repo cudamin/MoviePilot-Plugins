@@ -48,7 +48,7 @@
       "v0.2.0": "重构为 BLU/ATR 双站点 RSS 后备订阅；仅检查 MediaInfo 简体字幕；接入自定义识别词、订阅过滤规则组与最低优先级缺集保护。"
     }
   },
-  "agentconfigprofile": {
+  "AgentConfigProfile": {
     "name": "智能助手配置模板",
     "description": "持久化保存智能助手的 LLM 配置与人格，支持多个模板一键快速切换。",
     "labels": "智能助手",
