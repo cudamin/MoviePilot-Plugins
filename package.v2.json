@@ -3,7 +3,7 @@
     "name": "空间清理器",
     "description": "剩余空间不足时自动删除已观看资源；智能RSS下载自动跳过已看完剧集；tmdbid标签识别。",
     "labels": "系统工具",
-    "version": "4.1.3",
+    "version": "4.1.4",
     "icon": "delete.png",
     "author": "tafei",
     "level": 1,
