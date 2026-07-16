@@ -26,7 +26,7 @@ from app.schemas.types import EventType, MediaImageType, MediaType
 from app.utils.http import RequestUtils
 
 
-class spaceCleaner(_PluginBase):
+class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源；智能RSS下载自动跳过已看完剧集；tmdbid标签识别。"
     plugin_icon = "delete.png"
