@@ -26,13 +26,14 @@
     "name": "新增订阅不自动搜索",
     "description": "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。",
     "labels": "订阅管理",
-    "version": "1.2.1",
+    "version": "1.2.2",
     "icon": "pause.png",
     "author": "tafei",
     "level": 1,
     "history": {
       "v1.2.0": "初始版本",
       "v1.2.1": "2.0"
+      "v1.2.2": "删除数据页面"
     }
   },
   "Unit3dChineseSubFilter": {
