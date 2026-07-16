@@ -8,7 +8,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import EventType
 
 
-class subscribeNoAutoSearch(_PluginBase):
+class subscribenoautosearch(_PluginBase):
     """新增订阅不自动搜索插件。"""
 
     plugin_name = "新增订阅不自动搜索"
