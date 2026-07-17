@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源；智能RSS下载自动跳过已看完剧集；tmdbid标签识别。"
     plugin_icon = "delete.png"
-    plugin_version = "4.1.4"
+    plugin_version = "4.1.5"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -537,10 +537,8 @@ class SpaceCleaner(_PluginBase):
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "delete_count", "label": "单次删除资源数", "type": "number", "min": 1}}]},
                 ]},
                 {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "watched_threshold", "label": "标记已看播放进度阈值（%）", "type": "number", "min": 1, "max": 100, "hint": "播放进度达到此百分比时标记为已观看", "persistent-hint": True}}]},
-                ]},
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VSelect", "props": {"model": "clean_downloader", "label": "扫描下载器", "items": dls, "multiple": True, "chips": True, "clearable": True, "hint": "删种时扫描的下载器，留空扫描全部", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "watched_threshold", "label": "标记已看播放进度阈值（%）", "type": "number", "min": 1, "max": 100, "hint": "播放进度达到此百分比时标记为已观看", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [{"component": "VSelect", "props": {"model": "clean_downloader", "label": "扫描下载器", "items": dls, "multiple": True, "chips": True, "clearable": True, "hint": "删种时扫描的下载器，留空扫描全部", "persistent-hint": True}}]},
                 ]},
             ],
         }
@@ -776,6 +774,11 @@ class SpaceCleaner(_PluginBase):
                     {"component": "VBtn", "props": {"color": "error", "variant": "text", "size": "x-small"},
                      "text": "删除",
                      "events": {"click": {"api": "plugin/SpaceCleaner/del_pb_item", "method": "get",
+                                          "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}})
+                op_buttons.append(
+                    {"component": "VBtn", "props": {"color": "success", "variant": "text", "size": "x-small"},
+                     "text": "已看",
+                     "events": {"click": {"api": "plugin/SpaceCleaner/pb_mark_watched", "method": "get",
                                           "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}})
                 table_rows.append({"component": "div", "props": {"class": "d-flex align-center px-3 py-2 border-t text-caption"}, "content": [
                     {"component": "div", "props": {"style": "flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"}, "text": item["title"]},
@@ -1437,11 +1440,14 @@ class SpaceCleaner(_PluginBase):
             return True, season_num, [int(episodes_str)]
         return None, season_num, []
 
+    # 删除记录缓存上限：保留最近 50 条，避免占用过多存储空间与读取开销
+    _DELETE_HISTORY_MAX = 50
+
     def _add_delete_history(self, title: str, action: str):
         h = self.get_data("delete_history") or []
         h.append({"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "title": title, "action": action})
-        if len(h) > 200:
-            h = h[-200:]
+        if len(h) > self._DELETE_HISTORY_MAX:
+            h = h[-self._DELETE_HISTORY_MAX:]
         self.save_data("delete_history", h)
 
     def _get_delete_history(self) -> List[Dict[str, str]]:
