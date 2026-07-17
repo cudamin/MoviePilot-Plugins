@@ -34,7 +34,7 @@ from .core import (
 
 
 class Unit3dChineseSubFilter(_PluginBase):
-    plugin_name = "UNIT3D 简中 RSS 后备订阅"
+    plugin_name = "UNIT3D 简中 RSS 后备订阅 测试版"
     plugin_desc = "BLU/ATR 独立 RSS 后备源；正常站点无资源时，经订阅识别与规则过滤后用 API 检查 MediaInfo 简体中文字幕。"
     plugin_icon = "rss.png"
     plugin_version = "0.2.0"
