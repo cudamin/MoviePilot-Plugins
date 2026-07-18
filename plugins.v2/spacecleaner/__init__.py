@@ -28,9 +28,9 @@ from app.utils.http import RequestUtils
 
 class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
-    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，合集需整季看完，含辅种）；智能RSS下载自动跳过已看完剧集。"
+    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，合集需整季看完，含辅种及同集/同片的不同版本）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.2.0"
+    plugin_version = "4.2.2"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -48,6 +48,7 @@ class SpaceCleaner(_PluginBase):
     _dry_run = False
     _delete_same_size = True
     _delete_cross_seeds = True  # 删种时同时删除辅种（内容相同、tracker 不同的种子），含非 MP 管理的种子
+    _delete_other_versions = True  # 删种时检索整理记录，删除同一集/同一部电影的其他版本
     _notify = True
     _media_cache_disabled = False  # 关闭媒体缓存（默认开启）
     _pb_page = 1
@@ -103,6 +104,7 @@ class SpaceCleaner(_PluginBase):
         self._delete_by_target = self._dry_run = self._notify = False
         self._delete_same_size = True
         self._delete_cross_seeds = True
+        self._delete_other_versions = True
         self._media_cache_disabled = False
         self._pb_page = 1
         self._pb_sort_by = "time"
@@ -137,6 +139,7 @@ class SpaceCleaner(_PluginBase):
         self._dry_run = bool(config.get("dry_run"))
         self._delete_same_size = bool(config.get("delete_same_size"))
         self._delete_cross_seeds = bool(config.get("delete_cross_seeds", True))
+        self._delete_other_versions = bool(config.get("delete_other_versions", True))
         self._notify = bool(config.get("notify", True))
         self._media_cache_disabled = bool(config.get("media_cache_disabled", False))
         try:
@@ -209,7 +212,7 @@ class SpaceCleaner(_PluginBase):
             "delete_by_target": self._delete_by_target, "target_free_percent": self._target_free_percent,
             "delete_count": self._delete_count, "check_interval": self._check_interval,
             "dry_run": self._dry_run, "delete_same_size": self._delete_same_size,
-            "delete_cross_seeds": self._delete_cross_seeds, "notify": self._notify,
+            "delete_cross_seeds": self._delete_cross_seeds, "delete_other_versions": self._delete_other_versions, "notify": self._notify,
             "media_cache_disabled": self._media_cache_disabled, "pb_page": self._pb_page, "run_now": False,
             "pb_sort_by": self._pb_sort_by, "pb_sort_desc": self._pb_sort_desc,
             "pb_filter_watched": self._pb_filter_watched, "watched_threshold": self._watched_threshold,
@@ -508,7 +511,14 @@ class SpaceCleaner(_PluginBase):
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_by_target", "label": "按目标百分比删除", "hint": "持续删除资源直到剩余空间达到目标百分比", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_cross_seeds", "label": "删除辅种", "hint": "删种时同时删除内容相同、tracker 不同的辅种（含非 MP 管理的种子）", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_other_versions", "label": "删除不同版本", "hint": "删种时检索整理记录，删除同一集/同一部电影的不同版本（不同分辨率、字幕组等）", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "media_cache_disabled", "label": "关闭媒体缓存", "hint": "开启后不再接收播放进度，也不新增播放记录", "persistent-hint": True}}]},
+                ]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [
+                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mb-0"},
+                         "content": [{"component": "div", "props": {"class": "text-caption"}, "text": "「删除不同版本」：删种时会检索媒体整理记录，把同一集电视剧或同一部电影的其他版本（不同分辨率、编码、字幕组、发布组等）一并删除，包括它们对应的源文件、媒体库文件、下载器种子（含辅种）及整理记录。电视剧按 tmdbid + 季 + 集号匹配，电影按 tmdbid 匹配。"}]}
+                    ]},
                 ]},
                 {"component": "VDivider", "props": {"class": "my-2"}},
                 {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1 mt-2"}, "text": "清理参数"},
@@ -577,7 +587,7 @@ class SpaceCleaner(_PluginBase):
             "enabled": False, "min_free_percent": 10,
             "delete_by_target": False, "target_free_percent": 20,
             "delete_count": 1, "check_interval": 6,
-            "dry_run": False, "delete_same_size": False, "delete_cross_seeds": True, "notify": True,
+            "dry_run": False, "delete_same_size": False, "delete_cross_seeds": True, "delete_other_versions": True, "notify": True,
             "media_cache_disabled": False, "pb_page": 1, "clean_downloader": [], "run_now": False,
             "pb_sort_by": "time", "pb_sort_desc": True, "pb_filter_watched": True, "pb_search": "", "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
@@ -1189,13 +1199,18 @@ class SpaceCleaner(_PluginBase):
         display_name = unit["display"]
         download_hash = unit["hash"]
         tmdbid = unit["tmdbid"]
+        # 其他版本：同一集/同一部电影的不同发布版本（分辨率、字幕组、编码等）
+        other_versions = self._find_other_version_records(records) if self._delete_other_versions else []
         if self._dry_run:
-            logger.info(f"【试运行】将删除: {display_name}（{len(records)} 条记录）")
-            self._add_delete_history(display_name, "试运行 - 将删除")
+            extra = f"，另含不同版本 {len(other_versions)} 条" if other_versions else ""
+            logger.info(f"【试运行】将删除: {display_name}（{len(records)} 条记录{extra}）")
+            self._add_delete_history(display_name, "试运行 - 将删除" + extra)
             return
         try:
-            # 删除该单元下所有集的源文件与媒体库文件
-            for rec in records:
+            # 需要处理的全部记录 = 该单元记录 + 其他版本记录
+            all_recs = records + other_versions
+            # 删除源文件与媒体库文件
+            for rec in all_recs:
                 for path_str in (rec.get("src", ""), rec.get("dest", "")):
                     if not path_str:
                         continue
@@ -1207,11 +1222,18 @@ class SpaceCleaner(_PluginBase):
                         self._safe_delete_path(pp)
             # 从下载器删除主种子及其辅种（同时删除文件）
             self._delete_downloader_torrents(chain, download_hash, display_name, all_torrents)
-            # 用独立 session 删除该单元的所有转移记录
+            # 其他版本各自对应的种子也一并删除（含其辅种）
+            seen_hashes = {download_hash}
+            for rec in other_versions:
+                dh = rec.get("download_hash", "")
+                if dh and dh not in seen_hashes:
+                    seen_hashes.add(dh)
+                    self._delete_downloader_torrents(chain, dh, rec.get("title", "其他版本"), all_torrents)
+            # 用独立 session 删除所有相关转移记录
             from app.db import ScopedSession
             ds = ScopedSession()
             try:
-                for rec in records:
+                for rec in all_recs:
                     r = ds.query(TransferHistory).filter(TransferHistory.id == rec["id"]).first()
                     if r:
                         ds.delete(r)
@@ -1220,13 +1242,109 @@ class SpaceCleaner(_PluginBase):
                 ds.close()
             # 从 pb 缓存中删除该 tmdbid 对应的条目
             self._delete_pb_by_tmdbid(tmdbid)
-            self._add_delete_history(display_name, f"已删除（{len(records)} 条记录）")
+            if other_versions:
+                logger.info(f"已删除不同版本 {len(other_versions)} 条: {display_name}")
+            extra = f"，含不同版本 {len(other_versions)} 条" if other_versions else ""
+            self._add_delete_history(display_name, f"已删除（{len(records)} 条记录{extra}）")
             if self._notify:
+                ver_line = f"\n不同版本: {len(other_versions)} 条" if other_versions else ""
                 self.post_message(title="空间清理器 - 资源已删除",
-                                  text=f"资源: {display_name}\n当前剩余空间: {space_info['free_gb']:.2f} GB ({space_info['free_percent']:.1f}%)")
+                                  text=f"资源: {display_name}{ver_line}\n当前剩余空间: {space_info['free_gb']:.2f} GB ({space_info['free_percent']:.1f}%)")
         except Exception as e:
             logger.error(f"删除 {display_name} 失败: {str(e)}")
             self._add_delete_history(display_name, f"删除失败: {str(e)}")
+
+    @staticmethod
+    def _norm_season(seasons: str) -> Optional[int]:
+        """规范化季号：'S01' / '1' -> 1；无效返回 None。"""
+        s = (seasons or "").strip().upper().replace("S", "")
+        return int(s) if s.isdigit() else None
+
+    @staticmethod
+    def _episode_set(episodes: str) -> set:
+        """解析集号字符串为集号集合，支持 E01、E01-E12、E01,E03、01~12 等格式。"""
+        e_str = (episodes or "").strip().upper().replace("E", "")
+        if not e_str:
+            return set()
+        result = set()
+        for part in re.split(r'[,\s]+', e_str):
+            if not part:
+                continue
+            m = re.match(r'^(\d+)\s*[-~]\s*(\d+)$', part)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                if a <= b:
+                    result.update(range(a, b + 1))
+            elif part.isdigit():
+                result.add(int(part))
+        return result
+
+    def _find_other_version_records(self, unit_records: List[dict]) -> List[dict]:
+        """检索整理记录，找出同一集/同一部电影的其他发布版本。
+
+        判定标准：
+        - 电影：同一 tmdbid 的其他电影记录（不同分辨率、编码、字幕组等）。
+        - 电视剧：同一 tmdbid + 同一季，且集号有交集的其他记录。
+        排除本删除单元已包含的记录（按记录 id 去重）。返回记录快照字典列表。
+        """
+        unit_ids = {r["id"] for r in unit_records}
+        # 从本单元记录中提取待匹配的 (tmdbid, 类型, 季, 集集合)
+        tmdbids = {r.get("tmdbid") for r in unit_records if r.get("tmdbid")}
+        if not tmdbids:
+            return []
+        # 汇总本单元每个 tmdbid 涉及的 电影/电视剧 季集
+        movie_tmdbids = set()
+        tv_seasons: Dict[tuple, set] = {}  # (tmdbid, season) -> 集号集合
+        for r in unit_records:
+            tid = r.get("tmdbid")
+            if not tid:
+                continue
+            if r.get("type") == "电视剧":
+                season = self._norm_season(r.get("seasons", ""))
+                if season is None:
+                    continue
+                eps = self._episode_set(r.get("episodes", ""))
+                tv_seasons.setdefault((tid, season), set()).update(eps)
+            else:
+                movie_tmdbids.add(tid)
+
+        found: Dict[int, dict] = {}
+        try:
+            from app.db import ScopedSession
+            sess = ScopedSession()
+            try:
+                recs = sess.query(TransferHistory).filter(
+                    TransferHistory.tmdbid.in_(list(tmdbids)),
+                    TransferHistory.status == True
+                ).all()
+                for r in recs:
+                    if r.id in unit_ids or r.id in found:
+                        continue
+                    tid = r.tmdbid
+                    if (r.type or "") == "电视剧":
+                        season = self._norm_season(r.seasons or "")
+                        if season is None or (tid, season) not in tv_seasons:
+                            continue
+                        target_eps = tv_seasons[(tid, season)]
+                        rec_eps = self._episode_set(r.episodes or "")
+                        # 集号有交集才视为同一集的其他版本
+                        if not rec_eps or not (rec_eps & target_eps):
+                            continue
+                    else:
+                        if tid not in movie_tmdbids:
+                            continue
+                    found[r.id] = {
+                        "id": r.id, "title": r.title or "未知", "type": r.type or "",
+                        "seasons": r.seasons or "", "episodes": r.episodes or "",
+                        "src": r.src or "", "dest": r.dest or "", "tmdbid": tid,
+                        "download_hash": r.download_hash or "",
+                    }
+            finally:
+                sess.close()
+        except Exception as e:
+            logger.error(f"检索其他版本失败: {str(e)}")
+            return []
+        return list(found.values())
 
     def _delete_pb_by_tmdbid(self, tmdbid: Optional[int]):
         """从 pb 缓存中删除指定 tmdbid 的所有条目。"""
