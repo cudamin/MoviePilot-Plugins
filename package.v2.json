@@ -39,19 +39,6 @@
       "v1.2.2": "删除数据页面"
     }
   },
-  "Unit3dChineseSubFilter": {
-    "name": "UNIT3D 简中 RSS 后备订阅 测试版",
-    "description": "BLU/ATR 独立 RSS 后备源；正常站点无资源时，经订阅识别与规则过滤后用 API 检查 MediaInfo 简体中文字幕。",
-    "labels": "订阅,字幕,UNIT3D",
-    "version": "0.2.0",
-    "icon": "rss.png",
-    "author": "Community",
-    "level": 1,
-    "history": {
-      "v0.1.0": "首个原型：ResourceSelection 候选过滤、ResourceDownload 下载前兜底、UNIT3D API 多站点配置。",
-      "v0.2.0": "重构为 BLU/ATR 双站点 RSS 后备订阅；仅检查 MediaInfo 简体字幕；接入自定义识别词、订阅过滤规则组与最低优先级缺集保护。"
-    }
-  },
   "AgentConfigProfile": {
     "name": "智能助手配置模板",
     "description": "持久化保存智能助手的 LLM 配置与人格，支持多个模板一键快速切换。",
