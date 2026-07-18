@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.4.0"
+    plugin_version = "4.4.1"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -1048,7 +1048,7 @@ class SpaceCleaner(_PluginBase):
             self._invalidate_caches()
 
     def _clean_resources(self, space_info: Dict[str, float]) -> None:
-        # 清理无对应整理记录的孤儿播放缓存，避免其干扰后续判断
+        # 清理无对应整理记录的失效播放缓存，避免其干扰后续判断
         self._prune_orphan_pb()
         chain = self._get_chain()
         dc = 0
@@ -1501,11 +1501,11 @@ class SpaceCleaner(_PluginBase):
     def _prune_orphan_pb(self) -> int:
         """清理在媒体整理记录中已无对应记录的播放缓存条目。
 
-        逐条比对 pb 缓存与转移历史（status==True）：
-        - 电视剧键 {tmdbid}:S{季}E{集}：整理记录中该季须包含该集号；
-        - 电影键 {tmdbid}:M：整理记录中须存在该 tmdbid 的电影记录。
-        找不到对应整理记录的播放缓存视为孤儿并删除（例如资源已被手动删除，
-        或整理记录被清理但播放缓存残留）。返回删除条数。
+        判定按「季 / 电影」粒度进行（与删除单元一致），不做逐集比对，避免误删：
+        - 电视剧键 {tmdbid}:S{季}E{集}：只要整理记录中存在该 tmdbid + 该季的任意记录即视为有对应记录；
+        - 电影键 {tmdbid}:M：只要整理记录中存在该 tmdbid 的记录即视为有对应记录。
+        仅当整个 tmdbid（或该季）在转移历史中已完全不存在时（资源被彻底删除、
+        整理记录被清理但播放缓存残留），才将其判为失效并删除。返回删除条数。
         """
         pb = list(self._pb)
         if not pb:
@@ -1518,8 +1518,13 @@ class SpaceCleaner(_PluginBase):
                 tmdbids.add(int(m.group(1)))
         if not tmdbids:
             return 0
-        # 构建整理记录覆盖的键集合：电视剧 {tmdbid}:S..E..，电影 {tmdbid}:M
-        covered = set()
+        # 构建整理记录覆盖的范围：
+        #   covered_movie_tmdbids: 存在电影/其他类型记录的 tmdbid 集合
+        #   covered_tv_seasons: 存在电视剧记录的 (tmdbid, season) 集合
+        #   covered_tv_tmdbids: 存在电视剧记录但季号无法解析的 tmdbid（整部保留）
+        covered_movie_tmdbids = set()
+        covered_tv_seasons = set()
+        covered_tv_tmdbids = set()
         try:
             from app.db import ScopedSession
             sess = ScopedSession()
@@ -1533,24 +1538,41 @@ class SpaceCleaner(_PluginBase):
                     if not tid:
                         continue
                     if (r.type or "") == "电视剧":
+                        covered_tv_tmdbids.add(tid)
                         season = self._norm_season(r.seasons or "")
-                        if season is None:
-                            continue
-                        for ep in self._episode_set(r.episodes or ""):
-                            covered.add(f"{tid}:S{season:02d}E{ep:02d}")
+                        if season is not None:
+                            covered_tv_seasons.add((tid, season))
                     else:
-                        covered.add(f"{tid}:M")
+                        covered_movie_tmdbids.add(tid)
             finally:
                 sess.close()
         except Exception as e:
-            logger.error(f"SC 清理孤儿播放缓存时查询整理记录失败: {str(e)}")
+            logger.error(f"SC 清理失效播放缓存时查询整理记录失败: {str(e)}")
             return 0
-        # 找出无对应整理记录的孤儿键
-        orphans = []
-        for r in pb:
-            k = r.get("k", "") or ""
-            if k and k not in covered:
-                orphans.append(r)
+
+        def _is_orphan(k: str) -> bool:
+            # 电影键 {tmdbid}:M
+            m_movie = re.match(r'^(\d+):M$', k)
+            if m_movie:
+                return int(m_movie.group(1)) not in covered_movie_tmdbids
+            # 电视剧键 {tmdbid}:S{季}E{集}
+            m_tv = re.match(r'^(\d+):S(\d+)E\d+$', k)
+            if m_tv:
+                tid = int(m_tv.group(1))
+                season = int(m_tv.group(2))
+                # 该剧在整理记录中完全不存在 -> 失效
+                if tid not in covered_tv_tmdbids:
+                    return True
+                # 该剧存在，但无任何可解析季号的记录 -> 无法按季判定，保守保留
+                if not any(t == tid for (t, s) in covered_tv_seasons):
+                    return False
+                # 该季在整理记录中不存在 -> 失效
+                return (tid, season) not in covered_tv_seasons
+            # 未知键格式：保守保留，不删
+            return False
+
+        # 找出无对应整理记录的失效键
+        orphans = [r for r in pb if _is_orphan(r.get("k", "") or "")]
         if not orphans:
             return 0
         orphan_keys = {r.get("k") for r in orphans}
@@ -1561,9 +1583,9 @@ class SpaceCleaner(_PluginBase):
         if removed:
             self.save_data("pb", self._pb)
             self._pb_cache = None
-            logger.info(f"SC 已清理无对应整理记录的孤儿播放缓存 {removed} 条")
+            logger.info(f"SC 已清理无对应整理记录的失效播放缓存 {removed} 条")
             for r in orphans[:20]:
-                logger.info(f"SC   - 孤儿缓存: {r.get('n', '')} [{r.get('k', '')}]")
+                logger.info(f"SC   - 失效缓存: {r.get('n', '')} [{r.get('k', '')}]")
             if len(orphans) > 20:
                 logger.info(f"SC   - 其余 {len(orphans) - 20} 条略")
         return removed
