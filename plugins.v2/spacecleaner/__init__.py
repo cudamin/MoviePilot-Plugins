@@ -28,9 +28,9 @@ from app.utils.http import RequestUtils
 
 class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
-    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，合集需整季看完，含辅种及同集/同片的不同版本）；智能RSS下载自动跳过已看完剧集。"
+    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.3.0"
+    plugin_version = "4.3.2"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -56,6 +56,7 @@ class SpaceCleaner(_PluginBase):
     _pb_sort_desc = True  # 播放缓存排序方向：True 降序 / False 升序
     _pb_filter_watched = True  # 播放缓存默认只显示已看完
     _pb_search = ""  # 播放缓存搜索关键字
+    _pb_interacted = False  # 本次数据页会话是否发生过页内交互（用于判断是否为首次打开）
     _watched_threshold = 85  # 标记已看播放进度阈值（%）
     _clean_downloader = []  # 空间清理扫描的下载器，空列表扫描全部
 
@@ -339,6 +340,7 @@ class SpaceCleaner(_PluginBase):
     def del_pb_item(self, k: str, apikey: str):
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._pb_interacted = True
         with self._pb_lock:
             before = len(self._pb)
             self._pb = [r for r in self._pb if r.get("k") != k]
@@ -351,6 +353,7 @@ class SpaceCleaner(_PluginBase):
     def clear_pb(self, apikey: str):
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._pb_interacted = True
         with self._pb_lock:
             self._pb.clear()
         self.save_data("pb", [])
@@ -362,11 +365,11 @@ class SpaceCleaner(_PluginBase):
         """设置播放缓存当前页码。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._pb_interacted = True
         try:
             self._pb_page = max(1, int(page or 1))
         except (ValueError, TypeError):
             self._pb_page = 1
-        self._update_config()
         return schemas.Response(success=True)
 
     def set_pb_sort(self, sort_by: str, apikey: str):
@@ -375,6 +378,7 @@ class SpaceCleaner(_PluginBase):
             return schemas.Response(success=False)
         if sort_by not in ("time", "title", "status"):
             return schemas.Response(success=False, message="无效排序字段")
+        self._pb_interacted = True
         if self._pb_sort_by == sort_by:
             # 同字段切换排序方向
             self._pb_sort_desc = not self._pb_sort_desc
@@ -382,13 +386,13 @@ class SpaceCleaner(_PluginBase):
             self._pb_sort_by = sort_by
             self._pb_sort_desc = True  # 默认降序
         self._pb_page = 1
-        self._update_config()
         return schemas.Response(success=True)
 
     def toggle_pb_filter(self, apikey: str):
         """切换播放缓存已看完筛选。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._pb_interacted = True
         self._pb_filter_watched = not self._pb_filter_watched
         self._pb_page = 1
         self._update_config()
@@ -398,15 +402,16 @@ class SpaceCleaner(_PluginBase):
         """设置播放缓存搜索关键字（空串表示清除搜索）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._pb_interacted = True
         self._pb_search = (q or "").strip()
         self._pb_page = 1
-        self._update_config()
         return schemas.Response(success=True)
 
     def pb_mark_watched(self, k: str, apikey: str):
         """将单条未看完的播放记录标记为已看（进度置为100%）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._pb_interacted = True
         marked = False
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._pb_lock:
@@ -426,6 +431,7 @@ class SpaceCleaner(_PluginBase):
         """切换单条播放记录的优先删除标记。被标记的资源在空间清理时优先删除。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._pb_interacted = True
         new_state = None
         with self._pb_lock:
             for r in self._pb:
@@ -443,6 +449,7 @@ class SpaceCleaner(_PluginBase):
         """将所有未看完的播放记录批量标记为已看（进度置为100%）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._pb_interacted = True
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cnt = 0
         with self._pb_lock:
@@ -592,6 +599,12 @@ class SpaceCleaner(_PluginBase):
     # ==================== 详情页（三区块平铺） ====================
 
     def get_page(self) -> Optional[List[dict]]:
+        # 首次打开数据页（非页内交互触发的刷新）时自动清除搜索栏并回到首页
+        if not self._pb_interacted:
+            self._pb_search = ""
+            self._pb_page = 1
+        # 重置交互标记：下一次渲染若无交互即视为重新打开数据页
+        self._pb_interacted = False
         space_info = self._get_space_info()
         delete_history = self._get_delete_history()
         pb = self._get_playback_pb()
@@ -1252,18 +1265,8 @@ class SpaceCleaner(_PluginBase):
         try:
             # 需要处理的全部记录 = 该单元记录 + 其他版本记录
             all_recs = records + other_versions
-            # 删除源文件与媒体库文件
-            for rec in all_recs:
-                for path_str in (rec.get("src", ""), rec.get("dest", "")):
-                    if not path_str:
-                        continue
-                    p = Path(path_str)
-                    if p.exists():
-                        self._safe_delete_path(p)
-                    pp = p.parent
-                    if pp.exists() and self._is_dir_empty(pp):
-                        self._safe_delete_path(pp)
-            # 从下载器删除该单元涉及的全部种子及其辅种（整季可能跨多个种子）
+            # 1) 从下载器删除该单元涉及的全部种子及其辅种（整季可能跨多个种子）
+            #    删种时 delete_file=True 会一并删除下载目录中的源文件
             seen_hashes = set()
             for rec in records:
                 dh = rec.get("download_hash", "")
@@ -1280,6 +1283,26 @@ class SpaceCleaner(_PluginBase):
                 if dh and dh not in seen_hashes:
                     seen_hashes.add(dh)
                     self._delete_downloader_torrents(chain, dh, rec.get("title", "不同版本"), all_torrents)
+            # 2) 删种后删除媒体库文件及其所在目录（MP 软链接/硬链接、重命名、刮削生成的目录）
+            #    以及仍残留的下载源文件（无 hash 记录不会被删种流程清理）
+            media_dirs = set()
+            for rec in all_recs:
+                # 下载源文件：有种子的已随删种删除，此处兜底处理无 hash 记录
+                src = rec.get("src", "")
+                if src:
+                    sp = Path(src)
+                    if sp.exists():
+                        self._safe_delete_path(sp)
+                # 媒体库文件（链接+重命名后的成品）
+                dest = rec.get("dest", "")
+                if dest:
+                    dp = Path(dest)
+                    if dp.exists():
+                        self._safe_delete_path(dp)
+                    media_dirs.add(dp.parent)
+            # 删除媒体库目录整体（含 nfo、海报等刮削文件）
+            for d in media_dirs:
+                self._delete_media_dir(d)
             # 用独立 session 删除所有相关转移记录
             from app.db import ScopedSession
             ds = ScopedSession()
@@ -1502,12 +1525,24 @@ class SpaceCleaner(_PluginBase):
         except Exception:
             pass
 
-    @staticmethod
-    def _is_dir_empty(path: Path) -> bool:
+    def _delete_media_dir(self, media_dir: Path):
+        """删除媒体库中该资源所在目录（MP 软链接/硬链接、重命名、刮削生成的成品目录）。
+
+        MP 通常为每部电影/每季电视剧建立独立目录，目录内除媒体文件外还含
+        nfo、海报、fanart 等刮削文件；删除资源时应连同整个目录一并删除。
+        为安全起见不会删除挂载点或根目录。
+        """
         try:
-            return not any(path.iterdir())
-        except Exception:
-            return False
+            if not media_dir or not media_dir.exists() or not media_dir.is_dir():
+                return
+            # 避免误删挂载点/根目录
+            if media_dir.parent == media_dir or os.path.ismount(str(media_dir)):
+                logger.warning(f"SC 跳过删除媒体库目录（疑似挂载点/根目录）: {media_dir}")
+                return
+            self._safe_delete_path(media_dir)
+            logger.info(f"SC 已删除媒体库目录: {media_dir}")
+        except Exception as e:
+            logger.error(f"SC 删除媒体库目录失败 {media_dir}: {e}")
 
     @staticmethod
     def _parse_episode_info(record: TransferHistory) -> Tuple[Optional[bool], Optional[int], List[int]]:
