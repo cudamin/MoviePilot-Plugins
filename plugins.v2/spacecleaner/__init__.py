@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.4.1"
+    plugin_version = "4.4.2"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -1060,6 +1060,14 @@ class SpaceCleaner(_PluginBase):
         sess = ScopedSession()
         fr = ""
         try:
+            pb = self._get_playback_pb()
+            # 有播放缓存记录的 tmdbid 集合：没有播放缓存的整理记录无需检查（不可能满足"已看完"条件）
+            pb_tmdbids = set()
+            for p in pb:
+                km = re.match(r'(\d+):', p.get("k", "") or "")
+                if km:
+                    pb_tmdbids.add(int(km.group(1)))
+
             offset = 0
             # 按 download_hash 分组：收集每组所有记录的(tmdbid, season, episodes)
             hash_groups: Dict[str, List[TransferHistory]] = {}
@@ -1069,6 +1077,9 @@ class SpaceCleaner(_PluginBase):
                 if not recs:
                     break
                 for r in recs:
+                    # 无播放缓存记录的资源直接跳过，节省后续处理
+                    if not r.tmdbid or r.tmdbid not in pb_tmdbids:
+                        continue
                     if r.download_hash:
                         hash_groups.setdefault(r.download_hash, []).append(r)
                     elif r.type == "电视剧":
@@ -1077,8 +1088,6 @@ class SpaceCleaner(_PluginBase):
                         # 电影无 hash：直接检查 pb 中的 {tmdbid}:M
                         no_hash_records.append(r)
                 offset += len(recs)
-
-            pb = self._get_playback_pb()
 
             # 优先删除标记：pb 中被标记 prio 的资源对应的 tmdbid 集合
             prio_tmdbids = set()
@@ -1274,7 +1283,7 @@ class SpaceCleaner(_PluginBase):
         other_versions = self._find_other_version_records(records) if self._delete_other_versions else []
         all_recs = records + other_versions
         if self._dry_run:
-            # 统计将删除的种子（主种子 + 辅种）与媒体库目录
+            # 统计将删除的种子（主种子 + 辅种）
             torrents = self._get_cached_torrents(chain)
             seen = set()
             main_cnt = cross_cnt = 0
@@ -1285,7 +1294,6 @@ class SpaceCleaner(_PluginBase):
                     tl = self._collect_torrents_to_delete(dh, torrents)
                     main_cnt += 1
                     cross_cnt += sum(1 for _, _, is_cross in tl if is_cross)
-            media_dirs = {str(Path(r.get("dest")).parent) for r in all_recs if r.get("dest")}
             unit_type = "电视剧整季" if is_tv else "电影"
             logger.info(
                 f"【试运行】将删除 [{unit_type}] {display_name}："
@@ -1293,7 +1301,6 @@ class SpaceCleaner(_PluginBase):
                 + (f"，不同版本 {len(other_versions)} 条" if other_versions else "")
                 + f"，种子 {main_cnt} 个"
                 + (f"（含辅种 {cross_cnt} 个）" if cross_cnt else "")
-                + f"，媒体库目录 {len(media_dirs)} 个"
             )
             detail = (f"将删除：整理记录 {len(records)} 条"
                       + (f"，不同版本 {len(other_versions)} 条" if other_versions else "")
@@ -1366,12 +1373,11 @@ class SpaceCleaner(_PluginBase):
             logger.info(f"SC 删除完成 [{unit_type}] {display_name}："
                         f"整理记录 {len(records)} 条"
                         + (f"，不同版本 {len(other_versions)} 条" if other_versions else "")
-                        + f"，种子 {torrents_deleted} 个"
-                        + f"，媒体库目录 {len(media_dirs)} 个")
+                        + f"，种子 {torrents_deleted} 个")
             extra = f"，含不同版本 {len(other_versions)} 条" if other_versions else ""
             self._add_delete_history(
                 display_name,
-                f"已删除（记录 {len(records)} 条{extra}，种子 {torrents_deleted} 个，媒体库目录 {len(media_dirs)} 个）")
+                f"已删除（记录 {len(records)} 条{extra}，种子 {torrents_deleted} 个）")
             if self._notify:
                 ver_line = f"\n不同版本: {len(other_versions)} 条" if other_versions else ""
                 self.post_message(title="空间清理器 - 资源已删除",
