@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源；智能RSS下载自动跳过已看完剧集；tmdbid标签识别。"
     plugin_icon = "delete.png"
-    plugin_version = "4.1.5"
+    plugin_version = "4.1.6"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -103,6 +103,7 @@ class SpaceCleaner(_PluginBase):
     _rss_s: Optional[BackgroundScheduler] = None
     _rss_busy = False
     _rss_seen: set = set()
+    _rss_washed: set = set()  # 已洗版下载过的集(tmdbid:SxxExx)，一集一个槽位
     _rss_lk = threading.Lock()
 
     def init_plugin(self, config: dict = None) -> None:
@@ -134,6 +135,7 @@ class SpaceCleaner(_PluginBase):
         self._tag_run_now = False
         self._pb = list(self.get_data("pb") or [])
         self._rss_seen = set()
+        self._rss_washed = set()
         self._stop_rss_scheduler()
 
         if not config:
@@ -190,6 +192,7 @@ class SpaceCleaner(_PluginBase):
         except (ValueError, TypeError):
             self._rss_th = 85
         self._rss_seen = set(self.get_data("rss_seen") or [])
+        self._rss_washed = set(self.get_data("rss_washed") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
 
@@ -763,30 +766,23 @@ class SpaceCleaner(_PluginBase):
         ]
         if page_items:
             for item in page_items:
-                op_buttons = []
-                if not item["watched"]:
-                    op_buttons.append(
-                        {"component": "VBtn", "props": {"color": "success", "variant": "text", "size": "x-small"},
-                         "text": "标记已看",
-                         "events": {"click": {"api": "plugin/SpaceCleaner/pb_mark_watched", "method": "get",
-                                              "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}})
-                op_buttons.append(
-                    {"component": "VBtn", "props": {"color": "error", "variant": "text", "size": "x-small"},
+                op_buttons = [
+                    {"component": "VBtn", "props": {"color": "error", "variant": "text", "size": "x-small", "class": "px-1"},
                      "text": "删除",
                      "events": {"click": {"api": "plugin/SpaceCleaner/del_pb_item", "method": "get",
-                                          "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}})
-                op_buttons.append(
-                    {"component": "VBtn", "props": {"color": "success", "variant": "text", "size": "x-small"},
+                                          "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}},
+                    {"component": "VBtn", "props": {"color": "success", "variant": "text", "size": "x-small", "class": "px-1"},
                      "text": "已看",
                      "events": {"click": {"api": "plugin/SpaceCleaner/pb_mark_watched", "method": "get",
-                                          "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}})
-                table_rows.append({"component": "div", "props": {"class": "d-flex align-center px-3 py-2 border-t text-caption"}, "content": [
+                                          "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}},
+                ]
+                table_rows.append({"component": "div", "props": {"class": "d-flex align-center px-3 py-2 border-t text-body-2"}, "content": [
                     {"component": "div", "props": {"style": "flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"}, "text": item["title"]},
                     {"component": "div", "props": {"style": "width: 92px;"}, "text": item["se"]},
                     {"component": "div", "props": {"style": "width: 76px;"}, "text": f"{item['progress']:.1f}%"},
                     {"component": "div", "props": {"style": "width: 76px;"}, "text": "已看完" if item["watched"] else "未看完"},
                     {"component": "div", "props": {"style": "width: 150px;"}, "text": item["time"]},
-                    {"component": "div", "props": {"style": "width: 128px; display: flex; flex-direction: column; align-items: flex-start;"}, "content": op_buttons},
+                    {"component": "div", "props": {"style": "width: 128px; display: flex; flex-direction: row; align-items: center; gap: 4px;"}, "content": op_buttons},
                 ]})
         else:
             table_rows.append({"component": "div", "props": {"class": "pa-4 text-center text-body-2 text-medium-emphasis"}, "text": "暂无播放缓存"})
@@ -1518,9 +1514,10 @@ class SpaceCleaner(_PluginBase):
         logger.info("SC-RSS 运行完成")
 
     def _rss_run_dedup(self, urls: List[str]):
-        """洗版模式：收集所有 URL 的 RSS 条目，播放进度低于阈值时触发洗版，只下载最早版本。"""
+        """洗版模式（一集一个槽位）：收集所有 URL 的 RSS 条目，播放进度低于阈值时触发洗版；
+        同一集有多个版本时只下载最早发布的版本，已洗版下载过的集在后续刷新中不再重复下载。"""
         from collections import OrderedDict
-        all_candidates = OrderedDict()  # dedup_key -> (item, m, meta, s_season, se_fmt, url)
+        all_candidates = OrderedDict()  # dedup_key -> (item, m, meta, s_season, se_fmt, ts)
         total_items = 0
         for url in urls:
             items = RssHelper().parse(url)
@@ -1581,17 +1578,31 @@ class SpaceCleaner(_PluginBase):
                     dedup_key = ("tmdb", m.tmdb_id, int(s_season))
                 else:
                     dedup_key = ("enclosure", item.get("enclosure", "") or item.get("link", ""))
-                if dedup_key in all_candidates:
-                    self._rss_log("洗版去重跳过", m.title, f"{se_fmt} 已有更早版本")
+                # 一集一个槽位：该集在之前的刷新中已洗版下载过，则不再重复下载
+                ep_key = self._rss_wash_key(dedup_key)
+                if ep_key and ep_key in self._rss_washed:
+                    self._rss_log("洗版跳过", m.title, f"{se_fmt} 已洗版下载过")
                     continue
-                all_candidates[dedup_key] = (item, m, meta, s_season, se_fmt)
+                ts = self._rss_pubts(item)
+                if dedup_key in all_candidates:
+                    # 同一集有多个版本时，只保留发布时间最早的版本
+                    if self._rss_earlier(ts, all_candidates[dedup_key][5]):
+                        all_candidates[dedup_key] = (item, m, meta, s_season, se_fmt, ts)
+                        self._rss_log("洗版替换", m.title, f"{se_fmt} 选用更早发布版本")
+                    else:
+                        self._rss_log("洗版去重跳过", m.title, f"{se_fmt} 已有更早版本")
+                    continue
+                all_candidates[dedup_key] = (item, m, meta, s_season, se_fmt, ts)
         logger.info(f"SC-RSS 报文处理完成：获取 {total_items} 条，过滤后剩余 {len(all_candidates)} 条待处理")
         # 统一下载去重后的条目
         dc = 0
         for dedup_key, payload in all_candidates.items():
-            item, m, meta, s_season, se_fmt = payload
+            item, m, meta, s_season, se_fmt, ts = payload
             if self._rss_dl_add(item, m, meta):
                 dc += 1
+                ep_key = self._rss_wash_key(dedup_key)
+                if ep_key:
+                    self._rss_washed.add(ep_key)
                 self._rss_log("下载", m.title)
                 if self._rss_ntf:
                     self.post_message(title="SC-RSS",
@@ -1606,6 +1617,42 @@ class SpaceCleaner(_PluginBase):
             s = s[-2000:]
             self._rss_seen = set(s)
         self.save_data("rss_seen", s)
+        w = list(self._rss_washed)
+        if len(w) > 3000:
+            w = w[-3000:]
+            self._rss_washed = set(w)
+        self.save_data("rss_washed", w)
+
+    @staticmethod
+    def _rss_wash_key(dedup_key) -> Optional[str]:
+        """仅对精确到集的 (tmdb_id, season, episode) 生成持久化槽位键，其余返回 None。"""
+        if isinstance(dedup_key, tuple) and len(dedup_key) == 3 and not isinstance(dedup_key[0], str):
+            return f"{dedup_key[0]}:S{int(dedup_key[1]):02d}E{int(dedup_key[2]):02d}"
+        return None
+
+    @staticmethod
+    def _rss_pubts(item: dict) -> float:
+        """从 RSS 条目解析发布时间戳，无法解析时返回 +inf（视为最晚）。"""
+        for key in ("pubdate", "pub_date", "published", "date", "updated"):
+            v = item.get(key)
+            if not v:
+                continue
+            if isinstance(v, (int, float)):
+                return float(v)
+            s = str(v).strip()
+            for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z",
+                        "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S",
+                        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(s, fmt).timestamp()
+                except (ValueError, TypeError):
+                    continue
+        return float("inf")
+
+    @staticmethod
+    def _rss_earlier(ts_a: float, ts_b: float) -> bool:
+        """ts_a 是否比 ts_b 更早发布。"""
+        return ts_a < ts_b
 
     def _rss_proc(self, url: str):
         items = RssHelper().parse(url)
@@ -1837,21 +1884,81 @@ class SpaceCleaner(_PluginBase):
                 break
 
     def _scan_and_tag(self) -> None:
-        """扫描下载器种子：识别并添加 tmdbid 标签。"""
+        """扫描下载器种子：识别并添加 tmdbid 标签。
+
+        性能优化（参考 downloadsitetag 插件）：
+        1) 优先复用下载历史中已识别的 tmdbid（DB 命中几乎无 CPU 开销），
+           避免逐个种子调用 recognize_media 触发大量 TMDB 匹配导致的高 CPU；
+        2) 按标题缓存识别结果，同名种子/辅种只识别一次；
+        3) 每处理一个种子检查停止信号并让出片刻 CPU，避免瞬时占满。
+        """
         chain = self._get_chain()
         torrents = self._tag_list_torrents(chain)
         if not torrents:
             logger.info("SC-Tmdb 未找到任何种子")
             return
-
-        # 识别未标记 tmdbid 的种子并打标签
-        title_groups = self._tag_group_untagged(torrents)
-        if title_groups:
-            logger.info(f"SC-Tmdb 待识别标题数: {len(title_groups)}，待处理种子数: {sum(len(v) for v in title_groups.values())}")
-            tagged, skipped = self._tag_title_groups(chain, title_groups)
-            logger.info(f"SC-Tmdb tmdbid 标记完成: 已标记 {tagged} 个种子，跳过 {skipped} 个")
-        else:
+        # 筛出未打 tmdbid 标签的种子
+        pending = self._tag_group_untagged(torrents)
+        if not pending:
             logger.info("SC-Tmdb 所有种子已有 tmdbid 标签")
+            return
+        try:
+            from app.db.downloadhistory_oper import DownloadHistoryOper
+            downloadhis = DownloadHistoryOper()
+        except Exception as err:
+            logger.warn(f"SC-Tmdb 无法访问下载历史，将回退到标题识别: {err}")
+            downloadhis = None
+
+        total = sum(len(v) for v in pending.values())
+        logger.info(f"SC-Tmdb 待处理标题数: {len(pending)}，待处理种子数: {total}")
+        tagged = 0
+        skipped = 0
+        db_hits = 0
+        recognized = 0
+        title_cache: Dict[str, Optional[int]] = {}  # title -> tmdb_id，运行期缓存
+        for title, hash_list in pending.items():
+            if self._tag_scheduler_event is not None and self._tag_scheduler_event.is_set():
+                logger.info("SC-Tmdb 收到停止信号，中断扫描")
+                break
+            # 1) 先查下载历史（按 hash，DB 命中无需识别）
+            tmdb_id: Optional[int] = None
+            if downloadhis is not None:
+                for torrent_hash, _dl in hash_list:
+                    try:
+                        history = downloadhis.get_by_hash(torrent_hash)
+                    except Exception:
+                        history = None
+                    if history and getattr(history, "tmdbid", None):
+                        try:
+                            tmdb_id = int(history.tmdbid)
+                            db_hits += 1
+                            break
+                        except (ValueError, TypeError):
+                            tmdb_id = None
+            # 2) 命中标题缓存
+            if tmdb_id is None and title in title_cache:
+                tmdb_id = title_cache[title]
+            # 3) 最后才回退到标题识别（昂贵），并缓存结果
+            if tmdb_id is None and title not in title_cache:
+                tmdb_id = self._tag_recognize_tmdb_id(chain, title)
+                title_cache[title] = tmdb_id
+                if tmdb_id:
+                    recognized += 1
+                # 识别是 CPU 密集操作，让出片刻，避免瞬时占满 CPU
+                time.sleep(0.05)
+            if not tmdb_id:
+                skipped += len(hash_list)
+                continue
+            tmdb_tag = f"tmdbid={tmdb_id}"
+            for torrent_hash, downloader in hash_list:
+                try:
+                    chain.set_torrents_tag(hashs=torrent_hash, tags=[tmdb_tag], downloader=downloader)
+                    tagged += 1
+                except Exception as err:
+                    logger.error(f"SC-Tmdb 为种子 {title} (hash={torrent_hash}) 打标签失败: {err}")
+            logger.info(f"SC-Tmdb 已为 {len(hash_list)} 个同名种子添加标签: {title} -> {tmdb_tag}")
+        logger.info(f"SC-Tmdb tmdbid 标记完成: 已标记 {tagged} 个，跳过 {skipped} 个，"
+                    f"其中 {db_hits} 个复用下载历史、{recognized} 个走标题识别")
 
     def _tag_list_torrents(self, chain: ChainBase) -> List[Any]:
         """列出需要标记tmdbid标签的种子。"""
@@ -1883,25 +1990,6 @@ class SpaceCleaner(_PluginBase):
             downloader = getattr(torrent, "downloader", None)
             title_groups.setdefault(title, []).append((torrent_hash, downloader))
         return title_groups
-
-    def _tag_title_groups(self, chain: ChainBase, title_groups: Dict[str, List[Tuple[str, Optional[str]]]]) -> Tuple[int, int]:
-        """识别标题分组并写入 tmdbid 标签。返回 (tagged, skipped)。"""
-        tagged = 0
-        skipped = 0
-        for title, hash_list in title_groups.items():
-            tmdb_id = self._tag_recognize_tmdb_id(chain, title)
-            if not tmdb_id:
-                skipped += len(hash_list)
-                continue
-            tmdb_tag = f"tmdbid={tmdb_id}"
-            for torrent_hash, downloader in hash_list:
-                try:
-                    chain.set_torrents_tag(hashs=torrent_hash, tags=[tmdb_tag], downloader=downloader)
-                    tagged += 1
-                except Exception as err:
-                    logger.error(f"SC-Tmdb 为种子 {title} (hash={torrent_hash}) 打标签失败: {err}")
-            logger.info(f"SC-Tmdb 已为 {len(hash_list)} 个同名种子添加标签: {title} -> {tmdb_tag}")
-        return tagged, skipped
 
     @staticmethod
     def _tag_recognize_tmdb_id(chain: ChainBase, title: str) -> Optional[int]:
