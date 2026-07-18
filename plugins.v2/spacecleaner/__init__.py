@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，合集需整季看完，含辅种及同集/同片的不同版本）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.2.2"
+    plugin_version = "4.3.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -142,16 +142,12 @@ class SpaceCleaner(_PluginBase):
         self._delete_other_versions = bool(config.get("delete_other_versions", True))
         self._notify = bool(config.get("notify", True))
         self._media_cache_disabled = bool(config.get("media_cache_disabled", False))
-        try:
-            self._pb_page = max(1, int(config.get("pb_page") or 1))
-        except (ValueError, TypeError):
-            self._pb_page = 1
-        self._pb_sort_by = str(config.get("pb_sort_by") or "time")
-        if self._pb_sort_by not in ("time", "title", "status"):
-            self._pb_sort_by = "time"
-        self._pb_sort_desc = bool(config.get("pb_sort_desc", True))
+        # 播放缓存视图状态不持久化：每次加载插件默认按时间从近到远排序，并清空搜索
+        self._pb_page = 1
+        self._pb_sort_by = "time"
+        self._pb_sort_desc = True  # 时间降序（从近到远）
         self._pb_filter_watched = bool(config.get("pb_filter_watched", True))
-        self._pb_search = str(config.get("pb_search") or "")
+        self._pb_search = ""
         try:
             self._watched_threshold = int(config.get("watched_threshold") or 85)
         except (ValueError, TypeError):
@@ -213,10 +209,8 @@ class SpaceCleaner(_PluginBase):
             "delete_count": self._delete_count, "check_interval": self._check_interval,
             "dry_run": self._dry_run, "delete_same_size": self._delete_same_size,
             "delete_cross_seeds": self._delete_cross_seeds, "delete_other_versions": self._delete_other_versions, "notify": self._notify,
-            "media_cache_disabled": self._media_cache_disabled, "pb_page": self._pb_page, "run_now": False,
-            "pb_sort_by": self._pb_sort_by, "pb_sort_desc": self._pb_sort_desc,
+            "media_cache_disabled": self._media_cache_disabled, "run_now": False,
             "pb_filter_watched": self._pb_filter_watched, "watched_threshold": self._watched_threshold,
-            "pb_search": self._pb_search,
             "rss_on": self._rss_on, "rss_cron": self._rss_cron, "rss_urls": self._rss_urls,
             "rss_dl": self._rss_dl, "rss_sz": self._rss_sz, "rss_inc": self._rss_inc,
             "rss_exc": self._rss_exc, "rss_once": self._rss_once, "rss_ntf": self._rss_ntf,
@@ -588,8 +582,8 @@ class SpaceCleaner(_PluginBase):
             "delete_by_target": False, "target_free_percent": 20,
             "delete_count": 1, "check_interval": 6,
             "dry_run": False, "delete_same_size": False, "delete_cross_seeds": True, "delete_other_versions": True, "notify": True,
-            "media_cache_disabled": False, "pb_page": 1, "clean_downloader": [], "run_now": False,
-            "pb_sort_by": "time", "pb_sort_desc": True, "pb_filter_watched": True, "pb_search": "", "watched_threshold": 85,
+            "media_cache_disabled": False, "clean_downloader": [], "run_now": False,
+            "pb_filter_watched": True, "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
             "rss_dl": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
             "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False, "rss_save_path": "",
@@ -1089,21 +1083,9 @@ class SpaceCleaner(_PluginBase):
                 mm = re.findall(r'\d+', rec.episodes or "0")
                 return max(int(e) for e in mm) if mm else 0
 
-            def _group_watched_time(recs, is_tv):
-                """合集判断：只有最后一集（或电影）已看完才返回其缓存时间，否则 None。"""
-                if is_tv:
-                    check_rec = max(recs, key=_ep_max)
-                    s = (check_rec.seasons or "").strip().upper().replace("S", "")
-                    e_str = (check_rec.episodes or "").strip().upper().replace("E", "")
-                    if not (s.isdigit() and e_str):
-                        return None
-                    eps = re.findall(r'\d+', e_str)
-                    if not eps:
-                        return None
-                    k = f"{check_rec.tmdbid}:S{int(s):02d}E{max(int(x) for x in eps):02d}"
-                else:
-                    check_rec = recs[0]
-                    k = f"{check_rec.tmdbid}:M"
+            def _movie_watched_time(rec):
+                """电影：pb 中 {tmdbid}:M 已看完才返回其缓存时间，否则 None。"""
+                k = f"{rec.tmdbid}:M"
                 for p in pb:
                     if p.get("k") == k:
                         if (p.get("p", 0) or 0) >= self._watched_threshold:
@@ -1111,55 +1093,114 @@ class SpaceCleaner(_PluginBase):
                         return None
                 return None
 
-            # 删除单元：合集的所有集必须一起删除
+            def _season_last_watched_time(recs):
+                """电视剧整季判断：以整理记录中该季出现的最后一集为准，
+                只有最后一集已看完才返回其缓存时间（用于排序），否则 None。
+                例：记录含 S01E01~S01E13，则需 S01E13 看完才删除整季。"""
+                tmdbid = recs[0].tmdbid
+                season = None
+                max_ep = 0
+                for r in recs:
+                    s = self._norm_season(r.seasons or "")
+                    if s is not None:
+                        season = s
+                    eps = self._episode_set(r.episodes or "")
+                    if eps:
+                        max_ep = max(max_ep, max(eps))
+                if season is None or max_ep <= 0:
+                    return None
+                k = f"{tmdbid}:S{season:02d}E{max_ep:02d}"
+                for p in pb:
+                    if p.get("k") == k:
+                        if (p.get("p", 0) or 0) >= self._watched_threshold:
+                            return p.get("t", "9999")
+                        return None
+                return None
+
+            # 删除单元：电视剧整季一起删除、电影单条删除
             delete_units = []
 
-            def _add_unit(recs, is_tv):
-                t = _group_watched_time(recs, is_tv)
+            def _add_tv_season_unit(recs):
+                """一个 (tmdbid, season) 的所有整理记录构成一个删除单元。"""
+                t = _season_last_watched_time(recs)
                 if t is None:
                     return
-                rep = max(recs, key=_ep_max) if is_tv else recs[0]
+                rep = max(recs, key=_ep_max)
+                tmdbid = rep.tmdbid
+                season = self._norm_season(rep.seasons or "")
+                dh = ""
+                for rr in recs:
+                    if rr.download_hash:
+                        dh = rr.download_hash
+                        break
+                ep_count = len({e for r in recs for e in self._episode_set(r.episodes or "")})
+                display = f"{rep.title or ''} S{season:02d}".strip() if season is not None else (rep.title or "未知")
+                display = f"{display}（整季 {ep_count} 集）"
+                delete_units.append({
+                    "records": [_snap(r) for r in recs],
+                    "hash": dh,
+                    "tmdbid": tmdbid,
+                    "season": season,
+                    "is_tv": True,
+                    "display": display,
+                    "sort_time": t or "9999",
+                    "prio": str(tmdbid) in prio_tmdbids,
+                })
+
+            def _add_movie_unit(recs):
+                t = _movie_watched_time(recs[0])
+                if t is None:
+                    return
+                rep = recs[0]
                 tmdbid = rep.tmdbid
                 dh = ""
                 for rr in recs:
                     if rr.download_hash:
                         dh = rr.download_hash
                         break
-                if is_tv:
-                    display = f"{rep.title or ''} {rep.seasons or ''}".strip()
-                    if len(recs) > 1:
-                        display = f"{display}（合集 {len(recs)} 集）"
-                else:
-                    display = rep.title or "未知"
                 delete_units.append({
                     "records": [_snap(r) for r in recs],
                     "hash": dh,
                     "tmdbid": tmdbid,
-                    "display": display,
+                    "season": None,
+                    "is_tv": False,
+                    "display": rep.title or "未知",
                     "sort_time": t or "9999",
                     "prio": str(tmdbid) in prio_tmdbids,
                 })
 
-            # 1) 有 download_hash 的种子：整个种子（合集所有集）作为一个删除单元
+            # 汇总所有记录（有/无 download_hash）后重新分组
+            all_records: List[TransferHistory] = []
             for recs in hash_groups.values():
-                _add_unit(recs, any((r.type == "电视剧") for r in recs))
+                all_records.extend(recs)
+            all_records.extend(no_hash_records)
 
-            # 2) 无 download_hash 的电视剧：按 tmdbid+season 归并为一个删除单元
-            no_hash_groups: Dict[str, List[TransferHistory]] = {}
-            for r in no_hash_records:
-                if r.type != "电视剧" or not r.tmdbid or not r.seasons:
+            # 电视剧：按 tmdbid+season 归并（跨种子/跨版本），整季作为一个删除单元
+            tv_season_groups: Dict[str, List[TransferHistory]] = {}
+            # 电影：有 hash 按 hash 归并，无 hash 每条一个单元
+            movie_hash_groups: Dict[str, List[TransferHistory]] = {}
+            movie_no_hash: List[TransferHistory] = []
+            for r in all_records:
+                if not r.tmdbid:
                     continue
-                s = r.seasons.strip().upper().replace("S", "")
-                if s.isdigit():
-                    key = f"{r.tmdbid}:S{int(s):02d}"
-                    no_hash_groups.setdefault(key, []).append(r)
-            for recs in no_hash_groups.values():
-                _add_unit(recs, True)
+                if (r.type or "") == "电视剧":
+                    season = self._norm_season(r.seasons or "")
+                    if season is None:
+                        continue  # 无法判定季，跳过
+                    key = f"{r.tmdbid}:S{season:02d}"
+                    tv_season_groups.setdefault(key, []).append(r)
+                else:
+                    if r.download_hash:
+                        movie_hash_groups.setdefault(r.download_hash, []).append(r)
+                    else:
+                        movie_no_hash.append(r)
 
-            # 3) 无 download_hash 的电影：每条记录一个删除单元
-            for r in no_hash_records:
-                if r.type != "电视剧" and r.tmdbid:
-                    _add_unit([r], False)
+            for recs in tv_season_groups.values():
+                _add_tv_season_unit(recs)
+            for recs in movie_hash_groups.values():
+                _add_movie_unit(recs)
+            for r in movie_no_hash:
+                _add_movie_unit([r])
 
             if not delete_units:
                 logger.info("SC 未发现满足删除条件的资源（已看完且在转移历史中）")
@@ -1199,6 +1240,8 @@ class SpaceCleaner(_PluginBase):
         display_name = unit["display"]
         download_hash = unit["hash"]
         tmdbid = unit["tmdbid"]
+        season = unit.get("season")
+        is_tv = unit.get("is_tv", False)
         # 其他版本：同一集/同一部电影的不同发布版本（分辨率、字幕组、编码等）
         other_versions = self._find_other_version_records(records) if self._delete_other_versions else []
         if self._dry_run:
@@ -1220,15 +1263,23 @@ class SpaceCleaner(_PluginBase):
                     pp = p.parent
                     if pp.exists() and self._is_dir_empty(pp):
                         self._safe_delete_path(pp)
-            # 从下载器删除主种子及其辅种（同时删除文件）
-            self._delete_downloader_torrents(chain, download_hash, display_name, all_torrents)
-            # 其他版本各自对应的种子也一并删除（含其辅种）
-            seen_hashes = {download_hash}
+            # 从下载器删除该单元涉及的全部种子及其辅种（整季可能跨多个种子）
+            seen_hashes = set()
+            for rec in records:
+                dh = rec.get("download_hash", "")
+                if dh and dh not in seen_hashes:
+                    seen_hashes.add(dh)
+                    self._delete_downloader_torrents(chain, dh, display_name, all_torrents)
+            # 若单元记录均无 hash 但存在代表 hash，仍尝试删除
+            if not seen_hashes and download_hash:
+                seen_hashes.add(download_hash)
+                self._delete_downloader_torrents(chain, download_hash, display_name, all_torrents)
+            # 不同版本各自对应的种子也一并删除（含其辅种）
             for rec in other_versions:
                 dh = rec.get("download_hash", "")
                 if dh and dh not in seen_hashes:
                     seen_hashes.add(dh)
-                    self._delete_downloader_torrents(chain, dh, rec.get("title", "其他版本"), all_torrents)
+                    self._delete_downloader_torrents(chain, dh, rec.get("title", "不同版本"), all_torrents)
             # 用独立 session 删除所有相关转移记录
             from app.db import ScopedSession
             ds = ScopedSession()
@@ -1240,8 +1291,11 @@ class SpaceCleaner(_PluginBase):
                 ds.commit()
             finally:
                 ds.close()
-            # 从 pb 缓存中删除该 tmdbid 对应的条目
-            self._delete_pb_by_tmdbid(tmdbid)
+            # 从 pb 缓存中删除对应条目：电视剧仅删除该季，电影删除整个 tmdbid
+            if is_tv and season is not None:
+                self._delete_pb_by_tmdbid(tmdbid, season)
+            else:
+                self._delete_pb_by_tmdbid(tmdbid)
             if other_versions:
                 logger.info(f"已删除不同版本 {len(other_versions)} 条: {display_name}")
             extra = f"，含不同版本 {len(other_versions)} 条" if other_versions else ""
@@ -1346,18 +1400,31 @@ class SpaceCleaner(_PluginBase):
             return []
         return list(found.values())
 
-    def _delete_pb_by_tmdbid(self, tmdbid: Optional[int]):
-        """从 pb 缓存中删除指定 tmdbid 的所有条目。"""
+    def _delete_pb_by_tmdbid(self, tmdbid: Optional[int], season: Optional[int] = None):
+        """从 pb 缓存中删除指定 tmdbid 的条目。
+
+        指定 season 时只删除该季（键形如 {tmdbid}:S01E..），
+        避免删除某一季时误删同剧其他季的播放记录；未指定时删除该 tmdbid 全部条目。
+        """
         if not tmdbid:
             return
+        if season is not None:
+            season_prefix = f"{tmdbid}:S{season:02d}E"
+            def _match(k):
+                return k.startswith(season_prefix)
+            scope = f"tmdbid={tmdbid} S{season:02d}"
+        else:
+            prefix = f"{tmdbid}:"
+            def _match(k):
+                return k.startswith(prefix)
+            scope = f"tmdbid={tmdbid}"
         with self._pb_lock:
             before = len(self._pb)
-            prefix = f"{tmdbid}:"
-            self._pb = [r for r in self._pb if not r.get("k", "").startswith(prefix)]
+            self._pb = [r for r in self._pb if not _match(r.get("k", ""))]
             after = len(self._pb)
         if before != after:
             self.save_data("pb", self._pb)
-            logger.info(f"从 pb 缓存删除 tmdbid={tmdbid} 共 {before - after} 条")
+            logger.info(f"从 pb 缓存删除 {scope} 共 {before - after} 条")
 
     def _delete_downloader_torrents(self, chain, download_hash, display_name, all_torrents=None):
         """删除主种子及其辅种（cross-seed）。
