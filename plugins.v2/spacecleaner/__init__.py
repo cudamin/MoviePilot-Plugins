@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.4.2"
+    plugin_version = "4.4.3"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -1117,6 +1117,24 @@ class SpaceCleaner(_PluginBase):
                         return None
                 return None
 
+            def _unit_earliest_mark_time(tmdbid, season=None):
+                """取该单元在播放缓存中最早的标记时间（排序用）。
+
+                电影取 {tmdbid}:M 的缓存时间；电视剧取该季各集缓存时间的最小值。
+                以"最早标记"作为删除/跳过顺序依据：越早标记的越先处理。
+                无匹配缓存时返回 "9999"（排到最后）。
+                """
+                if season is None:
+                    prefix = f"{tmdbid}:M"
+                    def _m(k):
+                        return k == prefix
+                else:
+                    sp = f"{tmdbid}:S{season:02d}E"
+                    def _m(k):
+                        return k.startswith(sp)
+                times = [p.get("t", "9999") for p in pb if _m(p.get("k", "") or "")]
+                return min(times) if times else "9999"
+
             def _season_last_watched_time(recs):
                 """电视剧整季判断：以整理记录中该季出现的最后一集为准，
                 只有最后一集已看完才返回 (缓存时间, None)，否则返回 (None, 跳过原因)。
@@ -1151,9 +1169,13 @@ class SpaceCleaner(_PluginBase):
             def _add_tv_season_unit(recs):
                 """一个 (tmdbid, season) 的所有整理记录构成一个删除单元。"""
                 t, skip_reason = _season_last_watched_time(recs)
+                tmdbid = recs[0].tmdbid
+                season = self._norm_season(recs[0].seasons or "")
+                # 排序键：该季在播放缓存中最早的标记时间（越早越先处理）
+                mark_time = _unit_earliest_mark_time(tmdbid, season)
                 if t is None:
                     if skip_reason:
-                        skip_logs.append(skip_reason)
+                        skip_logs.append((mark_time, skip_reason))
                     return
                 rep = max(recs, key=_ep_max)
                 tmdbid = rep.tmdbid
@@ -1173,7 +1195,7 @@ class SpaceCleaner(_PluginBase):
                     "season": season,
                     "is_tv": True,
                     "display": display,
-                    "sort_time": t or "9999",
+                    "sort_time": mark_time,
                     "prio": str(tmdbid) in prio_tmdbids,
                 })
 
@@ -1195,7 +1217,7 @@ class SpaceCleaner(_PluginBase):
                     "season": None,
                     "is_tv": False,
                     "display": rep.title or "未知",
-                    "sort_time": t or "9999",
+                    "sort_time": _unit_earliest_mark_time(tmdbid, None),
                     "prio": str(tmdbid) in prio_tmdbids,
                 })
 
@@ -1232,18 +1254,20 @@ class SpaceCleaner(_PluginBase):
             for r in movie_no_hash:
                 _add_movie_unit([r])
 
-            # 输出因未看完/无播放记录而跳过的电视剧季，便于排查
+            # 输出因未看完/无播放记录而跳过的电视剧季，按最早标记时间排序，每行 5 个
             if skip_logs:
-                logger.info(f"SC 以下 {len(skip_logs)} 个电视剧季不满足删除条件，已跳过：")
-                for s in skip_logs:
-                    logger.info(f"SC   - {s}")
+                skip_logs.sort(key=lambda x: x[0])
+                reasons = [s for _, s in skip_logs]
+                logger.info(f"SC 以下 {len(reasons)} 个电视剧季不满足删除条件，已跳过（按最早标记时间排序）：")
+                for i in range(0, len(reasons), 5):
+                    logger.info("SC   - " + " ｜ ".join(reasons[i:i + 5]))
 
             if not delete_units:
                 logger.info("SC 未发现满足删除条件的资源（已看完且在转移历史中）")
                 return
 
-            logger.info(f"SC 共 {len(delete_units)} 个删除单元满足条件，按优先标记与最早看完时间排序后开始清理")
-            # 排序：优先删除被标记的资源，其次最早已看完（缓存时间升序）
+            logger.info(f"SC 共 {len(delete_units)} 个删除单元满足条件，按优先标记与最早标记时间排序后开始清理")
+            # 排序：优先删除被标记的资源，其次播放缓存中最早标记的（标记时间升序）
             delete_units.sort(key=lambda u: (not u["prio"], u["sort_time"]))
         finally:
             sess.close()
