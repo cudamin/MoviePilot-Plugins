@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.5.1"
+    plugin_version = "4.5.2"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -2117,7 +2117,7 @@ class SpaceCleaner(_PluginBase):
         """洗版模式：下载种子文件，取其中的视频文件名做 TMDB 识别。
         recognize_media(cache=True) 会优先命中 MoviePilot 的 TMDB 识别缓存。
         返回 (media, meta, video_name)，video_name 为用于识别的视频文件名（basename），
-        供后续电视剧按 MP 剧集解析引擎重新提取季/集使用。"""
+        供后续电视剧用正则从原视频文件名提取季/集使用。"""
         enc = item.get("enclosure", "") or item.get("link", "")
         fns = self._rss_fnames(enc)
         if fns:
@@ -2138,23 +2138,16 @@ class SpaceCleaner(_PluginBase):
         return None, None, ""
 
     def _rss_tv_season_episode(self, m, meta, video_name: str):
-        """电视剧洗版：调用 MP 的剧集解析引擎（与电视剧重命名同源的 MetaVideo）
-        对视频文件名重新解析，得到权威的季号与集号。
+        """电视剧洗版：用正则从原视频文件名解析季号与集号，
+        仅用于洗版判重与“是否已看完”判断（不做实际文件重命名）。
 
-        优先级：MP 视频名解析结果 > TMDB 识别结果(m.season) > RSS 标题解析(meta)。
+        优先级：文件名正则解析结果 > TMDB 识别结果(m.season) > RSS 标题解析(meta)。
         返回 (season:int, episode:int|None)。"""
         season = None
         episode = None
-        # 1) 用 MP 剧集解析引擎解析视频文件名（电视剧重命名用的就是这个）
+        # 1) 用正则从原视频文件名（去掉目录）解析季/集
         if video_name:
-            try:
-                mv = MetaVideo(title=video_name.rsplit("/", 1)[-1])
-                if mv.begin_season is not None:
-                    season = mv.begin_season
-                if mv.begin_episode is not None:
-                    episode = mv.begin_episode
-            except Exception:
-                pass
+            season, episode = self._parse_se_from_name(video_name.rsplit("/", 1)[-1])
         # 2) 回退到 TMDB 识别结果与 RSS 标题解析结果
         if season is None:
             season = m.season if m.season is not None else meta.begin_season
@@ -2171,6 +2164,49 @@ class SpaceCleaner(_PluginBase):
         except (ValueError, TypeError):
             episode = None
         return season, episode
+
+    @staticmethod
+    def _parse_se_from_name(name: str) -> Tuple[Optional[int], Optional[int]]:
+        """用正则从视频文件名解析 (季, 集)。解析不到的部分返回 None。
+
+        支持常见命名：S01E05 / s1.e5 / 1x05 / 第1季第5集 / 第5话 /
+        Season 1 Episode 5 / EP05 / E05 / 动漫式 “- 05 ” 或 “[05]”（仅集号，季默认 1）。"""
+        if not name:
+            return None, None
+        s = name
+        # S01E05 / S1E5 / S01.E05 / S01 E05
+        mm = re.search(r'[Ss](\d{1,2})[\s._\-]*[Ee](\d{1,3})(?!\d)', s)
+        if mm:
+            return int(mm.group(1)), int(mm.group(2))
+        # 1x05 / 01x05
+        mm = re.search(r'(?<!\d)(\d{1,2})x(\d{1,3})(?!\d)', s, re.IGNORECASE)
+        if mm:
+            return int(mm.group(1)), int(mm.group(2))
+        # 中文：第1季 ... 第5集/话
+        season = None
+        ms = re.search(r'第\s*(\d{1,2})\s*季', s)
+        if ms:
+            season = int(ms.group(1))
+        me = re.search(r'第\s*(\d{1,3})\s*[集话話]', s)
+        if me:
+            return (season if season is not None else 1), int(me.group(1))
+        # Season 1 [Episode 5]
+        ms = re.search(r'[Ss]eason\s*(\d{1,2})', s)
+        if ms:
+            season = int(ms.group(1))
+        me = re.search(r'[Ee]pisode\s*(\d{1,3})(?!\d)', s)
+        if me:
+            return (season if season is not None else 1), int(me.group(1))
+        # EP05 / EP.05 / E05（前后不接字母，避免误匹配单词）
+        mm = re.search(r'(?<![A-Za-z])[Ee][Pp]?[\s._]*(\d{1,3})(?![A-Za-z0-9])', s)
+        if mm:
+            return (season if season is not None else 1), int(mm.group(1))
+        # 动漫式：分隔符后的独立集号，如 “Title - 05 ” 或 “[05]”“【05】”
+        # 排除分辨率/年份：不匹配 4 位数，且集号后不紧跟 p（如 720p）
+        mm = re.search(r'(?:[-\[【]\s*)(\d{1,3})(?!\d)(?![Pp])\s*(?:[\]】]|[\s.\-]|$)', s)
+        if mm:
+            return (season if season is not None else 1), int(mm.group(1))
+        return season, None
 
     # 视频文件扩展名（洗版识别时优先取这些文件的文件名）
     _VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
