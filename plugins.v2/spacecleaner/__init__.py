@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.4.3"
+    plugin_version = "4.5.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -1959,13 +1959,13 @@ class SpaceCleaner(_PluginBase):
                     self._rss_washed.add(ep_key)
                 self._rss_log("下载", m.title)
                 if self._rss_ntf:
-                    self.post_message(title="SC-RSS",
-                                      text=f"已添加下载: {m.title} {se_fmt}")
+                    self.post_message(title="SC-RSS 已添加下载",
+                                      text=self._rss_notify_text(item, meta, m, se_fmt))
             else:
                 self._rss_log("下载失败", item.get("title", ""), "推送下载器失败")
                 if self._rss_ntf:
-                    self.post_message(title="SC-RSS",
-                                      text=f"添加种子任务失败: {m.title} {se_fmt}")
+                    self.post_message(title="SC-RSS 添加失败",
+                                      text=f"名称: {m.title} {se_fmt}")
         s = list(self._rss_seen)
         if len(s) > 2000:
             s = s[-2000:]
@@ -2009,14 +2009,14 @@ class SpaceCleaner(_PluginBase):
         return ts_a < ts_b
 
     def _rss_proc(self, url: str):
+        """普通模式（未开启洗版）：不做 TMDB 识别，直接添加种子到下载器。
+        去重由 _rss_seen（enclosure 集合，持久化）保证，避免重复添加同一个种子。"""
         items = RssHelper().parse(url)
         if not items:
             logger.info(f"SC-RSS 未获取到新报文: {url}")
             return
         url_new = 0
         url_filtered = 0
-        # 第一遍：识别所有条目，按 (tmdb_id, season, episode) 分组，每组只保留最早出现的条目
-        seen_dedup = {}  # dedup_key -> (item, m, meta, s_season, se_fmt)
         for item in items:
             t = item.get("title", "")
             e = item.get("enclosure", "") or item.get("link", "")
@@ -2047,61 +2047,17 @@ class SpaceCleaner(_PluginBase):
                     if gb < lo or gb > hi:
                         continue
             url_filtered += 1
-            m, meta = self._rss_id(item, t)
-            if not m or not meta:
-                self._rss_log("识别失败", t)
+            # 未开启洗版：跳过 TMDB 识别，仅本地解析标题用于通知的类别/质量（不调用 TMDB）
+            meta = MetaInfo(title=t)
+            if self._rss_add_direct(item):
+                self._rss_log("下载", t)
                 if self._rss_ntf:
-                    self.post_message(title="SC-RSS识别失败",
-                                      text=f"资源无法识别: {t}")
-                continue
-            cr = self._rss_ck(m, meta)
-            s_season = m.season or meta.begin_season or 1
-            se_fmt = f"S{int(s_season):02d}E{int(meta.begin_episode or 0):02d}" if meta.begin_episode else ""
-            if cr["s"]:
-                sc = 1
-                self._rss_log("跳过", m.title, cr["r"])
-                if self._rss_ntf:
-                    self.post_message(title="SC-RSS跳过",
-                                      text=f"{m.title} {se_fmt} {cr['r']}")
-                continue
-            # 洗版模式：播放进度低于阈值时触发洗版，同一 (tmdb_id, season, episode) 只保留 RSS feed 中最早出现的条目
-            if self._rss_wash_mode:
-                # 构造去重 key：优先用 tmdb_id+season+episode，缺字段时用 enclosure
-                if m.tmdb_id and meta.begin_episode:
-                    dedup_key = (m.tmdb_id, int(s_season), int(meta.begin_episode))
-                elif m.tmdb_id:
-                    dedup_key = ("tmdb", m.tmdb_id, int(s_season))
-                else:
-                    dedup_key = ("enclosure", item.get("enclosure", "") or item.get("link", ""))
-                if dedup_key in seen_dedup:
-                    self._rss_log("洗版去重跳过", m.title, f"{se_fmt} 已有更早版本")
-                    continue
-                seen_dedup[dedup_key] = (item, m, meta, s_season, se_fmt)
+                    self.post_message(title="SC-RSS 已添加下载",
+                                      text=self._rss_notify_text(item, meta))
             else:
-                # 开关关闭或无法去重的条目直接下载
-                if self._rss_dl_add(item, m, meta):
-                    self._rss_log("下载", m.title)
-                    if self._rss_ntf:
-                        self.post_message(title="SC-RSS",
-                                          text=f"已添加下载: {m.title} {se_fmt}")
-                else:
-                    self._rss_log("下载失败", t, "推送下载器失败")
-                    if self._rss_ntf:
-                        self.post_message(title="SC-RSS",
-                                          text=f"添加种子任务失败: {m.title} {se_fmt}")
-        if self._rss_wash_mode:
-            for dedup_key, payload in seen_dedup.items():
-                item, m, meta, s_season, se_fmt = payload
-                if self._rss_dl_add(item, m, meta):
-                    self._rss_log("下载", m.title)
-                    if self._rss_ntf:
-                        self.post_message(title="SC-RSS",
-                                          text=f"已添加下载: {m.title} {se_fmt}")
-                else:
-                    self._rss_log("下载失败", item.get("title", ""), "推送下载器失败")
-                    if self._rss_ntf:
-                        self.post_message(title="SC-RSS",
-                                          text=f"添加种子任务失败: {m.title} {se_fmt}")
+                self._rss_log("下载失败", t, "添加下载器失败")
+                if self._rss_ntf:
+                    self.post_message(title="SC-RSS 添加失败", text=f"名称: {t}")
         logger.info(f"SC-RSS [{url}] 获取到 {url_new} 个新报文，过滤后剩余 {url_filtered} 个")
         s = list(self._rss_seen)
         if len(s) > 2000:
@@ -2135,12 +2091,16 @@ class SpaceCleaner(_PluginBase):
             return {"s": False, "r": "无记录(触发洗版)"}
 
     def _rss_id(self, item: dict, rt: str):
+        """洗版模式：下载种子文件，取其中的视频文件名做 TMDB 识别。
+        recognize_media(cache=True) 会优先命中 MoviePilot 的 TMDB 识别缓存。"""
         enc = item.get("enclosure", "") or item.get("link", "")
         fns = self._rss_fnames(enc)
         if fns:
             for fn in fns:
                 try:
-                    meta = MetaInfo(title=fn)
+                    # 用视频文件名（去掉目录）识别，命中率更高
+                    base = fn.rsplit("/", 1)[-1]
+                    meta = MetaInfo(title=base)
                     if meta.name and (media := self.chain.recognize_media(meta=meta, cache=True)):
                         return media, meta
                 except Exception:
@@ -2152,8 +2112,14 @@ class SpaceCleaner(_PluginBase):
                 return media, meta
         return None, None
 
-    @staticmethod
-    def _rss_fnames(enc: str) -> List[str]:
+    # 视频文件扩展名（洗版识别时优先取这些文件的文件名）
+    _VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
+                   ".flv", ".rmvb", ".rm", ".mpg", ".mpeg", ".webm", ".iso")
+
+    @classmethod
+    def _rss_fnames(cls, enc: str) -> List[str]:
+        """解析种子文件的文件列表，仅返回视频文件（按体积从大到小），
+        无视频文件时回退到全部文件名。"""
         if not enc:
             return []
         try:
@@ -2166,12 +2132,17 @@ class SpaceCleaner(_PluginBase):
             info = t.get("info", {})
             files = info.get("files", [])
             if files:
-                res = []
+                all_files = []  # (path, length)
                 for f in files:
                     parts = [p.decode("utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p in f.get("path", [])]
                     if parts:
-                        res.append("/".join(parts))
-                return res
+                        all_files.append(("/".join(parts), f.get("length", 0) or 0))
+                # 优先取视频文件，按体积从大到小（正片通常最大）
+                videos = [(p, l) for p, l in all_files if p.lower().endswith(cls._VIDEO_EXTS)]
+                if videos:
+                    videos.sort(key=lambda x: x[1], reverse=True)
+                    return [p for p, _ in videos]
+                return [p for p, _ in all_files]
             name = info.get("name", "")
             if isinstance(name, bytes):
                 name = name.decode("utf-8", errors="replace")
@@ -2202,6 +2173,82 @@ class SpaceCleaner(_PluginBase):
         except Exception as e:
             logger.error(f"RSS dl err {e}")
             return False
+
+    def _rss_add_direct(self, item: dict) -> bool:
+        """未开启洗版模式：不做 TMDB 识别，直接把种子添加到下载器。
+        通过下载器实例添加：磁链直接传 URL，种子文件先下载内容再添加。"""
+        try:
+            enc = item.get("enclosure", "") or item.get("link", "")
+            if not enc:
+                return False
+            from app.helper.downloader import DownloaderHelper
+            helper = DownloaderHelper()
+            if self._rss_dl:
+                svc = helper.get_service(name=self._rss_dl)
+            else:
+                svcs = helper.get_services() or {}
+                svc = None
+                for s in svcs.values():
+                    if s.config and getattr(s.config, "enabled", True) and not s.instance.is_inactive():
+                        svc = s
+                        break
+            if not svc or not svc.instance:
+                logger.warn("SC-RSS 未找到可用下载器，无法直接添加种子")
+                return False
+            downloader = svc.instance
+            content = enc
+            # 非磁链：先下载 .torrent 文件内容
+            if not enc.lower().startswith("magnet:"):
+                r = RequestUtils(timeout=30).get_res(enc)
+                if not r or r.status_code != 200:
+                    logger.warn(f"SC-RSS 下载种子文件失败: {item.get('title', '')}")
+                    return False
+                content = r.content
+            r = downloader.add_torrent(content=content, download_dir=self._rss_save_path or None)
+            return bool(r)
+        except Exception as e:
+            logger.error(f"RSS direct add err {e}")
+            return False
+
+    @staticmethod
+    def _rss_size_str(item: dict) -> str:
+        sz = item.get("size", 0) or 0
+        try:
+            sz = float(sz)
+        except (ValueError, TypeError):
+            return ""
+        if sz <= 0:
+            return ""
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if sz < 1024 or unit == "TB":
+                return f"{sz:.2f} {unit}"
+            sz /= 1024
+        return ""
+
+    def _rss_notify_text(self, item: dict, meta: MetaInfo, m=None, se_fmt: str = "") -> str:
+        """通知正文：仅含类别、质量、大小、名称（不含描述）。"""
+        # 类别：优先 TMDB 识别的媒体类型，否则用本地解析
+        cat = ""
+        if m is not None and getattr(m, "type", None):
+            cat = m.type.value if hasattr(m.type, "value") else str(m.type)
+        elif getattr(meta, "type", None):
+            cat = meta.type.value if hasattr(meta.type, "value") else str(meta.type)
+        quality = getattr(meta, "resource_pix", "") or getattr(meta, "edition", "") or ""
+        size = self._rss_size_str(item)
+        # 名称：TMDB 标题优先，否则用报文标题
+        if m is not None and getattr(m, "title", None):
+            name = f"{m.title} {se_fmt}".strip()
+        else:
+            name = item.get("title", "")
+        lines = []
+        if cat:
+            lines.append(f"类别: {cat}")
+        if quality:
+            lines.append(f"质量: {quality}")
+        if size:
+            lines.append(f"大小: {size}")
+        lines.append(f"名称: {name}")
+        return "\n".join(lines)
 
     def _rss_log(self, a, title, r=""):
         # RSS下载历史不持久化，仅用于本次运行期间的日志记录
