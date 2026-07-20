@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.6.1"
+    plugin_version = "4.6.2"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -73,9 +73,6 @@ class SpaceCleaner(_PluginBase):
     _rss_th = 85
     _rss_wash_mode = False  # 洗版模式：播放进度低于阈值时触发洗版，只下载最早版本
     _rss_save_path = ""  # RSS 下载自定义保存路径
-    _rss_ctmdba = False  # 洗版分辨季时查询 CTMDbA 插件（番剧季分离），修正 TMDB 合并季
-    _rss_ctmdba_port = 8632  # CTMDbA 本地代理端口
-    _ctmdba_cache: dict = {}  # tmdb_id -> {(tmdb_season, tmdb_ep): (logical_season, logical_ep)}
 
     # === 内部状态 ===
     _scheduler_thread = None
@@ -125,9 +122,6 @@ class SpaceCleaner(_PluginBase):
         self._rss_th = 85
         self._rss_wash_mode = False
         self._rss_save_path = ""
-        self._rss_ctmdba = False
-        self._rss_ctmdba_port = 8632
-        self._ctmdba_cache = {}
         self._pb = list(self.get_data("pb") or [])
         self._rss_seen = set()
         self._rss_washed = set()
@@ -186,11 +180,6 @@ class SpaceCleaner(_PluginBase):
         self._rss_washed = set(self.get_data("rss_washed") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
-        self._rss_ctmdba = bool(config.get("rss_ctmdba"))
-        try:
-            self._rss_ctmdba_port = int(config.get("rss_ctmdba_port") or 8632)
-        except (ValueError, TypeError):
-            self._rss_ctmdba_port = 8632
 
         if self._enabled:
             self._start_scheduler()
@@ -228,7 +217,6 @@ class SpaceCleaner(_PluginBase):
             "rss_exc": self._rss_exc, "rss_once": self._rss_once, "rss_ntf": self._rss_ntf,
             "rss_th": self._rss_th, "rss_wash_mode": self._rss_wash_mode,
             "rss_save_path": self._rss_save_path,
-            "rss_ctmdba": self._rss_ctmdba, "rss_ctmdba_port": self._rss_ctmdba_port,
             "clean_downloader": self._clean_downloader,
         })
 
@@ -565,10 +553,6 @@ class SpaceCleaner(_PluginBase):
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VCronField", "props": {"model": "rss_cron", "label": "执行周期"}}]},
                 ]},
                 {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_ctmdba", "label": "使用 CTMDbA 分季", "hint": "洗版辨别番剧季号时查询 CureTMDbA 插件的季分离映射（需已安装并启用该插件）", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "rss_ctmdba_port", "label": "CTMDbA 端口", "type": "number", "placeholder": "8632", "hint": "与 CureTMDbA 插件运行端口一致", "persistent-hint": True}}]},
-                ]},
-                {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextField", "props": {"model": "rss_save_path", "label": "自定义保存路径", "placeholder": "留空使用默认路径", "hint": "支持 <storage>:<path> 格式", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "rss_urls", "label": "RSS链接", "rows": 4}}]},
                 ]},
@@ -610,7 +594,6 @@ class SpaceCleaner(_PluginBase):
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
             "rss_dl": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
             "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False, "rss_save_path": "",
-            "rss_ctmdba": False, "rss_ctmdba_port": 8632,
         }
 
     # ==================== 详情页（三区块平铺） ====================
@@ -687,7 +670,7 @@ class SpaceCleaner(_PluginBase):
         cards.append({
             "component": "VCard", "props": {"variant": "flat", "class": "mt-2"},
             "content": [
-                {"component": "VCardTitle", "props": {}, "content": "删除历史记录（最近 50 条）"},
+                {"component": "VCardTitle", "props": {}, "text": "删除历史记录（最近 50 条）"},
                 {"component": "VCardText", "content": [{"component": "VTable", "props": {"density": "compact", "hover": True}, "content": {
                     "thead": [{"th": [{"text": "时间"}, {"text": "资源"}, {"text": "操作"}]}],
                     "tbody": hist_rows if hist_rows else [{"tr": [{"td": {"attrs": {"colspan": 3}, "content": [{"text": "暂无删除记录"}]}}]}],
@@ -2238,14 +2221,8 @@ class SpaceCleaner(_PluginBase):
 
         季/集直接取自 MoviePilot 的识别结果（MetaInfo 已用 MetaVideo 解析并套用自定义
         识别词），不再自行用正则解析文件名，实际下载后的重命名仍由 MP 完成。
-
-        番剧在 TMDB 上常被合并为一季，导致季号/集号与实际发布不符。开启“CTMDbA 分季”后，
-        会查询 CTMDbA 插件（CureTMDbAnime）的逻辑季集映射，把 TMDB 合并季/集翻译成实际
-        分季季号/集号，从而正确判断当前季是否已看完。
-
-        优先级：CTMDbA 逻辑映射 > MP 识别季/集(meta.begin_season/episode、m.season)。
-        返回 (season:int, episode:int|None)。"""
-        # 1) 取 MP 识别（MetaVideo 解析）出的季/集
+        """
+        # 取 MP 识别（MetaVideo 解析）出的季/集
         season = meta.begin_season if meta.begin_season is not None else m.season
         episode = meta.begin_episode
         if season is None:
@@ -2260,55 +2237,7 @@ class SpaceCleaner(_PluginBase):
             episode = None
         self._rss_log("季集解析", getattr(m, "title", ""),
                       f"MP识别 S{season:02d}" + (f"E{episode:02d}" if episode is not None else "（无集号）"))
-        # 2) 开启 CTMDbA 分季：用 TMDB(合并)季集查逻辑(分季)季集
-        if self._rss_ctmdba and episode is not None and getattr(m, "tmdb_id", None):
-            logical = self._ctmdba_logical_se(int(m.tmdb_id), season, episode)
-            if logical:
-                ls, le = logical
-                self._rss_log("CTMDbA分季", getattr(m, "title", ""),
-                              f"S{season:02d}E{episode:02d} -> S{ls:02d}E{le:02d}")
-                season, episode = ls, le
         return season, episode
-
-    def _ctmdba_logical_se(self, tmdb_id: int, season: int, episode: int):
-        """查询 CTMDbA 插件的逻辑季集映射，把 TMDB 合并季/集翻译为实际分季季/集。
-
-        CTMDbA 启用后会在本地起代理服务（默认端口 8632），并提供映射接口
-        /cache/mapping/{tmdb_id}，返回 {tmdb季: {tmdb集: {season, episode}}}。
-        命中则返回 (逻辑季, 逻辑集)，否则返回 None。结果按运行缓存，避免重复请求。"""
-        if not tmdb_id:
-            return None
-        cache = getattr(self, "_ctmdba_cache", None)
-        if cache is None:
-            cache = {}
-            self._ctmdba_cache = cache
-        if tmdb_id not in cache:
-            mapping = {}
-            try:
-                url = f"http://127.0.0.1:{self._rss_ctmdba_port}/cache/mapping/{tmdb_id}"
-                result = RequestUtils(timeout=3).get_json(url)
-                if isinstance(result, dict):
-                    for s_key, eps in result.items():
-                        if not isinstance(eps, dict):
-                            continue
-                        try:
-                            s_num = int(s_key)
-                        except (TypeError, ValueError):
-                            continue
-                        for e_key, itm in eps.items():
-                            if not isinstance(itm, dict):
-                                continue
-                            try:
-                                e_num = int(e_key)
-                                ls = int(itm.get("season"))
-                                le = int(itm.get("episode"))
-                            except (TypeError, ValueError):
-                                continue
-                            mapping[(s_num, e_num)] = (ls, le)
-            except Exception as e:
-                logger.debug(f"SC-RSS 查询 CTMDbA 映射失败 tmdb={tmdb_id}: {e}")
-            cache[tmdb_id] = mapping
-        return cache[tmdb_id].get((int(season), int(episode)))
 
     # 视频文件扩展名（洗版识别时优先取这些文件的文件名）
     _VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
@@ -2460,4 +2389,3 @@ class SpaceCleaner(_PluginBase):
             logger.info(msg)
         except Exception:
             pass
-
