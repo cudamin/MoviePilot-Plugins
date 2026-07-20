@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.6.2"
+    plugin_version = "4.6.3"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -2162,37 +2162,87 @@ class SpaceCleaner(_PluginBase):
         返回 (media, meta, video_name)，video_name 为用于识别的视频文件名（basename）。"""
         enc = item.get("enclosure", "") or item.get("link", "")
         fns = self._rss_fnames(enc)
+
+        def _try_recognize(title: str, subtitle: str = "", source_label: str = ""):
+            """尝试用给定标题做 MetaInfo 解析 + TMDB 识别，返回 (media, meta, ok)"""
+            meta = MetaInfo(title=title, subtitle=subtitle)
+            self._rss_log_meta(source_label, title, meta)
+            if not meta.name:
+                return None, meta, False
+            media = self.chain.recognize_media(meta=meta, cache=True)
+            if media:
+                self._rss_log("识别成功", title,
+                              f"TMDB={media.tmdb_id} {media.type.value if getattr(media,'type',None) else ''} 《{media.title}》")
+                return media, meta, True
+            else:
+                self._rss_log("识别未命中", title, "该标题未匹配到 TMDB")
+                return None, meta, False
+
         # 1) 优先用种子内的视频文件名识别（命中率更高）
         if fns:
             self._rss_log("识别", rt, f"种子含 {len(fns)} 个文件，优先用视频文件名识别")
+            best_file_media, best_file_meta, best_file_base = None, None, ""
             for fn in fns:
                 try:
                     base = fn.rsplit("/", 1)[-1]
-                    meta = MetaInfo(title=base)  # MetaInfo 内部套用自定义识别词
-                    self._rss_log_meta("文件名候选", base, meta)
-                    if meta.name and (media := self.chain.recognize_media(meta=meta, cache=True)):
-                        self._rss_log("识别成功", base,
-                                      f"TMDB={media.tmdb_id} {media.type.value if getattr(media,'type',None) else ''} 《{media.title}》")
+                    media, meta, ok = _try_recognize(base, source_label="文件名候选")
+                    if not ok:
+                        continue
+                    # 优先选用带集号的识别结果
+                    if meta.begin_episode is not None:
                         return media, meta, base
-                    else:
-                        self._rss_log("识别未命中", base, "该文件名未匹配到 TMDB，尝试下一个")
+                    if best_file_media is None:
+                        best_file_media, best_file_meta, best_file_base = media, meta, base
                 except Exception as ex:
                     self._rss_log("识别异常", fn, str(ex))
                     continue
+            # 所有文件名候选都无集号，保留第一个成功的，从原始标题补充集号
+            if best_file_media is not None:
+                media, meta, base = best_file_media, best_file_meta, best_file_base
+                meta = self._rss_merge_episode_from_title(meta, rt)
+                return media, meta, base
+
         # 2) 回退到 RSS 标题识别
         ct = re.sub(r'\[.*?\]', "", rt).strip()
         cands = [x.strip() for x in ct.split("/") if x.strip()] or [ct]
         self._rss_log("识别", rt, f"回退用标题识别，共 {len(cands)} 个候选")
+        best_media, best_meta, best_c = None, None, ""
         for c in cands:
-            meta = MetaInfo(title=c, subtitle=item.get("description", ""))  # 套用自定义识别词
-            self._rss_log_meta("标题候选", c, meta)
-            if meta.name and (media := self.chain.recognize_media(meta=meta, cache=True)):
-                self._rss_log("识别成功", c,
-                              f"TMDB={media.tmdb_id} {media.type.value if getattr(media,'type',None) else ''} 《{media.title}》")
+            media, meta, ok = _try_recognize(c, subtitle=item.get("description", ""), source_label="标题候选")
+            if not ok:
+                continue
+            # 优先选用带集号的识别结果
+            if meta.begin_episode is not None:
                 return media, meta, c
-            else:
-                self._rss_log("识别未命中", c, "该标题未匹配到 TMDB")
+            if best_media is None:
+                best_media, best_meta, best_c = media, meta, c
+        if best_media is not None:
+            self._rss_log("识别回退", best_c, "所有候选均无集号，从原始标题补充")
+            meta = self._rss_merge_episode_from_title(best_meta, rt)
+            return best_media, meta, best_c
         return None, None, ""
+
+    def _rss_merge_episode_from_title(self, meta, rt: str):
+        """当 MetaInfo 解析结果缺少集号时，从原始 RSS 标题中重新提取季集信息，
+        合并到 meta 中，确保插件识别的季集与 MP 入库时一致。
+
+        MP 入库时 DownloadChain.download_single 使用 context.meta_info 的
+        season/episode 写入下载记录，因此此处修改 meta.begin_season/begin_episode
+        能直接影响入库季集。"""
+        if meta.begin_episode is not None:
+            return meta
+        # 从原始 RSS 标题重新解析季集（去掉方括号内容以减少干扰）
+        clean = re.sub(r'\[.*?\]', "", rt).strip()
+        fallback = MetaInfo(title=clean)
+        if fallback.begin_episode is not None:
+            self._rss_log("季集补充", rt,
+                          f"从原始标题提取 S{fallback.begin_season or 1:02d}E{fallback.begin_episode:02d}")
+            meta.begin_season = fallback.begin_season if fallback.begin_season is not None else (meta.begin_season or 1)
+            meta.begin_episode = fallback.begin_episode
+            # 同时更新 episode_list 供 MP 下载链使用
+            if not hasattr(meta, "episode_list") or meta.episode_list is None:
+                meta.episode_list = [fallback.begin_episode]
+        return meta
 
     def _rss_log_meta(self, stage: str, raw: str, meta) -> None:
         """输出 MetaInfo 的解析细节：套用的自定义识别词、解析出的名称与季集。"""
