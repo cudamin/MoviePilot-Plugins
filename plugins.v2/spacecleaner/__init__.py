@@ -30,7 +30,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.6.0"
+    plugin_version = "4.6.1"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -1942,6 +1942,17 @@ class SpaceCleaner(_PluginBase):
                     se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}" if s_episode else f"S{int(s_season):02d}"
                 else:
                     se_fmt = "电影"
+                # 洗版模式：若该季已有更新集的播放记录，则跳过之前的所有旧集
+                # 例：缓存中已有第 10 集记录，则该季 1-9 集不再洗版下载
+                if is_tv and s_episode is not None:
+                    latest_ep = self._rss_latest_watched_ep(m.tmdb_id, s_season)
+                    if latest_ep is not None and int(s_episode) < latest_ep:
+                        self._rss_log("跳过旧集", m.title,
+                                      f"{se_fmt} 已看到 E{latest_ep:02d}，跳过更早的集")
+                        if self._rss_ntf:
+                            self.post_message(title="SC-RSS跳过旧集",
+                                              text=f"{m.title} {se_fmt} 已看到第{latest_ep}集，跳过旧集")
+                        continue
                 # 洗版模式：播放进度低于阈值才触发洗版
                 if cr["s"]:
                     # 已看完（进度 >= 阈值），跳过
@@ -2130,51 +2141,115 @@ class SpaceCleaner(_PluginBase):
                         return {"s": False, "r": f"{p:.1f}%(洗版关闭)"}
             return {"s": False, "r": "无记录(触发洗版)"}
 
+    def _rss_latest_watched_ep(self, tmdb_id, season) -> Optional[int]:
+        """洗版模式：查找某剧某季在播放缓存中“已有播放记录”的最大集号。
+
+        用于跳过旧集：若缓存中已有第 10 集的播放记录，说明用户已看到第 10 集，
+        则该季 1-9 集无需再洗版下载。只要该集存在任意播放记录（不论进度）即计入，
+        因为“有记录”本身就代表已获取过更新的集。
+
+        返回最大已观看集号；无任何记录返回 None。"""
+        if self._media_cache_disabled or not tmdb_id or season is None:
+            return None
+        prefix = f"{tmdb_id}:S{int(season):02d}E"
+        latest = None
+        with self._pb_lock:
+            for r in self._pb:
+                k = r.get("k") or ""
+                if not k.startswith(prefix):
+                    continue
+                try:
+                    ep = int(k[len(prefix):])
+                except (ValueError, TypeError):
+                    continue
+                if latest is None or ep > latest:
+                    latest = ep
+        return latest
+
     def _rss_id(self, item: dict, rt: str):
         """洗版模式：下载种子文件，取其中的视频文件名做 TMDB 识别。
-        recognize_media(cache=True) 会优先命中 MoviePilot 的 TMDB 识别缓存。
-        返回 (media, meta, video_name)，video_name 为用于识别的视频文件名（basename），
-        供后续电视剧用正则从原视频文件名提取季/集使用。"""
+
+        识别时统一走 MoviePilot 的 MetaInfo()，它在解析前会自动套用用户在
+        “设定-自定义识别词”里配置的识别词（屏蔽/替换/集偏移等），套用结果记录在
+        meta.apply_words；随后用 recognize_media(cache=True) 命中 TMDB 识别缓存。
+
+        整个识别过程会写入日志：候选来源、原始串、套用的识别词、解析出的标题/季集、
+        以及最终 TMDB 命中结果，便于排查识别错误。
+
+        返回 (media, meta, video_name)，video_name 为用于识别的视频文件名（basename）。"""
         enc = item.get("enclosure", "") or item.get("link", "")
         fns = self._rss_fnames(enc)
+        # 1) 优先用种子内的视频文件名识别（命中率更高）
         if fns:
+            self._rss_log("识别", rt, f"种子含 {len(fns)} 个文件，优先用视频文件名识别")
             for fn in fns:
                 try:
-                    # 用视频文件名（去掉目录）识别，命中率更高
                     base = fn.rsplit("/", 1)[-1]
-                    meta = MetaInfo(title=base)
+                    meta = MetaInfo(title=base)  # MetaInfo 内部套用自定义识别词
+                    self._rss_log_meta("文件名候选", base, meta)
                     if meta.name and (media := self.chain.recognize_media(meta=meta, cache=True)):
+                        self._rss_log("识别成功", base,
+                                      f"TMDB={media.tmdb_id} {media.type.value if getattr(media,'type',None) else ''} 《{media.title}》")
                         return media, meta, base
-                except Exception:
+                    else:
+                        self._rss_log("识别未命中", base, "该文件名未匹配到 TMDB，尝试下一个")
+                except Exception as ex:
+                    self._rss_log("识别异常", fn, str(ex))
                     continue
+        # 2) 回退到 RSS 标题识别
         ct = re.sub(r'\[.*?\]', "", rt).strip()
-        for c in [x.strip() for x in ct.split("/") if x.strip()] or [ct]:
-            meta = MetaInfo(title=c, subtitle=item.get("description", ""))
+        cands = [x.strip() for x in ct.split("/") if x.strip()] or [ct]
+        self._rss_log("识别", rt, f"回退用标题识别，共 {len(cands)} 个候选")
+        for c in cands:
+            meta = MetaInfo(title=c, subtitle=item.get("description", ""))  # 套用自定义识别词
+            self._rss_log_meta("标题候选", c, meta)
             if meta.name and (media := self.chain.recognize_media(meta=meta, cache=True)):
+                self._rss_log("识别成功", c,
+                              f"TMDB={media.tmdb_id} {media.type.value if getattr(media,'type',None) else ''} 《{media.title}》")
                 return media, meta, c
+            else:
+                self._rss_log("识别未命中", c, "该标题未匹配到 TMDB")
         return None, None, ""
 
+    def _rss_log_meta(self, stage: str, raw: str, meta) -> None:
+        """输出 MetaInfo 的解析细节：套用的自定义识别词、解析出的名称与季集。"""
+        try:
+            parts = []
+            name = getattr(meta, "name", "") or ""
+            if name:
+                parts.append(f"解析名称={name}")
+            bs = getattr(meta, "begin_season", None)
+            be = getattr(meta, "begin_episode", None)
+            if bs is not None:
+                parts.append(f"季={bs}")
+            if be is not None:
+                parts.append(f"集={be}")
+            aw = getattr(meta, "apply_words", None)
+            if aw:
+                parts.append(f"套用识别词={aw}")
+            else:
+                parts.append("套用识别词=无")
+            self._rss_log(stage, raw, "，".join(parts))
+        except Exception:
+            pass
+
     def _rss_tv_season_episode(self, m, meta, video_name: str):
-        """电视剧洗版：解析季号与集号，仅用于洗版判重与“是否已看完”判断（不做实际文件重命名）。
+        """电视剧洗版：解析季号与集号，用于洗版判重与“是否已看完”判断。
+
+        季/集直接取自 MoviePilot 的识别结果（MetaInfo 已用 MetaVideo 解析并套用自定义
+        识别词），不再自行用正则解析文件名，实际下载后的重命名仍由 MP 完成。
 
         番剧在 TMDB 上常被合并为一季，导致季号/集号与实际发布不符。开启“CTMDbA 分季”后，
-        会查询已安装的 CTMDbA 插件（CureTMDbAnime）的逻辑季集映射，把 TMDB 合并季/集
-        翻译成实际的分季季号/集号，从而正确判断当前季是否已看完。
+        会查询 CTMDbA 插件（CureTMDbAnime）的逻辑季集映射，把 TMDB 合并季/集翻译成实际
+        分季季号/集号，从而正确判断当前季是否已看完。
 
-        优先级：CTMDbA 逻辑映射 > 文件名正则解析 > TMDB 识别结果(m.season) > RSS 标题解析(meta)。
+        优先级：CTMDbA 逻辑映射 > MP 识别季/集(meta.begin_season/episode、m.season)。
         返回 (season:int, episode:int|None)。"""
-        season = None
-        episode = None
-        # 1) 用正则从原视频文件名（去掉目录）解析季/集
-        if video_name:
-            season, episode = self._parse_se_from_name(video_name.rsplit("/", 1)[-1])
-        # 2) 回退到 TMDB 识别结果与 RSS 标题解析结果
-        if season is None:
-            season = m.season if m.season is not None else meta.begin_season
+        # 1) 取 MP 识别（MetaVideo 解析）出的季/集
+        season = meta.begin_season if meta.begin_season is not None else m.season
+        episode = meta.begin_episode
         if season is None:
             season = 1
-        if episode is None:
-            episode = meta.begin_episode
         try:
             season = int(season)
         except (ValueError, TypeError):
@@ -2183,7 +2258,9 @@ class SpaceCleaner(_PluginBase):
             episode = int(episode) if episode is not None else None
         except (ValueError, TypeError):
             episode = None
-        # 3) 开启 CTMDbA 分季：用 TMDB(合并)季集查逻辑(分季)季集
+        self._rss_log("季集解析", getattr(m, "title", ""),
+                      f"MP识别 S{season:02d}" + (f"E{episode:02d}" if episode is not None else "（无集号）"))
+        # 2) 开启 CTMDbA 分季：用 TMDB(合并)季集查逻辑(分季)季集
         if self._rss_ctmdba and episode is not None and getattr(m, "tmdb_id", None):
             logical = self._ctmdba_logical_se(int(m.tmdb_id), season, episode)
             if logical:
@@ -2232,49 +2309,6 @@ class SpaceCleaner(_PluginBase):
                 logger.debug(f"SC-RSS 查询 CTMDbA 映射失败 tmdb={tmdb_id}: {e}")
             cache[tmdb_id] = mapping
         return cache[tmdb_id].get((int(season), int(episode)))
-
-    @staticmethod
-    def _parse_se_from_name(name: str) -> Tuple[Optional[int], Optional[int]]:
-        """用正则从视频文件名解析 (季, 集)。解析不到的部分返回 None。
-
-        支持常见命名：S01E05 / s1.e5 / 1x05 / 第1季第5集 / 第5话 /
-        Season 1 Episode 5 / EP05 / E05 / 动漫式 “- 05 ” 或 “[05]”（仅集号，季默认 1）。"""
-        if not name:
-            return None, None
-        s = name
-        # S01E05 / S1E5 / S01.E05 / S01 E05
-        mm = re.search(r'[Ss](\d{1,2})[\s._\-]*[Ee](\d{1,3})(?!\d)', s)
-        if mm:
-            return int(mm.group(1)), int(mm.group(2))
-        # 1x05 / 01x05
-        mm = re.search(r'(?<!\d)(\d{1,2})x(\d{1,3})(?!\d)', s, re.IGNORECASE)
-        if mm:
-            return int(mm.group(1)), int(mm.group(2))
-        # 中文：第1季 ... 第5集/话
-        season = None
-        ms = re.search(r'第\s*(\d{1,2})\s*季', s)
-        if ms:
-            season = int(ms.group(1))
-        me = re.search(r'第\s*(\d{1,3})\s*[集话話]', s)
-        if me:
-            return (season if season is not None else 1), int(me.group(1))
-        # Season 1 [Episode 5]
-        ms = re.search(r'[Ss]eason\s*(\d{1,2})', s)
-        if ms:
-            season = int(ms.group(1))
-        me = re.search(r'[Ee]pisode\s*(\d{1,3})(?!\d)', s)
-        if me:
-            return (season if season is not None else 1), int(me.group(1))
-        # EP05 / EP.05 / E05（前后不接字母，避免误匹配单词）
-        mm = re.search(r'(?<![A-Za-z])[Ee][Pp]?[\s._]*(\d{1,3})(?![A-Za-z0-9])', s)
-        if mm:
-            return (season if season is not None else 1), int(mm.group(1))
-        # 动漫式：分隔符后的独立集号，如 “Title - 05 ” 或 “[05]”“【05】”
-        # 排除分辨率/年份：不匹配 4 位数，且集号后不紧跟 p（如 720p）
-        mm = re.search(r'(?:[-\[【]\s*)(\d{1,3})(?!\d)(?![Pp])\s*(?:[\]】]|[\s.\-]|$)', s)
-        if mm:
-            return (season if season is not None else 1), int(mm.group(1))
-        return season, None
 
     # 视频文件扩展名（洗版识别时优先取这些文件的文件名）
     _VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
@@ -2415,6 +2449,15 @@ class SpaceCleaner(_PluginBase):
         return "\n".join(lines)
 
     def _rss_log(self, a, title, r=""):
-        # RSS下载历史不持久化，仅用于本次运行期间的日志记录
-        pass
+        """RSS 处理过程日志。下载历史不持久化，但过程写入 MoviePilot 运行日志，
+        便于排查识别与洗版判定。格式：[SC-RSS] 动作 | 标题 | 详情。"""
+        try:
+            msg = f"[SC-RSS] {a}"
+            if title:
+                msg += f" | {title}"
+            if r:
+                msg += f" | {r}"
+            logger.info(msg)
+        except Exception:
+            pass
 
