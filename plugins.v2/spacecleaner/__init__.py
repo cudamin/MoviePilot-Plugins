@@ -31,7 +31,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.6.5"
+    plugin_version = "4.7.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -47,7 +47,6 @@ class SpaceCleaner(_PluginBase):
     _delete_count = 1
     _check_interval = 6
     _dry_run = False
-    _delete_same_size = True
     _delete_cross_seeds = True  # 删种时同时删除辅种（内容相同、tracker 不同的种子），含非 MP 管理的种子
     _delete_other_versions = True  # 删种时检索整理记录，删除同一集/同一部电影的其他版本
     _notify = True
@@ -98,13 +97,14 @@ class SpaceCleaner(_PluginBase):
     _rss_seen: set = set()
     _rss_washed: set = set()  # 已洗版下载过的集(tmdbid:SxxExx)，一集一个槽位
     _rss_lk = threading.Lock()
+    _deleted_pb: set = set()  # 持久化已删除的播放记录键，上限500条，用于避免重复下载
+    _deleted_rss: set = set()  # 持久化已删除的RSS下载记录(enclosure)，上限500条，用于避免重复下载
 
     def init_plugin(self, config: dict = None) -> None:
         self.stop_service()
         self._enabled = self._rss_on = False
         self._min_free_percent = 10
         self._delete_by_target = self._dry_run = self._notify = False
-        self._delete_same_size = True
         self._delete_cross_seeds = True
         self._delete_other_versions = True
         self._media_cache_disabled = False
@@ -126,6 +126,8 @@ class SpaceCleaner(_PluginBase):
         self._pb = list(self.get_data("pb") or [])
         self._rss_seen = set()
         self._rss_washed = set()
+        self._deleted_pb = set(self.get_data("deleted_pb") or [])
+        self._deleted_rss = set(self.get_data("deleted_rss") or [])
         self._stop_rss_scheduler()
 
         if not config:
@@ -139,7 +141,6 @@ class SpaceCleaner(_PluginBase):
         self._delete_count = int(config.get("delete_count") or 1)
         self._check_interval = int(config.get("check_interval") or 6)
         self._dry_run = bool(config.get("dry_run"))
-        self._delete_same_size = bool(config.get("delete_same_size"))
         self._delete_cross_seeds = bool(config.get("delete_cross_seeds", True))
         self._delete_other_versions = bool(config.get("delete_other_versions", True))
         self._notify = bool(config.get("notify", True))
@@ -179,6 +180,8 @@ class SpaceCleaner(_PluginBase):
             self._rss_th = 85
         self._rss_seen = set(self.get_data("rss_seen") or [])
         self._rss_washed = set(self.get_data("rss_washed") or [])
+        self._deleted_pb = set(self.get_data("deleted_pb") or [])
+        self._deleted_rss = set(self.get_data("deleted_rss") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
 
@@ -209,7 +212,7 @@ class SpaceCleaner(_PluginBase):
             "enabled": self._enabled, "min_free_percent": self._min_free_percent,
             "delete_by_target": self._delete_by_target, "target_free_percent": self._target_free_percent,
             "delete_count": self._delete_count, "check_interval": self._check_interval,
-            "dry_run": self._dry_run, "delete_same_size": self._delete_same_size,
+            "dry_run": self._dry_run,
             "delete_cross_seeds": self._delete_cross_seeds, "delete_other_versions": self._delete_other_versions, "notify": self._notify,
             "media_cache_disabled": self._media_cache_disabled, "run_now": False,
             "pb_filter_watched": self._pb_filter_watched, "watched_threshold": self._watched_threshold,
@@ -329,6 +332,8 @@ class SpaceCleaner(_PluginBase):
         ]
 
     def rss_dh(self, k: str, apikey: str):
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
         return schemas.Response(success=True)
 
     def rss_ca(self, apikey: str):
@@ -589,7 +594,7 @@ class SpaceCleaner(_PluginBase):
             "enabled": False, "min_free_percent": 10,
             "delete_by_target": False, "target_free_percent": 20,
             "delete_count": 1, "check_interval": 6,
-            "dry_run": False, "delete_same_size": False, "delete_cross_seeds": True, "delete_other_versions": True, "notify": True,
+            "dry_run": False, "delete_cross_seeds": True, "delete_other_versions": True, "notify": True,
             "media_cache_disabled": False, "clean_downloader": [], "run_now": False,
             "pb_filter_watched": True, "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
@@ -1232,9 +1237,8 @@ class SpaceCleaner(_PluginBase):
 
             # 电视剧：按 tmdbid+season 归并（跨种子/跨版本），整季作为一个删除单元
             tv_season_groups: Dict[str, List[TransferHistory]] = {}
-            # 电影：有 hash 按 hash 归并，无 hash 每条一个单元
-            movie_hash_groups: Dict[str, List[TransferHistory]] = {}
-            movie_no_hash: List[TransferHistory] = []
+            # 电影：按 tmdbid 归并（跨种子/跨版本），同一部电影的所有版本只生成一个删除单元
+            movie_tmdb_groups: Dict[int, List[TransferHistory]] = {}
             for r in all_records:
                 if not r.tmdbid:
                     continue
@@ -1245,10 +1249,7 @@ class SpaceCleaner(_PluginBase):
                     key = f"{r.tmdbid}:S{season:02d}"
                     tv_season_groups.setdefault(key, []).append(r)
                 else:
-                    if r.download_hash:
-                        movie_hash_groups.setdefault(r.download_hash, []).append(r)
-                    else:
-                        movie_no_hash.append(r)
+                    movie_tmdb_groups.setdefault(r.tmdbid, []).append(r)
 
             # 电视剧：同一 TMDB 存在多个季度时，升级为整剧删除单元。
             # 规则：必须等待整理记录中最后一季的最后一集播放完成后，才删除所有季度；
@@ -1290,10 +1291,8 @@ class SpaceCleaner(_PluginBase):
 
             for recs in tv_show_groups.values():
                 _add_tv_show_unit(recs)
-            for recs in movie_hash_groups.values():
+            for recs in movie_tmdb_groups.values():
                 _add_movie_unit(recs)
-            for r in movie_no_hash:
-                _add_movie_unit([r])
 
             # 输出因未看完/无播放记录而跳过的电视剧季，按最早标记时间排序，每行 5 个
             if skip_logs:
@@ -1402,6 +1401,7 @@ class SpaceCleaner(_PluginBase):
             # 2) 删种后删除源文件、媒体库文件及残留空目录
             #    复用 StorageChain.delete_media_file（含配置目录保护，不会误删下载/媒体库根目录）
             storage_chain = StorageChain()
+            cleanup_dirs: set = set()  # 收集所有被处理文件所在的父目录路径
             for rec in all_recs:
                 # 删除下载源文件（有种子的已随删种删除，此处兜底处理无 hash 记录）
                 src_fileitem = rec.get("src_fileitem", {})
@@ -1415,6 +1415,7 @@ class SpaceCleaner(_PluginBase):
                         sp = Path(src)
                         if sp.exists():
                             self._safe_delete_path(sp)
+                            cleanup_dirs.add(sp.parent)
                 # 删除媒体库文件（链接+重命名后的成品）
                 dest_fileitem = rec.get("dest_fileitem", {})
                 if dest_fileitem:
@@ -1426,6 +1427,19 @@ class SpaceCleaner(_PluginBase):
                         dp = Path(dest)
                         if dp.exists():
                             self._safe_delete_path(dp)
+                            cleanup_dirs.add(dp.parent)
+            # 收集 src/dest 路径的父目录（含 fileitem 场景）
+            for rec in all_recs:
+                src = rec.get("src", "")
+                if src:
+                    cleanup_dirs.add(Path(src).parent)
+                dest = rec.get("dest", "")
+                if dest:
+                    cleanup_dirs.add(Path(dest).parent)
+            # 清理下载残留目录和媒体库空目录
+            for d in cleanup_dirs:
+                self._cleanup_download_dir(d)
+                self._delete_media_dir(d, max_levels=3)
             # 用独立 session 删除所有相关转移记录
             from app.db import ScopedSession
             ds = ScopedSession()
@@ -1442,6 +1456,9 @@ class SpaceCleaner(_PluginBase):
                 self._delete_pb_by_tmdbid(tmdbid, season)
             else:
                 self._delete_pb_by_tmdbid(tmdbid)
+            # 持久化已删除的播放记录和RSS下载记录，上限500条，用于避免重复下载
+            self._save_deleted_pb(tmdbid, season if is_tv else None)
+            self._save_deleted_rss(all_recs)
             logger.info(f"SC 删除完成 [{unit_type}] {display_name}："
                         f"整理记录 {len(records)} 条"
                         + (f"，不同版本 {len(other_versions)} 条" if other_versions else "")
@@ -1575,6 +1592,52 @@ class SpaceCleaner(_PluginBase):
         if before != after:
             self.save_data("pb", self._pb)
             logger.info(f"从 pb 缓存删除 {scope} 共 {before - after} 条")
+
+    _DELETED_MAX = 500  # 已删除记录持久化上限
+
+    def _save_deleted_pb(self, tmdbid: int, season: Optional[int] = None):
+        """持久化已删除的播放记录键，上限500条，用于避免重复下载。
+
+        电视剧按 tmdbid:season 存储，电影按 tmdbid 存储。
+        """
+        if season is not None:
+            key = f"{tmdbid}:S{season:02d}"
+        else:
+            key = f"{tmdbid}:M"
+        self._deleted_pb.add(key)
+        # 裁剪到上限
+        if len(self._deleted_pb) > self._DELETED_MAX:
+            self._deleted_pb = set(list(self._deleted_pb)[-self._DELETED_MAX:])
+        self.save_data("deleted_pb", list(self._deleted_pb))
+
+    def _save_deleted_rss(self, all_recs: List[dict]):
+        """持久化已删除的RSS下载记录(enclosure)，上限500条，用于避免重复下载。
+
+        从整理记录中提取 download_hash，存入 _deleted_rss 集合。
+        """
+        for rec in all_recs:
+            dh = rec.get("download_hash", "")
+            if dh:
+                self._deleted_rss.add(dh)
+        if len(self._deleted_rss) > self._DELETED_MAX:
+            self._deleted_rss = set(list(self._deleted_rss)[-self._DELETED_MAX:])
+        self.save_data("deleted_rss", list(self._deleted_rss))
+
+    def _is_deleted_pb(self, tmdbid: int, season: Optional[int] = None, episode: Optional[int] = None) -> bool:
+        """检查播放记录是否已被持久化标记为已删除。
+
+        电视剧按 tmdbid:season 粒度检查，电影按 tmdbid 检查。
+        若指定 episode，则精确匹配 {tmdbid}:S{season}E{episode}。
+        """
+        if episode is not None and season is not None:
+            return f"{tmdbid}:S{season:02d}E{episode:02d}" in self._deleted_pb
+        if season is not None:
+            return f"{tmdbid}:S{season:02d}" in self._deleted_pb
+        return f"{tmdbid}:M" in self._deleted_pb
+
+    def _is_deleted_rss(self, enclosure: str) -> bool:
+        """检查RSS下载记录(enclosure)是否已被持久化标记为已删除。"""
+        return enclosure in self._deleted_rss
 
     def _prune_orphan_pb(self) -> int:
         """清理在媒体整理记录中已无对应记录的播放缓存条目。
@@ -2025,6 +2088,16 @@ class SpaceCleaner(_PluginBase):
                         self.post_message(title="SC-RSS跳过",
                                           text=f"{m.title} {se_fmt} {cr['r']}")
                     continue
+                # 检查该资源是否已被空间清理删除过（持久化记录），避免重复下载
+                if m.tmdb_id:
+                    if is_tv and s_episode is not None:
+                        if self._is_deleted_pb(m.tmdb_id, int(s_season), int(s_episode)):
+                            self._rss_log("跳过已删", m.title, f"{se_fmt} 已被空间清理删除过")
+                            continue
+                    elif not is_tv:
+                        if self._is_deleted_pb(m.tmdb_id):
+                            self._rss_log("跳过已删", m.title, "电影已被空间清理删除过")
+                            continue
                 # 构造去重 key：电视剧按 tmdb+季+集，电影按 tmdb，缺字段时用 enclosure
                 if is_tv and m.tmdb_id and s_episode:
                     dedup_key = (m.tmdb_id, int(s_season), int(s_episode))
@@ -2034,6 +2107,11 @@ class SpaceCleaner(_PluginBase):
                     dedup_key = ("tmdb", m.tmdb_id, int(s_season))
                 else:
                     dedup_key = ("enclosure", item.get("enclosure", "") or item.get("link", ""))
+                # 检查 enclosure 是否已被空间清理删除过
+                enc = item.get("enclosure", "") or item.get("link", "")
+                if enc and self._is_deleted_rss(enc):
+                    self._rss_log("跳过已删", m.title, f"{se_fmt} enclosure已被空间清理删除过")
+                    continue
                 # 一集一个槽位：该集在之前的刷新中已洗版下载过，则不再重复下载
                 ep_key = self._rss_wash_key(dedup_key)
                 if ep_key and ep_key in self._rss_washed:
@@ -2153,6 +2231,10 @@ class SpaceCleaner(_PluginBase):
                     if gb < lo or gb > hi:
                         continue
             url_filtered += 1
+            # 检查该RSS下载记录是否已被空间清理删除过（持久化记录），避免重复下载
+            if self._is_deleted_rss(e):
+                self._rss_log("跳过已删", t, "该资源已被空间清理删除过")
+                continue
             # 未开启洗版：跳过 TMDB 识别，仅本地解析标题用于通知的类别/质量（不调用 TMDB）
             meta = MetaInfo(title=t)
             if self._rss_add_direct(item):
