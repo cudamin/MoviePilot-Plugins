@@ -1,5 +1,3 @@
-[file name]: __init__.py
-[file content begin]
 """
 SpaceCleaner: 空间清理 + 智能RSS下载，共用播放进度缓存。
 """
