@@ -9,6 +9,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from app import schemas
 from app.chain.download import DownloadChain
+from app.chain.storage import StorageChain
 from app.core.config import settings
 from app.core.context import Context, TorrentInfo
 from app.core.event import eventmanager, Event
@@ -30,7 +31,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.6.3"
+    plugin_version = "4.6.4"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -1101,7 +1102,9 @@ class SpaceCleaner(_PluginBase):
                 return {"id": r.id, "title": r.title or "未知", "type": r.type or "",
                         "seasons": r.seasons or "", "episodes": r.episodes or "",
                         "src": r.src or "", "dest": r.dest or "", "tmdbid": r.tmdbid,
-                        "download_hash": r.download_hash or ""}
+                        "download_hash": r.download_hash or "",
+                        "src_fileitem": r.src_fileitem or {},
+                        "dest_fileitem": r.dest_fileitem or {}}
 
             def _ep_max(rec):
                 mm = re.findall(r'\d+', rec.episodes or "0")
@@ -1358,26 +1361,33 @@ class SpaceCleaner(_PluginBase):
                     torrents_deleted += self._delete_downloader_torrents(chain, dh, rec.get("title", "不同版本"), all_torrents)
             if not seen_hashes:
                 logger.info(f"SC [{display_name}] 无关联种子（可能为无 hash 记录），跳过删种")
-            # 2) 删种后删除媒体库文件及其所在目录（MP 软链接/硬链接、重命名、刮削生成的目录）
-            #    以及仍残留的下载源文件（无 hash 记录不会被删种流程清理）
-            media_dirs = set()
+            # 2) 删种后删除源文件、媒体库文件及残留空目录
+            #    复用 StorageChain.delete_media_file（含配置目录保护，不会误删下载/媒体库根目录）
+            storage_chain = StorageChain()
             for rec in all_recs:
-                # 下载源文件：有种子的已随删种删除，此处兜底处理无 hash 记录
-                src = rec.get("src", "")
-                if src:
-                    sp = Path(src)
-                    if sp.exists():
-                        self._safe_delete_path(sp)
-                # 媒体库文件（链接+重命名后的成品）
-                dest = rec.get("dest", "")
-                if dest:
-                    dp = Path(dest)
-                    if dp.exists():
-                        self._safe_delete_path(dp)
-                    media_dirs.add(dp.parent)
-            # 删除媒体库目录整体（含 nfo、海报等刮削文件）
-            for d in media_dirs:
-                self._delete_media_dir(d)
+                # 删除下载源文件（有种子的已随删种删除，此处兜底处理无 hash 记录）
+                src_fileitem = rec.get("src_fileitem", {})
+                if src_fileitem:
+                    fi = schemas.FileItem(**src_fileitem)
+                    storage_chain.delete_media_file(fi)
+                else:
+                    # 无 fileitem 时兜底删除 src 路径
+                    src = rec.get("src", "")
+                    if src:
+                        sp = Path(src)
+                        if sp.exists():
+                            self._safe_delete_path(sp)
+                # 删除媒体库文件（链接+重命名后的成品）
+                dest_fileitem = rec.get("dest_fileitem", {})
+                if dest_fileitem:
+                    fi = schemas.FileItem(**dest_fileitem)
+                    storage_chain.delete_media_file(fi)
+                else:
+                    dest = rec.get("dest", "")
+                    if dest:
+                        dp = Path(dest)
+                        if dp.exists():
+                            self._safe_delete_path(dp)
             # 用独立 session 删除所有相关转移记录
             from app.db import ScopedSession
             ds = ScopedSession()
@@ -1738,6 +1748,7 @@ class SpaceCleaner(_PluginBase):
         电视剧的季目录（如 .../剧名 (2026) {tmdbid=x}/Season 1）删除后，
         若上层剧名目录随之变空，也一并向上清理（最多 max_levels 层），
         遇到仍有内容的目录（如同类目录下的其他剧集）、挂载点或根目录即停止。
+        不会删除配置的下载目录或媒体库目录本身。
         """
         try:
             if not media_dir or not media_dir.exists() or not media_dir.is_dir():
@@ -1746,6 +1757,14 @@ class SpaceCleaner(_PluginBase):
             if media_dir.parent == media_dir or os.path.ismount(str(media_dir)):
                 logger.warning(f"SC 跳过删除媒体库目录（疑似挂载点/根目录）: {media_dir}")
                 return
+            # 获取配置的下载目录和媒体库目录，用于向上追溯时保护
+            configured_dirs = []
+            for d in (self.systemconfig.get("DownloadDirectories") or []):
+                if isinstance(d, dict) and d.get("path"):
+                    configured_dirs.append(Path(d["path"]))
+            for d in (self.systemconfig.get("LibraryDirectories") or []):
+                if isinstance(d, dict) and d.get("path"):
+                    configured_dirs.append(Path(d["path"]))
             self._safe_delete_path(media_dir)
             logger.info(f"SC 已删除媒体库目录: {media_dir}")
             # 向上清理因删除季目录而残留的空目录（如剧名根目录）
@@ -1755,6 +1774,10 @@ class SpaceCleaner(_PluginBase):
                     break
                 if cur.parent == cur or os.path.ismount(str(cur)):
                     break
+                # 检查是否到达配置的下载/媒体库目录或其上级，不删除
+                if any(cfg_dir.is_relative_to(cur) for cfg_dir in configured_dirs):
+                    logger.debug(f"SC 目录 {cur} 位于配置的下载/媒体库目录结构中，不删除")
+                    break
                 if not self._dir_is_leftover_metadata(cur):
                     break  # 仍有子目录或视频文件（如同目录下别的剧集），停止上溯
                 parent = cur.parent
@@ -1763,6 +1786,26 @@ class SpaceCleaner(_PluginBase):
                 cur = parent
         except Exception as e:
             logger.error(f"SC 删除媒体库目录失败 {media_dir}: {e}")
+
+    def _cleanup_download_dir(self, download_dir: Path):
+        """清理下载目录中残留的空目录。
+
+        下载器删种时 delete_file=True 只删除种子对应的文件，不会删除种子所在的
+        父目录（如 qBittorrent 为每个种子创建的独立子目录）。此方法仅删除该目录
+        本身（若已空），不向上追溯，避免误删下载根目录或媒体库目录。
+        """
+        try:
+            if not download_dir or not download_dir.exists() or not download_dir.is_dir():
+                return
+            if download_dir.parent == download_dir or os.path.ismount(str(download_dir)):
+                return
+            # 检查目录是否为空（或仅剩元数据/垃圾文件）
+            if not self._dir_is_leftover_metadata(download_dir):
+                return  # 目录内仍有子目录或视频文件，不清理
+            self._safe_delete_path(download_dir)
+            logger.info(f"SC 已清理下载残留目录: {download_dir}")
+        except Exception as e:
+            logger.error(f"SC 清理下载残留目录失败 {download_dir}: {e}")
 
     @staticmethod
     def _parse_episode_info(record: TransferHistory) -> Tuple[Optional[bool], Optional[int], List[int]]:
