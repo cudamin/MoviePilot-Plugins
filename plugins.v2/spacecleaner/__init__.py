@@ -178,7 +178,7 @@ class SpaceCleaner(_PluginBase):
         except (ValueError, TypeError):
             self._rss_th = 85
         self._rss_seen = set(self.get_data("rss_seen") or [])
-        self._rss_washed = set(self.get_data("rss_washed") or [])
+        self._rss_washed = set(self.get_data("rss_washed") or []) | set(self.get_data("rss_wash_done") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
 
@@ -2078,6 +2078,8 @@ class SpaceCleaner(_PluginBase):
             w = w[-3000:]
             self._rss_washed = set(w)
         self.save_data("rss_washed", w)
+        # 独立保存洗版完成记录，避免播放缓存清理/重建导致洗版状态丢失
+        self.save_data("rss_wash_done", w)
 
     @staticmethod
     def _rss_wash_key(dedup_key) -> Optional[str]:
