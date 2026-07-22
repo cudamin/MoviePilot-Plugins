@@ -31,7 +31,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.6.7"
+    plugin_version = "4.6.5"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -47,7 +47,7 @@ class SpaceCleaner(_PluginBase):
     _delete_count = 1
     _check_interval = 6
     _dry_run = False
-    # _delete_same_size 已废弃，保留但不再使用
+    _delete_same_size = True
     _delete_cross_seeds = True  # 删种时同时删除辅种（内容相同、tracker 不同的种子），含非 MP 管理的种子
     _delete_other_versions = True  # 删种时检索整理记录，删除同一集/同一部电影的其他版本
     _notify = True
@@ -91,7 +91,7 @@ class SpaceCleaner(_PluginBase):
     _pb_cache_time = 0
     _pb_cache_ttl = 30
     _pb: List[dict] = []
-    _pb_max = 0  # 播放缓存最大条数，0 表示无上限（默认不限制，修复中保留）
+    _pb_max = 0  # 播放缓存最大条数，0 表示无上限
     _pb_lock = threading.Lock()
     _rss_s: Optional[BackgroundScheduler] = None
     _rss_busy = False
@@ -104,6 +104,7 @@ class SpaceCleaner(_PluginBase):
         self._enabled = self._rss_on = False
         self._min_free_percent = 10
         self._delete_by_target = self._dry_run = self._notify = False
+        self._delete_same_size = True
         self._delete_cross_seeds = True
         self._delete_other_versions = True
         self._media_cache_disabled = False
@@ -138,7 +139,7 @@ class SpaceCleaner(_PluginBase):
         self._delete_count = int(config.get("delete_count") or 1)
         self._check_interval = int(config.get("check_interval") or 6)
         self._dry_run = bool(config.get("dry_run"))
-        # _delete_same_size 已废弃，忽略
+        self._delete_same_size = bool(config.get("delete_same_size"))
         self._delete_cross_seeds = bool(config.get("delete_cross_seeds", True))
         self._delete_other_versions = bool(config.get("delete_other_versions", True))
         self._notify = bool(config.get("notify", True))
@@ -177,7 +178,7 @@ class SpaceCleaner(_PluginBase):
         except (ValueError, TypeError):
             self._rss_th = 85
         self._rss_seen = set(self.get_data("rss_seen") or [])
-        self._rss_washed = set(self.get_data("rss_washed") or []) | set(self.get_data("rss_wash_done") or [])
+        self._rss_washed = set(self.get_data("rss_washed") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
 
@@ -208,7 +209,7 @@ class SpaceCleaner(_PluginBase):
             "enabled": self._enabled, "min_free_percent": self._min_free_percent,
             "delete_by_target": self._delete_by_target, "target_free_percent": self._target_free_percent,
             "delete_count": self._delete_count, "check_interval": self._check_interval,
-            "dry_run": self._dry_run,
+            "dry_run": self._dry_run, "delete_same_size": self._delete_same_size,
             "delete_cross_seeds": self._delete_cross_seeds, "delete_other_versions": self._delete_other_versions, "notify": self._notify,
             "media_cache_disabled": self._media_cache_disabled, "run_now": False,
             "pb_filter_watched": self._pb_filter_watched, "watched_threshold": self._watched_threshold,
@@ -301,7 +302,8 @@ class SpaceCleaner(_PluginBase):
                     logger.info(f"SC cached: {n} {se_display} {pct:.1f}%")
                     return
             self._pb.append({"k": k, "n": n, "s": sn, "e": en, "p": pct, "t": ts})
-            # PB 容量上限保持原样（不强制限制）
+            if self._pb_max > 0 and len(self._pb) > self._pb_max:
+                self._pb = self._pb[-self._pb_max:]
         self.save_data("pb", self._pb)
         logger.info(f"SC cached: {n} {se_display} {pct:.1f}%")
 
@@ -327,8 +329,6 @@ class SpaceCleaner(_PluginBase):
         ]
 
     def rss_dh(self, k: str, apikey: str):
-        if apikey != settings.API_TOKEN:
-            return schemas.Response(success=False)
         return schemas.Response(success=True)
 
     def rss_ca(self, apikey: str):
@@ -348,8 +348,6 @@ class SpaceCleaner(_PluginBase):
         if len(self._pb) != before:
             self.save_data("pb", self._pb)
             self._pb_cache = None
-            # 同步清除洗版记录（若存在）
-            self._sync_rss_washed_on_delete(k)
             logger.info(f"SC 删除单条缓存: {k}")
         return schemas.Response(success=True)
 
@@ -361,11 +359,7 @@ class SpaceCleaner(_PluginBase):
             self._pb.clear()
         self.save_data("pb", [])
         self._invalidate_caches()
-        # 同步清除所有洗版记录（因为播放缓存全清，洗版记录应随之清空，否则会阻止未来洗版）
-        self.save_data("rss_washed", [])
-        self._rss_washed = set()
-        self.save_data("rss_wash_done", [])
-        logger.info("SC 播放缓存已清除，并同步清空洗版记录")
+        logger.info("SC 播放缓存已清除")
         return schemas.Response(success=True)
 
     def set_pb_page(self, page: int, apikey: str):
@@ -595,7 +589,7 @@ class SpaceCleaner(_PluginBase):
             "enabled": False, "min_free_percent": 10,
             "delete_by_target": False, "target_free_percent": 20,
             "delete_count": 1, "check_interval": 6,
-            "dry_run": False, "delete_cross_seeds": True, "delete_other_versions": True, "notify": True,
+            "dry_run": False, "delete_same_size": False, "delete_cross_seeds": True, "delete_other_versions": True, "notify": True,
             "media_cache_disabled": False, "clean_downloader": [], "run_now": False,
             "pb_filter_watched": True, "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
@@ -1238,8 +1232,9 @@ class SpaceCleaner(_PluginBase):
 
             # 电视剧：按 tmdbid+season 归并（跨种子/跨版本），整季作为一个删除单元
             tv_season_groups: Dict[str, List[TransferHistory]] = {}
-            # 电影：按 tmdbid 归并（同一部电影所有版本合并为一个单元，避免重复处理）
-            movie_tmdb_groups: Dict[int, List[TransferHistory]] = {}
+            # 电影：有 hash 按 hash 归并，无 hash 每条一个单元
+            movie_hash_groups: Dict[str, List[TransferHistory]] = {}
+            movie_no_hash: List[TransferHistory] = []
             for r in all_records:
                 if not r.tmdbid:
                     continue
@@ -1250,9 +1245,14 @@ class SpaceCleaner(_PluginBase):
                     key = f"{r.tmdbid}:S{season:02d}"
                     tv_season_groups.setdefault(key, []).append(r)
                 else:
-                    movie_tmdb_groups.setdefault(r.tmdbid, []).append(r)
+                    if r.download_hash:
+                        movie_hash_groups.setdefault(r.download_hash, []).append(r)
+                    else:
+                        movie_no_hash.append(r)
 
             # 电视剧：同一 TMDB 存在多个季度时，升级为整剧删除单元。
+            # 规则：必须等待整理记录中最后一季的最后一集播放完成后，才删除所有季度；
+            # 若最后一季最后一集未看完，则跳过该剧所有季度，让其他已看资源优先删除。
             tv_show_groups: Dict[int, List[TransferHistory]] = {}
             for recs in tv_season_groups.values():
                 if recs and recs[0].tmdbid:
@@ -1290,9 +1290,10 @@ class SpaceCleaner(_PluginBase):
 
             for recs in tv_show_groups.values():
                 _add_tv_show_unit(recs)
-            # 电影：每个 tmdbid 合并为一个单元
-            for recs in movie_tmdb_groups.values():
+            for recs in movie_hash_groups.values():
                 _add_movie_unit(recs)
+            for r in movie_no_hash:
+                _add_movie_unit([r])
 
             # 输出因未看完/无播放记录而跳过的电视剧季，按最早标记时间排序，每行 5 个
             if skip_logs:
@@ -1401,16 +1402,12 @@ class SpaceCleaner(_PluginBase):
             # 2) 删种后删除源文件、媒体库文件及残留空目录
             #    复用 StorageChain.delete_media_file（含配置目录保护，不会误删下载/媒体库根目录）
             storage_chain = StorageChain()
-            # 收集所有需要清理的父目录（去重）
-            cleanup_dirs = set()
             for rec in all_recs:
                 # 删除下载源文件（有种子的已随删种删除，此处兜底处理无 hash 记录）
                 src_fileitem = rec.get("src_fileitem", {})
                 if src_fileitem:
                     fi = schemas.FileItem(**src_fileitem)
                     storage_chain.delete_media_file(fi)
-                    if fi.path:
-                        cleanup_dirs.add(Path(fi.path).parent)
                 else:
                     # 无 fileitem 时兜底删除 src 路径
                     src = rec.get("src", "")
@@ -1418,28 +1415,17 @@ class SpaceCleaner(_PluginBase):
                         sp = Path(src)
                         if sp.exists():
                             self._safe_delete_path(sp)
-                            cleanup_dirs.add(sp.parent)
                 # 删除媒体库文件（链接+重命名后的成品）
                 dest_fileitem = rec.get("dest_fileitem", {})
                 if dest_fileitem:
                     fi = schemas.FileItem(**dest_fileitem)
                     storage_chain.delete_media_file(fi)
-                    if fi.path:
-                        cleanup_dirs.add(Path(fi.path).parent)
                 else:
                     dest = rec.get("dest", "")
                     if dest:
                         dp = Path(dest)
                         if dp.exists():
                             self._safe_delete_path(dp)
-                            cleanup_dirs.add(dp.parent)
-            # 清理残留空目录（下载目录和媒体库目录）
-            for dir_path in cleanup_dirs:
-                # 下载目录清理
-                self._cleanup_download_dir(dir_path)
-                # 媒体库目录向上清理（最多3层）
-                self._delete_media_dir(dir_path, max_levels=3)
-
             # 用独立 session 删除所有相关转移记录
             from app.db import ScopedSession
             ds = ScopedSession()
@@ -1588,38 +1574,7 @@ class SpaceCleaner(_PluginBase):
             after = len(self._pb)
         if before != after:
             self.save_data("pb", self._pb)
-            # 同步清除对应的洗版记录
-            for r in self._pb:  # 这里只处理被删除的，但我们需要删除匹配的键，所以无法直接从剩余获取，我们之前已经删除了，但我们可以通过匹配删除的键来同步。
-            # 更简单：直接调用 _sync_rss_washed_on_delete 遍历所有可能被删除的键？但我们不知道具体键。最好在删除前收集要删除的键。
-            # 由于 _delete_pb_by_tmdbid 是内部调用，我们可以在调用前收集键，但为了简便，我们直接清除所有匹配的 _rss_washed。
-            # 但这样会清除该 tmdbid 所有季的洗版记录，如果只删一季，可能误删其他季的洗版记录，但洗版记录是精细到集的，只删该季更合理。
-            # 所以我们先收集被删除的键。
-            # 由于我们已删除，无法获取被删除的键，我们可以在删除前保存旧列表并对比。
-            # 为了简化，我们在外部调用 _delete_pb_by_tmdbid 前已经知道了删除的键（单元内的记录），所以可以在 _delete_unit 中同步。
-            # 因此，此处我们不再重复同步，交由调用方处理。
-            # 但为了完整性，我们在 _delete_unit 中调用此方法后，再调用 _sync_rss_washed_on_delete 对每个记录处理。
-            # 所以这里不处理。
             logger.info(f"从 pb 缓存删除 {scope} 共 {before - after} 条")
-
-    def _sync_rss_washed_on_delete(self, pb_key: str):
-        """当删除一条播放缓存记录时，同步清除对应的洗版记录（如果存在）。"""
-        if not pb_key:
-            return
-        # 构造洗版键：电影或剧集
-        if pb_key.endswith(":M"):
-            # 电影
-            wash_key = pb_key  # 格式 tmdbid:M
-        else:
-            # 电视剧格式 tmdbid:SxxExx
-            wash_key = pb_key
-        with self._rss_lk:
-            if wash_key in self._rss_washed:
-                self._rss_washed.remove(wash_key)
-                # 持久化
-                w = list(self._rss_washed)
-                self.save_data("rss_washed", w)
-                self.save_data("rss_wash_done", w)
-                logger.info(f"SC 同步清除洗版记录: {wash_key}")
 
     def _prune_orphan_pb(self) -> int:
         """清理在媒体整理记录中已无对应记录的播放缓存条目。
@@ -2123,8 +2078,6 @@ class SpaceCleaner(_PluginBase):
             w = w[-3000:]
             self._rss_washed = set(w)
         self.save_data("rss_washed", w)
-        # 独立保存洗版完成记录，避免播放缓存清理/重建导致洗版状态丢失
-        self.save_data("rss_wash_done", w)
 
     @staticmethod
     def _rss_wash_key(dedup_key) -> Optional[str]:
@@ -2220,11 +2173,7 @@ class SpaceCleaner(_PluginBase):
 
     def _rss_ck(self, m, meta: MetaInfo, season: Optional[int] = None, episode: Optional[int] = None) -> dict:
         if self._media_cache_disabled:
-            # 洗版模式下，关闭缓存视为已看完（跳过），防止无差别下载
-            if self._rss_wash_mode:
-                return {"s": True, "r": "缓存关闭（视为已看完）"}
-            else:
-                return {"s": False, "r": "缓存关闭"}
+            return {"s": False, "r": "媒体缓存关闭"}
         if not m.tmdb_id:
             return {"s": False, "r": "no tmdb"}
         # 电影：查 {tmdbid}:M 播放记录
@@ -2571,4 +2520,3 @@ class SpaceCleaner(_PluginBase):
             logger.info(msg)
         except Exception:
             pass
-[file content end]
