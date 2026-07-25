@@ -31,7 +31,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.7.0"
+    plugin_version = "4.7.1"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -667,22 +667,6 @@ class SpaceCleaner(_PluginBase):
                     ]},
                 ],
             })
-
-        # 区块2：删除历史
-        hist_rows = []
-        if delete_history:
-            for h in reversed(delete_history[-50:]):
-                hist_rows.append({"tr": [{"td": [{"text": h.get("time", "")}]}, {"td": [{"text": h.get("title", "")}]}, {"td": [{"text": h.get("action", "")}]}]})
-        cards.append({
-            "component": "VCard", "props": {"variant": "flat", "class": "mt-2"},
-            "content": [
-                {"component": "VCardTitle", "props": {}, "text": "删除历史记录（最近 50 条）"},
-                {"component": "VCardText", "content": [{"component": "VTable", "props": {"density": "compact", "hover": True}, "content": {
-                    "thead": [{"th": [{"text": "时间"}, {"text": "资源"}, {"text": "操作"}]}],
-                    "tbody": hist_rows if hist_rows else [{"tr": [{"td": {"attrs": {"colspan": 3}, "content": [{"text": "暂无删除记录"}]}}]}],
-                }}]},
-            ],
-        })
 
         # 区块3：播放记录 + 缓存管理
         all_items = []
@@ -1934,14 +1918,9 @@ class SpaceCleaner(_PluginBase):
             return True, season_num, [int(episodes_str)]
         return None, season_num, []
 
-    # 删除记录缓存上限：保留最近 50 条，避免占用过多存储空间与读取开销
-    _DELETE_HISTORY_MAX = 50
-
     def _add_delete_history(self, title: str, action: str):
         h = self.get_data("delete_history") or []
         h.append({"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "title": title, "action": action})
-        if len(h) > self._DELETE_HISTORY_MAX:
-            h = h[-self._DELETE_HISTORY_MAX:]
         self.save_data("delete_history", h)
 
     def _get_delete_history(self) -> List[Dict[str, str]]:
