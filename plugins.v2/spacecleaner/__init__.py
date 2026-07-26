@@ -31,7 +31,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.7.1"
+    plugin_version = "4.7.2"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -2037,10 +2037,24 @@ class SpaceCleaner(_PluginBase):
                         self.post_message(title="SC-RSS识别失败",
                                           text=f"资源无法识别: {t}")
                     continue
+                # 跳过无 TMDB ID 的识别结果
+                if not m.tmdb_id:
+                    self._rss_log("跳过无TMDB", t, "未识别到 TMDB ID")
+                    if self._rss_ntf:
+                        self.post_message(title="SC-RSS跳过",
+                                          text=f"未识别到 TMDB ID: {t}")
+                    continue
                 # 判断电视剧 / 电影，电视剧用 MP 剧集解析引擎重新提取季/集
                 is_tv = (getattr(m, "type", None) == MediaType.TV) or (m.season is not None) or (meta.begin_episode is not None)
                 if is_tv:
                     s_season, s_episode = self._rss_tv_season_episode(m, meta, video_name)
+                    # 电视剧无集号则跳过
+                    if s_episode is None:
+                        self._rss_log("跳过无集号", t, "电视剧未识别到集号")
+                        if self._rss_ntf:
+                            self.post_message(title="SC-RSS跳过",
+                                              text=f"电视剧未识别到集号: {t}")
+                        continue
                 else:
                     s_season, s_episode = None, None
                 cr = self._rss_ck(m, meta, s_season, s_episode)
@@ -2345,7 +2359,8 @@ class SpaceCleaner(_PluginBase):
                 return media, meta, base
 
         # 2) 回退到 RSS 标题识别
-        ct = re.sub(r'\[.*?\]', "", rt).strip()
+        # 只过滤非数字的方括号内容（保留 [03] 这类集号标记）
+        ct = re.sub(r'\[(?!\d+E?\])\[?.*?\]', "", rt).strip()
         cands = [x.strip() for x in ct.split("/") if x.strip()] or [ct]
         self._rss_log("识别", rt, f"回退用标题识别，共 {len(cands)} 个候选")
         best_media, best_meta, best_c = None, None, ""
@@ -2373,8 +2388,8 @@ class SpaceCleaner(_PluginBase):
         能直接影响入库季集。"""
         if meta.begin_episode is not None:
             return meta
-        # 从原始 RSS 标题重新解析季集（去掉方括号内容以减少干扰）
-        clean = re.sub(r'\[.*?\]', "", rt).strip()
+        # 从原始 RSS 标题重新解析季集（只过滤非数字的方括号内容，保留 [03] 这类集号标记）
+        clean = re.sub(r'\[(?!\d+E?\])\[?.*?\]', "", rt).strip()
         fallback = MetaInfo(title=clean)
         if fallback.begin_episode is not None:
             self._rss_log("季集补充", rt,
