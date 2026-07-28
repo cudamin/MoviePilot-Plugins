@@ -31,7 +31,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.7.2"
+    plugin_version = "4.7.3"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin/MoviePilot-Plugins"
@@ -1331,17 +1331,22 @@ class SpaceCleaner(_PluginBase):
         other_versions = self._find_other_version_records(records) if self._delete_other_versions else []
         all_recs = records + other_versions
         if self._dry_run:
-            # 统计将删除的种子（主种子 + 辅种）
+            # 统计将删除的种子（主种子 + 辅种）。部分不同版本整理记录没有
+            # download_hash，需要通过源文件路径反查下载器任务及其辅种。
             torrents = self._get_cached_torrents(chain)
-            seen = set()
+            main_hashes = self._collect_record_torrent_hashes(all_recs, torrents)
+            counted_hashes = set()
             main_cnt = cross_cnt = 0
-            for rec in all_recs:
-                dh = rec.get("download_hash", "")
-                if dh and dh not in seen:
-                    seen.add(dh)
-                    tl = self._collect_torrents_to_delete(dh, torrents)
-                    main_cnt += 1
-                    cross_cnt += sum(1 for _, _, is_cross in tl if is_cross)
+            for dh in main_hashes:
+                tl = self._collect_torrents_to_delete(dh, torrents)
+                for torrent_hash, _, is_cross in tl:
+                    if torrent_hash in counted_hashes:
+                        continue
+                    counted_hashes.add(torrent_hash)
+                    if is_cross:
+                        cross_cnt += 1
+                    else:
+                        main_cnt += 1
             unit_type = "电视剧整季" if is_tv else "电影"
             logger.info(
                 f"【试运行】将删除 [{unit_type}] {display_name}："
@@ -1364,23 +1369,15 @@ class SpaceCleaner(_PluginBase):
             # 1) 从下载器删除该单元涉及的全部种子及其辅种（整季可能跨多个种子）
             #    删种时 delete_file=True 会一并删除下载目录中的源文件
             torrents_deleted = 0
-            seen_hashes = set()
-            for rec in records:
-                dh = rec.get("download_hash", "")
-                if dh and dh not in seen_hashes:
-                    seen_hashes.add(dh)
-                    torrents_deleted += self._delete_downloader_torrents(chain, dh, display_name, all_torrents)
-            # 若单元记录均无 hash 但存在代表 hash，仍尝试删除
-            if not seen_hashes and download_hash:
-                seen_hashes.add(download_hash)
-                torrents_deleted += self._delete_downloader_torrents(chain, download_hash, display_name, all_torrents)
-            # 不同版本各自对应的种子也一并删除（含其辅种）
-            for rec in other_versions:
-                dh = rec.get("download_hash", "")
-                if dh and dh not in seen_hashes:
-                    seen_hashes.add(dh)
-                    torrents_deleted += self._delete_downloader_torrents(chain, dh, rec.get("title", "不同版本"), all_torrents)
-            if not seen_hashes:
+            torrents = all_torrents if all_torrents is not None else self._get_cached_torrents(chain)
+            main_hashes = self._collect_record_torrent_hashes(all_recs, torrents)
+            if not main_hashes and download_hash:
+                main_hashes = [download_hash]
+            for dh in main_hashes:
+                torrents_deleted += self._delete_downloader_torrents(
+                    chain, dh, display_name, torrents
+                )
+            if not main_hashes:
                 logger.info(f"SC [{display_name}] 无关联种子（可能为无 hash 记录），跳过删种")
             # 2) 删种后删除源文件、媒体库文件及残留空目录
             #    复用 StorageChain.delete_media_file（含配置目录保护，不会误删下载/媒体库根目录）
@@ -1714,6 +1711,55 @@ class SpaceCleaner(_PluginBase):
             if len(orphans) > 20:
                 logger.info(f"SC   - 其余 {len(orphans) - 20} 条略")
         return removed
+
+    def _collect_record_torrent_hashes(self, records: List[dict], torrents: List[Any]) -> List[str]:
+        """收集整理记录关联的主种子哈希，缺少哈希时按源路径反查下载器任务。"""
+        hashes = []
+        seen = set()
+        torrent_paths = []
+        for torrent in torrents or []:
+            torrent_hash = getattr(torrent, "hash", None)
+            if not torrent_hash:
+                continue
+            paths = []
+            for attr in ("content_path", "path"):
+                value = getattr(torrent, attr, None)
+                if value:
+                    paths.append(str(value))
+            save_path = getattr(torrent, "save_path", None)
+            name = self._torrent_name(torrent)
+            if save_path and name:
+                paths.append(str(Path(str(save_path)) / name))
+            torrent_paths.append((torrent_hash, paths))
+
+        for record in records:
+            download_hash = record.get("download_hash", "")
+            if download_hash:
+                if download_hash not in seen:
+                    seen.add(download_hash)
+                    hashes.append(download_hash)
+                continue
+            src = record.get("src", "")
+            if not src:
+                continue
+            src_path = Path(src)
+            for torrent_hash, paths in torrent_paths:
+                if torrent_hash in seen:
+                    continue
+                if any(self._path_contains(path, src_path) for path in paths):
+                    seen.add(torrent_hash)
+                    hashes.append(torrent_hash)
+                    break
+        return hashes
+
+    @staticmethod
+    def _path_contains(torrent_path: str, source_path: Path) -> bool:
+        """判断整理源文件是否位于下载器任务路径内。"""
+        try:
+            source_path.relative_to(Path(torrent_path))
+            return True
+        except (TypeError, ValueError):
+            return False
 
     def _collect_torrents_to_delete(self, download_hash, torrents):
         """收集该主种子及其辅种，返回 [(hash, name, is_cross), ...]（含主种子本身）。
