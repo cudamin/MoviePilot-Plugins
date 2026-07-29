@@ -22,7 +22,7 @@ class AgentConfigProfile(_PluginBase):
     plugin_icon = "agentresourceofficer.png"
     plugin_version = "1.1.1"
     plugin_author = "tafei"
-    author_url = "https://github.com/cudamin/MoviePilot-Plugins"
+    author_url = "https://github.com/cudamin"
     plugin_config_prefix = "agentconfigprofile_"
     plugin_order = 46
     auth_level = 1
