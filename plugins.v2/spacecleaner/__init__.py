@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.8.1"
+    plugin_version = "4.8.2"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -49,6 +49,7 @@ class SpaceCleaner(_PluginBase):
     _check_interval = 6
     _dry_run = False
     _delete_other_versions = True  # 删种时检索整理记录，删除同一集/同一部电影的其他版本
+    _delete_by_record = False  # 按媒体整理记录删除：优先删除整理记录中最早入库的已看资源
     _notify = True
     _media_cache_disabled = False  # 关闭媒体缓存（默认开启）
     _pb_page = 1
@@ -98,8 +99,6 @@ class SpaceCleaner(_PluginBase):
     _rss_seen: set = set()
     _rss_washed: set = set()  # 已洗版下载过的集(tmdbid:SxxExx)，一集一个槽位
     _rss_lk = threading.Lock()
-    _deleted_pb: List[str] = []  # 已删除资源的最新集记录，上限50条，用于避免洗版重复下载
-    _deleted_rss: List[str] = []  # 已删除的RSS下载记录，上限50条，用于避免重复下载
     _api_recognize_cache: List[dict] = []  # TMDB API 识别失败后的独立负缓存
     _api_recognize_cache_max = 5
     _api_recognize_success_cache: List[dict] = []  # TMDB API 识别成功后的独立正缓存
@@ -112,6 +111,7 @@ class SpaceCleaner(_PluginBase):
         self._min_free_percent = 10
         self._delete_by_target = self._dry_run = self._notify = False
         self._delete_other_versions = True
+        self._delete_by_record = False
         self._media_cache_disabled = False
         self._pb_page = 1
         self._pb_sort_by = "time"
@@ -133,8 +133,6 @@ class SpaceCleaner(_PluginBase):
         self.save_data("pb", self._pb)
         self._rss_seen = set()
         self._rss_washed = set()
-        self._deleted_pb = list(dict.fromkeys(self.get_data("deleted_pb") or []))[-self._DELETED_MAX:]
-        self._deleted_rss = list(dict.fromkeys(self.get_data("deleted_rss") or []))[-self._DELETED_MAX:]
         self._api_recognize_cache = self._load_api_recognize_cache()
         self._api_recognize_success_cache = self._load_api_recognize_success_cache()
         self._stop_rss_scheduler()
@@ -151,6 +149,7 @@ class SpaceCleaner(_PluginBase):
         self._check_interval = int(config.get("check_interval") or 6)
         self._dry_run = bool(config.get("dry_run"))
         self._delete_other_versions = bool(config.get("delete_other_versions", True))
+        self._delete_by_record = bool(config.get("delete_by_record"))
         self._notify = bool(config.get("notify", True))
         self._media_cache_disabled = bool(config.get("media_cache_disabled", False))
         # 播放缓存视图状态不持久化：每次加载插件默认按时间从近到远排序，并清空搜索
@@ -189,8 +188,6 @@ class SpaceCleaner(_PluginBase):
             self._rss_th = 85
         self._rss_seen = set(self.get_data("rss_seen") or [])
         self._rss_washed = set(self.get_data("rss_washed") or [])
-        self._deleted_pb = list(dict.fromkeys(self.get_data("deleted_pb") or []))[-self._DELETED_MAX:]
-        self._deleted_rss = list(dict.fromkeys(self.get_data("deleted_rss") or []))[-self._DELETED_MAX:]
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
 
@@ -223,6 +220,7 @@ class SpaceCleaner(_PluginBase):
             "delete_count": self._delete_count, "check_interval": self._check_interval,
             "dry_run": self._dry_run,
             "delete_other_versions": self._delete_other_versions, "notify": self._notify,
+            "delete_by_record": self._delete_by_record,
             "media_cache_disabled": self._media_cache_disabled, "run_now": False,
             "pb_filter_watched": self._pb_filter_watched, "watched_threshold": self._watched_threshold,
             "rss_on": self._rss_on, "rss_cron": self._rss_cron, "rss_urls": self._rss_urls,
@@ -578,6 +576,7 @@ class SpaceCleaner(_PluginBase):
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_by_target", "label": "按目标百分比删除", "hint": "持续删除资源直到剩余空间达到目标百分比", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_other_versions", "label": "删除不同版本", "hint": "删种时检索整理记录，删除同一集/同一部电影的不同版本（不同分辨率、字幕组等）", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_by_record", "label": "按媒体整理记录删除", "hint": "开启后优先删除媒体整理记录中最早入库的已看资源（否则按播放缓存最早看完时间）", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "media_cache_disabled", "label": "关闭媒体缓存", "hint": "开启后不再接收播放进度，也不新增播放记录", "persistent-hint": True}}]},
                 ]},
                 {"component": "VRow", "content": [
@@ -608,7 +607,7 @@ class SpaceCleaner(_PluginBase):
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_on", "label": "启用"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_ntf", "label": "通知"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_once", "label": "立即运行"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_once", "label": "立即刷新RSS"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_wash_mode", "label": "洗版模式", "hint": "播放进度低于阈值或无播放缓存时触发洗版，洗版只下载最早发布的版本", "persistent-hint": True}}]},
                 ]},
                 {"component": "VDivider", "props": {"class": "my-2"}},
@@ -653,7 +652,7 @@ class SpaceCleaner(_PluginBase):
             "enabled": False, "min_free_percent": 10,
             "delete_by_target": False, "target_free_percent": 20,
             "delete_count": 1, "check_interval": 6,
-            "dry_run": False, "delete_other_versions": True, "notify": True,
+            "dry_run": False, "delete_other_versions": True, "delete_by_record": False, "notify": True,
             "media_cache_disabled": False, "clean_downloader": [], "run_now": False,
             "pb_filter_watched": True, "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
@@ -1182,6 +1181,15 @@ class SpaceCleaner(_PluginBase):
                 times = [p.get("t", "9999") for p in pb if _m(p.get("k", "") or "")]
                 return min(times) if times else "9999"
 
+            def _unit_earliest_lib_time(recs):
+                """取该单元在媒体整理记录中最早的入库时间（排序用）。
+
+                以整理记录 date 字段为准（date 为入库时间字符串，字典序即时间序），
+                date 缺失的记录视为 "9999"（排到最后）。
+                """
+                times = [str(r.date or "").strip() for r in recs if str(r.date or "").strip()]
+                return min(times) if times else "9999"
+
             def _season_last_watched_time(recs):
                 """电视剧整季判断：以整理记录中该季出现的最后一集为准，
                 只有最后一集已看完才返回 (缓存时间, None)，否则返回 (None, 跳过原因)。
@@ -1243,6 +1251,7 @@ class SpaceCleaner(_PluginBase):
                     "is_tv": True,
                     "display": display,
                     "sort_time": mark_time,
+                    "lib_time": _unit_earliest_lib_time(recs),
                     "prio": str(tmdbid) in prio_tmdbids,
                 })
 
@@ -1265,6 +1274,7 @@ class SpaceCleaner(_PluginBase):
                     "is_tv": False,
                     "display": rep.title or "未知",
                     "sort_time": _unit_earliest_mark_time(tmdbid, None),
+                    "lib_time": _unit_earliest_lib_time(recs),
                     "prio": str(tmdbid) in prio_tmdbids,
                 })
 
@@ -1325,6 +1335,7 @@ class SpaceCleaner(_PluginBase):
                     "is_tv": True,
                     "display": f"{rep.title or '未知'}（整剧 {len(seasons)} 季 {ep_count} 集）",
                     "sort_time": mark_time,
+                    "lib_time": _unit_earliest_lib_time(recs),
                     "prio": str(rep.tmdbid) in prio_tmdbids,
                 })
 
@@ -1345,9 +1356,11 @@ class SpaceCleaner(_PluginBase):
                 logger.info("SC 未发现满足删除条件的资源（已看完且在转移历史中）")
                 return
 
-            logger.info(f"SC 共 {len(delete_units)} 个删除单元满足条件，按优先标记与最早标记时间排序后开始清理")
-            # 排序：优先删除被标记的资源，其次播放缓存中最早标记的（标记时间升序）
-            delete_units.sort(key=lambda u: (not u["prio"], u["sort_time"]))
+            # 排序：优先删除被标记的资源；按媒体整理记录删除开启时按整理记录最早入库时间（升序），否则按播放缓存最早标记时间（升序）
+            sort_key = "lib_time" if self._delete_by_record else "sort_time"
+            sort_label = "整理记录最早入库时间" if self._delete_by_record else "最早标记时间"
+            logger.info(f"SC 共 {len(delete_units)} 个删除单元满足条件，按优先标记与{sort_label}排序后开始清理")
+            delete_units.sort(key=lambda u: (not u["prio"], u.get(sort_key) or "9999"))
         finally:
             sess.close()
 
@@ -1492,21 +1505,6 @@ class SpaceCleaner(_PluginBase):
                 self._delete_pb_by_tmdbid(tmdbid, season)
             else:
                 self._delete_pb_by_tmdbid(tmdbid)
-            # 持久化洗版防重复记录：电视剧只记录此次删除范围中最靠后的最后一集。
-            if is_tv:
-                latest_season = latest_episode = None
-                for rec in all_recs:
-                    rec_season = self._norm_season(rec.get("seasons", ""))
-                    episodes = self._episode_set(rec.get("episodes", ""))
-                    if rec_season is None or not episodes:
-                        continue
-                    candidate = (rec_season, max(episodes))
-                    if latest_season is None or candidate > (latest_season, latest_episode):
-                        latest_season, latest_episode = candidate
-                self._save_deleted_pb(tmdbid, latest_season, latest_episode)
-            else:
-                self._save_deleted_pb(tmdbid)
-            self._save_deleted_rss(all_recs)
             logger.info(f"SC 删除完成 [{unit_type}] {display_name}："
                         f"整理记录 {len(records)} 条"
                         + (f"，不同版本 {len(other_versions)} 条" if other_versions else "")
@@ -1640,60 +1638,6 @@ class SpaceCleaner(_PluginBase):
         if before != after:
             self.save_data("pb", self._pb)
             logger.info(f"从 pb 缓存删除 {scope} 共 {before - after} 条")
-
-    _DELETED_MAX = 50  # 洗版防重复记录持久化上限
-
-    def _save_deleted_pb(self, tmdbid: int, season: Optional[int] = None,
-                         episode: Optional[int] = None) -> None:
-        """保存已删除资源标记；电视剧同季只保留集数最靠后的最后一集。"""
-        if season is not None and episode is not None:
-            prefix = f"{tmdbid}:S{season:02d}E"
-            self._deleted_pb = [key for key in self._deleted_pb if not key.startswith(prefix)]
-            key = f"{prefix}{episode:02d}"
-        elif season is not None:
-            key = f"{tmdbid}:S{season:02d}"
-        else:
-            key = f"{tmdbid}:M"
-        if key in self._deleted_pb:
-            self._deleted_pb.remove(key)
-        self._deleted_pb.append(key)
-        self._deleted_pb = self._deleted_pb[-self._DELETED_MAX:]
-        self.save_data("deleted_pb", self._deleted_pb)
-
-    def _save_deleted_rss(self, all_recs: List[dict]) -> None:
-        """保存已删除的RSS下载记录，并按写入顺序保留最近50条。"""
-        for rec in all_recs:
-            download_hash = rec.get("download_hash", "")
-            if not download_hash:
-                continue
-            if download_hash in self._deleted_rss:
-                self._deleted_rss.remove(download_hash)
-            self._deleted_rss.append(download_hash)
-        self._deleted_rss = self._deleted_rss[-self._DELETED_MAX:]
-        self.save_data("deleted_rss", self._deleted_rss)
-
-    def _is_deleted_pb(self, tmdbid: int, season: Optional[int] = None, episode: Optional[int] = None) -> bool:
-        """检查播放记录是否已被持久化标记为已删除。
-
-        电视剧按 tmdbid:season 粒度检查，电影按 tmdbid 检查。
-        若指定 episode，则精确匹配 {tmdbid}:S{season}E{episode}。
-        """
-        if episode is not None and season is not None:
-            prefix = f"{tmdbid}:S{season:02d}E"
-            latest = max(
-                (int(key[len(prefix):]) for key in self._deleted_pb
-                 if key.startswith(prefix) and key[len(prefix):].isdigit()),
-                default=None,
-            )
-            return latest is not None and episode <= latest
-        if season is not None:
-            prefix = f"{tmdbid}:S{season:02d}"
-            return any(key == prefix or key.startswith(prefix + "E") for key in self._deleted_pb)
-        return f"{tmdbid}:M" in self._deleted_pb
-
-    def _is_deleted_rss(self, enclosure: str) -> bool:
-        """检查RSS下载记录(enclosure)是否已被持久化标记为已删除。"""
-        return enclosure in self._deleted_rss
 
     def _prune_orphan_pb(self) -> int:
         """清理在媒体整理记录中已无对应记录的播放缓存条目。
@@ -2200,16 +2144,6 @@ class SpaceCleaner(_PluginBase):
                         self.post_message(title="SC-RSS跳过",
                                           text=f"{m.title} {se_fmt} {cr['r']}")
                     continue
-                # 检查该资源是否已被空间清理删除过（持久化记录），避免重复下载
-                if m.tmdb_id:
-                    if is_tv and s_episode is not None:
-                        if self._is_deleted_pb(m.tmdb_id, int(s_season), int(s_episode)):
-                            self._rss_log("跳过已删", m.title, f"{se_fmt} 已被空间清理删除过")
-                            continue
-                    elif not is_tv:
-                        if self._is_deleted_pb(m.tmdb_id):
-                            self._rss_log("跳过已删", m.title, "电影已被空间清理删除过")
-                            continue
                 # 构造去重 key：电视剧按 tmdb+季+集，电影按 tmdb，缺字段时用 enclosure
                 if is_tv and m.tmdb_id and s_episode:
                     dedup_key = (m.tmdb_id, int(s_season), int(s_episode))
@@ -2219,11 +2153,6 @@ class SpaceCleaner(_PluginBase):
                     dedup_key = ("tmdb", m.tmdb_id, int(s_season))
                 else:
                     dedup_key = ("enclosure", item.get("enclosure", "") or item.get("link", ""))
-                # 检查 enclosure 是否已被空间清理删除过
-                enc = item.get("enclosure", "") or item.get("link", "")
-                if enc and self._is_deleted_rss(enc):
-                    self._rss_log("跳过已删", m.title, f"{se_fmt} enclosure已被空间清理删除过")
-                    continue
                 # 一集一个槽位：该集在之前的刷新中已洗版下载过，则不再重复下载
                 ep_key = self._rss_wash_key(dedup_key)
                 if ep_key and ep_key in self._rss_washed:
@@ -2343,10 +2272,6 @@ class SpaceCleaner(_PluginBase):
                     if gb < lo or gb > hi:
                         continue
             url_filtered += 1
-            # 检查该RSS下载记录是否已被空间清理删除过（持久化记录），避免重复下载
-            if self._is_deleted_rss(e):
-                self._rss_log("跳过已删", t, "该资源已被空间清理删除过")
-                continue
             # 未开启洗版：跳过 TMDB 识别，仅本地解析标题用于通知的类别/质量（不调用 TMDB）
             meta = MetaInfo(title=t)
             if self._rss_add_direct(item):
