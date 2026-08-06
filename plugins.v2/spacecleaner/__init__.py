@@ -22,6 +22,7 @@ from app.db.models.transferhistory import TransferHistory
 from app.utils.system import SystemUtils
 from app.chain import ChainBase
 from app.helper.rss import RssHelper
+from app.helper.rule import RuleHelper
 from app.schemas import NotificationType
 from app.schemas.types import EventType, MediaImageType, MediaType
 from app.utils.http import RequestUtils
@@ -31,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.7.14"
+    plugin_version = "4.8.1"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -64,6 +65,7 @@ class SpaceCleaner(_PluginBase):
     _rss_cron = ""
     _rss_urls = ""
     _rss_dl = ""
+    _rss_rule_group = ""  # RSS 下载使用的优先级规则组
     _rss_sz = ""
     _rss_inc = ""
     _rss_exc = ""
@@ -98,8 +100,10 @@ class SpaceCleaner(_PluginBase):
     _rss_lk = threading.Lock()
     _deleted_pb: List[str] = []  # 已删除资源的最新集记录，上限50条，用于避免洗版重复下载
     _deleted_rss: List[str] = []  # 已删除的RSS下载记录，上限50条，用于避免重复下载
-    _api_recognize_cache: List[dict] = []  # TMDB API识别失败后的独立负缓存
-    _api_recognize_cache_max = 100
+    _api_recognize_cache: List[dict] = []  # TMDB API 识别失败后的独立负缓存
+    _api_recognize_cache_max = 5
+    _api_recognize_success_cache: List[dict] = []  # TMDB API 识别成功后的独立正缓存
+    _api_recognize_success_cache_max = 20
     _api_recognize_cache_lock = threading.Lock()
 
     def init_plugin(self, config: dict = None) -> None:
@@ -120,6 +124,7 @@ class SpaceCleaner(_PluginBase):
         self._clean_downloader = []
         self._rss_cron = self._rss_urls = self._rss_sz = self._rss_inc = self._rss_exc = ""
         self._rss_dl = ""
+        self._rss_rule_group = ""
         self._rss_once = self._rss_ntf = False
         self._rss_th = 85
         self._rss_wash_mode = False
@@ -131,6 +136,7 @@ class SpaceCleaner(_PluginBase):
         self._deleted_pb = list(dict.fromkeys(self.get_data("deleted_pb") or []))[-self._DELETED_MAX:]
         self._deleted_rss = list(dict.fromkeys(self.get_data("deleted_rss") or []))[-self._DELETED_MAX:]
         self._api_recognize_cache = self._load_api_recognize_cache()
+        self._api_recognize_success_cache = self._load_api_recognize_success_cache()
         self._stop_rss_scheduler()
 
         if not config:
@@ -171,6 +177,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_cron = str(config.get("rss_cron") or "")
         self._rss_urls = str(config.get("rss_urls") or "")
         self._rss_dl = str(config.get("rss_dl") or "")
+        self._rss_rule_group = str(config.get("rss_rule_group") or "")
         self._rss_sz = str(config.get("rss_sz") or "")
         self._rss_inc = str(config.get("rss_inc") or "")
         self._rss_exc = str(config.get("rss_exc") or "")
@@ -219,7 +226,8 @@ class SpaceCleaner(_PluginBase):
             "media_cache_disabled": self._media_cache_disabled, "run_now": False,
             "pb_filter_watched": self._pb_filter_watched, "watched_threshold": self._watched_threshold,
             "rss_on": self._rss_on, "rss_cron": self._rss_cron, "rss_urls": self._rss_urls,
-            "rss_dl": self._rss_dl, "rss_sz": self._rss_sz, "rss_inc": self._rss_inc,
+            "rss_dl": self._rss_dl, "rss_rule_group": self._rss_rule_group,
+            "rss_sz": self._rss_sz, "rss_inc": self._rss_inc,
             "rss_exc": self._rss_exc, "rss_once": self._rss_once, "rss_ntf": self._rss_ntf,
             "rss_th": self._rss_th, "rss_wash_mode": self._rss_wash_mode,
             "rss_save_path": self._rss_save_path,
@@ -2467,6 +2475,90 @@ class SpaceCleaner(_PluginBase):
             self.save_data("api_recognize_cache", cache)
         return cache
 
+    def _load_api_recognize_success_cache(self) -> List[dict]:
+        """加载识别成功独立正缓存，最多保留 20 条媒体标题识别结果。"""
+        raw = self.get_data("api_recognize_success_cache") or []
+        if not isinstance(raw, list):
+            return []
+        cache = []
+        seen = set()
+        for item in raw:
+            if not isinstance(item, dict) or not item.get("tmdb_id"):
+                continue
+            key = str(item.get("key") or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            cache.append({
+                "key": key,
+                "name": str(item.get("name") or "").strip(),
+                "media_type": item.get("media_type"),
+                "title": str(item.get("title") or "").strip(),
+                "year": str(item.get("year") or "").strip() or None,
+                "tmdb_id": int(item.get("tmdb_id")),
+            })
+        cache = cache[-self._api_recognize_success_cache_max:]
+        if cache != raw:
+            self.save_data("api_recognize_success_cache", cache)
+        return cache
+
+    def _save_api_success_cache(self, key: str, name: str, media: MediaInfo) -> None:
+        """保存一次识别成功结果到独立正缓存，超过 20 条时覆盖最早记录。"""
+        if not key or not media or not media.tmdb_id:
+            return
+        entry = {
+            "key": key,
+            "name": str(name or "").strip(),
+            "media_type": media.type.value if hasattr(media.type, "value") else str(media.type or ""),
+            "title": str(media.title or "").strip(),
+            "year": str(media.year or "").strip() or None,
+            "tmdb_id": int(media.tmdb_id),
+        }
+        with self._api_recognize_cache_lock:
+            self._api_recognize_success_cache = [
+                item for item in self._api_recognize_success_cache
+                if item.get("key") != key
+            ]
+            self._api_recognize_success_cache.append(entry)
+            # 超出上限时丢弃最早的缓存（列表头部为最早写入的记录）。
+            self._api_recognize_success_cache = self._api_recognize_success_cache[-self._api_recognize_success_cache_max:]
+            snapshot = list(self._api_recognize_success_cache)
+        self.save_data("api_recognize_success_cache", snapshot)
+        logger.info(f"SC-RSS 写入识别成功独立缓存（{len(snapshot)}/{self._api_recognize_success_cache_max}）: "
+                    f"{name} -> TMDB={media.tmdb_id} 《{media.title}》")
+
+    def _get_api_success_cache_media(self, cache_key: str, meta: MetaInfo) -> Optional[MediaInfo]:
+        """命中识别成功独立缓存时直接重建媒体信息，不调用 TMDB API。"""
+        if not cache_key:
+            return None
+        entry = None
+        with self._api_recognize_cache_lock:
+            for item in reversed(self._api_recognize_success_cache):
+                if item.get("key") == cache_key:
+                    entry = item
+                    break
+        if not entry or not entry.get("tmdb_id"):
+            return None
+        try:
+            media_type = entry.get("media_type")
+            if isinstance(media_type, str):
+                try:
+                    media_type = MediaType(media_type)
+                except (TypeError, ValueError):
+                    media_type = MediaType.UNKNOWN
+            media = MediaInfo(
+                source="themoviedb",
+                type=media_type or MediaType.UNKNOWN,
+                title=entry.get("title") or getattr(meta, "name", ""),
+                year=entry.get("year") or None,
+                season=getattr(meta, "begin_season", None),
+                tmdb_id=int(entry.get("tmdb_id")),
+            )
+            media.recognize_cache_hit = True
+            return media
+        except (TypeError, ValueError):
+            return None
+
     @staticmethod
     def _get_tmdb_local_cache_media(meta: MetaInfo) -> Optional[MediaInfo]:
         """从 MoviePilot 本地识别缓存直接重建媒体信息，不调用 TMDB API。"""
@@ -2544,9 +2636,12 @@ class SpaceCleaner(_PluginBase):
 
         识别时统一走 MoviePilot 的 MetaInfo()，它在解析前会自动套用用户在
         “设定-自定义识别词”里配置的识别词（屏蔽/替换/集偏移等），套用结果记录在
-        meta.apply_words；随后按 MoviePilot 本地缓存、空间清理器独立负缓存、TMDB 官方 API 的顺序识别。
-        MoviePilot 缓存命中时直接重建媒体信息，不再请求 TMDB；官方 API 成功结果由 MoviePilot
-        自身维护，空间清理器只保存 API 识别失败的标题级负缓存，最多 100 条。
+        meta.apply_words；随后按空间清理器独立缓存（识别成功正缓存/识别失败负缓存）、
+        MoviePilot 本地识别缓存、TMDB 官方 API 的顺序识别。
+        独立正缓存命中时直接用缓存重建媒体信息，不再请求 TMDB；独立负缓存命中时直接
+        跳过识别和下载；MoviePilot 本地缓存命中时直接重建媒体信息；官方 API 识别成功的
+        结果写入独立正缓存（最多 20 条，超出覆盖最早记录），API 识别失败的标题级负缓存
+        最多 5 条。
 
         整个识别过程会写入日志：候选来源、原始串、套用的识别词、解析出的标题/季集、
         以及最终 TMDB 命中结果，便于排查识别错误。
@@ -2558,7 +2653,7 @@ class SpaceCleaner(_PluginBase):
         failed_candidates: Dict[str, str] = {}
 
         def _try_recognize(title: str, subtitle: str = "", source_label: str = ""):
-            """尝试用给定标题做本地缓存、独立缓存和 TMDB 识别，返回 (media, meta, ok)。"""
+            """尝试用给定标题做独立缓存、本地识别缓存和 TMDB 识别，返回 (media, meta, ok)。"""
             meta = MetaInfo(title=title, subtitle=subtitle)
             self._rss_log_meta(source_label, title, meta)
             if not meta.name:
@@ -2566,12 +2661,12 @@ class SpaceCleaner(_PluginBase):
 
             cache_key = self._api_recognize_cache_key(meta)
 
-            # 第一层：直接读取 MoviePilot 自带识别缓存并重建 MediaInfo，不请求 TMDB 详情接口。
-            native_media = self._get_tmdb_local_cache_media(meta)
-            if native_media:
-                self._rss_log("命中 MoviePilot 自带 TMDB 本地缓存", title,
-                              f"TMDB={native_media.tmdb_id} 《{native_media.title}》")
-                return native_media, meta, True
+            # 第一层：读取空间清理器识别成功独立缓存，命中后直接用缓存重建媒体信息。
+            success_media = self._get_api_success_cache_media(cache_key, meta)
+            if success_media:
+                self._rss_log("命中空间清理器识别成功独立缓存", title,
+                              f"TMDB={success_media.tmdb_id} 《{success_media.title}》")
+                return success_media, meta, True
 
             # 第二层：读取空间清理器独立负缓存；命中后直接跳过识别及添加下载。
             if cache_key in failed_candidates:
@@ -2582,7 +2677,16 @@ class SpaceCleaner(_PluginBase):
                 self._rss_log("命中空间清理器独立负缓存", title, "跳过识别和下载")
                 return None, meta, False
 
-            # 第三层：以上均未命中，直接调用正在运行的 TMDB 官方模块并绕过其识别缓存。
+            # 第三层：读取 MoviePilot 自带识别缓存并重建 MediaInfo，不请求 TMDB 详情接口。
+            native_media = self._get_tmdb_local_cache_media(meta)
+            if native_media:
+                self._rss_log("命中TMDB识别缓存", title,
+                              f"TMDB={native_media.tmdb_id} 《{native_media.title}》")
+                # 识别成功结果同步写入独立正缓存，后续相同标题报文直接命中。
+                self._save_api_success_cache(cache_key, meta.name, native_media)
+                return native_media, meta, True
+
+            # 第四层：以上均未命中，直接调用正在运行的 TMDB 官方模块并绕过其识别缓存。
             tmdb_module = self.chain.modulemanager.get_running_module("TheMovieDbModule")
             if not tmdb_module:
                 self._rss_log("识别异常", title, "TMDB 官方识别模块未运行")
@@ -2594,7 +2698,8 @@ class SpaceCleaner(_PluginBase):
                 return None, meta, False
 
             if media:
-                # MoviePilot 官方模块自身负责写入其识别缓存，空间清理器不再重复保存正缓存。
+                # 写入识别成功独立缓存，后续相同标题报文直接使用缓存结果。
+                self._save_api_success_cache(cache_key, meta.name, media)
                 self._rss_log("TMDB官方API识别成功", title,
                               f"TMDB={media.tmdb_id} 《{media.title}》")
                 return media, meta, True
