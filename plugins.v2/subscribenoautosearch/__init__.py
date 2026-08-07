@@ -31,7 +31,7 @@ class SubscribeManage(_PluginBase):
     plugin_label = "订阅管理"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
-    plugin_config_prefix = "subscribenoautosearch_"
+    plugin_config_prefix = "subscribemanage_"
     plugin_order = 19
     auth_level = 1
 
