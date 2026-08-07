@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.8.2"
+    plugin_version = "4.8.3"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -2659,9 +2659,9 @@ class SpaceCleaner(_PluginBase):
                 return media, meta, base
 
         # 2) 回退到 RSS 标题识别
-        # 只过滤非数字的方括号内容（保留 [03] 这类集号标记）
-        ct = re.sub(r'\[(?!\d+E?\])\[?.*?\]', "", rt).strip()
-        cands = [x.strip() for x in ct.split("/") if x.strip()] or [ct]
+        # 优先用原始标题整体识别（MetaInfo 能自动跳过【发布组】等前缀标记）；
+        # 若整体识别失败，再按 "/" 分隔中英文名拆成多个候选分别尝试。
+        cands = [rt] + [x.strip() for x in rt.split("/") if x.strip() and x.strip() != rt]
         self._rss_log("识别", rt, f"回退用标题识别，共 {len(cands)} 个候选")
         best_media, best_meta, best_c = None, None, ""
         for c in cands:
@@ -2692,9 +2692,8 @@ class SpaceCleaner(_PluginBase):
         能直接影响入库季集。"""
         if meta.begin_episode is not None:
             return meta
-        # 从原始 RSS 标题重新解析季集（只过滤非数字的方括号内容，保留 [03] 这类集号标记）
-        clean = re.sub(r'\[(?!\d+E?\])\[?.*?\]', "", rt).strip()
-        fallback = MetaInfo(title=clean)
+        # 从原始 RSS 标题重新解析季集（直接用完整标题，MetaInfo 能跳过【发布组】等前缀）
+        fallback = MetaInfo(title=rt)
         if fallback.begin_episode is not None:
             self._rss_log("季集补充", rt,
                           f"从原始标题提取 S{fallback.begin_season or 1:02d}E{fallback.begin_episode:02d}")
@@ -2765,6 +2764,7 @@ class SpaceCleaner(_PluginBase):
 
             r = RequestUtils(timeout=30).get_res(enc)
             if not r or r.status_code != 200:
+                logger.warning(f"SC-RSS 下载种子文件失败: {enc} status={getattr(r, 'status_code', None)}")
                 return []
             t = bencode.bdecode(r.content)
             info = t.get("info", {})
@@ -2785,7 +2785,8 @@ class SpaceCleaner(_PluginBase):
             if isinstance(name, bytes):
                 name = name.decode("utf-8", errors="replace")
             return [name] if name else []
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"SC-RSS 解析种子文件失败: {enc} err={exc}")
             return []
 
     def _rss_dl_add(self, item: dict, m, meta: MetaInfo) -> bool:
