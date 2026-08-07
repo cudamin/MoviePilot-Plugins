@@ -37,11 +37,11 @@
     }
   },
   "SubscribeNoAutoSearch": {
-    "name": "新增订阅不自动搜索",
-    "description": "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。",
+    "name": "订阅管理",
+    "description": "订阅站点RSS刷新时先按包含/排除正则过滤，再参与TMDB识别；新增订阅不自动搜索。",
     "labels": "订阅管理",
-    "version": "2.0.0",
-    "icon": "pause.png",
+    "version": "1.0.0",
+    "icon": "subscribe.png",
     "author": "tafei",
     "level": 1,
     "history": {
