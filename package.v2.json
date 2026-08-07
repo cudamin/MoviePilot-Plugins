@@ -36,16 +36,16 @@
       "v4.8.2": "新增删种优先级功能，修改SC-RSS的识别和缓存逻辑"
     }
   },
-  "SubscribeManage": {
-    "name": "订阅管理",
-    "description": "订阅站点RSS刷新时先按包含/排除正则过滤，再参与TMDB识别；新增订阅不自动搜索。",
+  "SubscribeNoAutoSearch": {
+    "name": "新增订阅不自动搜索",
+    "description": "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。",
     "labels": "订阅管理",
-    "version": "1.0.0",
-    "icon": "subscribe.png",
+    "version": "1.2.2",
+    "icon": "pause.png",
     "author": "tafei",
     "level": 1,
     "history": {
-      "v1.0.0": "初始版本"
+      "v1.2.2": "可用版本"
     }
   },
   "AgentConfigProfile": {
