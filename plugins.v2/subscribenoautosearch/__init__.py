@@ -27,7 +27,7 @@ class SubscribeManage(_PluginBase):
     plugin_name = "订阅管理"
     plugin_desc = "订阅站点RSS刷新时先按包含/排除正则过滤，再参与TMDB识别；新增订阅不自动搜索。"
     plugin_icon = "subscribe.png"
-    plugin_version = "2.0.0"
+    plugin_version = "1.0.0"
     plugin_label = "订阅管理"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
