@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.8.3"
+    plugin_version = "4.8.4"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -1364,10 +1364,12 @@ class SpaceCleaner(_PluginBase):
         finally:
             sess.close()
 
+        # 按目标百分比删除时：预估每个单元可释放空间，避免删过头超过目标太多
         for unit in delete_units:
             if not self._delete_by_target and dc >= md:
                 fr = "limit"
                 break
+            # 完全删除上一个资源后强制刷新空间信息，再检查是否达到目标，避免缓存旧值导致多删
             cs = self._get_cached_space_info()
             if cs:
                 if self._delete_by_target and cs["free_percent"] >= self._target_free_percent:
@@ -1378,8 +1380,11 @@ class SpaceCleaner(_PluginBase):
                     logger.info(f"SC 空间已恢复至触发阈值 {self._min_free_percent}% (当前 {cs['free_percent']:.1f}%)，停止清理")
                     fr = "space_ok"
                     break
+            # 完整删除一个资源（种子+文件+记录），删除完成后立即使空间缓存失效，
+            # 下一次循环重新查询真实剩余空间，达标即停，否则继续删除下一个
             self._delete_unit(unit, chain, cs or space_info, all_torrents)
             dc += 1
+            self._cached_space_info = None
         if fr:
             return
         logger.info(f"SC 清理完成，删除 {dc} 个资源")
@@ -1605,6 +1610,8 @@ class SpaceCleaner(_PluginBase):
                         "seasons": r.seasons or "", "episodes": r.episodes or "",
                         "src": r.src or "", "dest": r.dest or "", "tmdbid": tid,
                         "download_hash": r.download_hash or "",
+                        "src_fileitem": r.src_fileitem or {},
+                        "dest_fileitem": r.dest_fileitem or {},
                     }
             finally:
                 sess.close()
@@ -2557,7 +2564,7 @@ class SpaceCleaner(_PluginBase):
         logger.info(f"SC-RSS 写入 TMDB API 失败独立缓存（{len(snapshot)}/{self._api_recognize_cache_max}）: {name}")
 
     def _rss_id(self, item: dict, rt: str):
-        """洗版模式：下载种子文件，取其中的视频文件名做 TMDB 识别。
+        """洗版模式：直接用 RSS 报文标题做 TMDB 识别（不再下载种子解析文件名）。
 
         识别时统一走 MoviePilot 的 MetaInfo()，它在解析前会自动套用用户在
         “设定-自定义识别词”里配置的识别词（屏蔽/替换/集偏移等），套用结果记录在
@@ -2571,10 +2578,8 @@ class SpaceCleaner(_PluginBase):
         整个识别过程会写入日志：候选来源、原始串、套用的识别词、解析出的标题/季集、
         以及最终 TMDB 命中结果，便于排查识别错误。
 
-        返回 (media, meta, video_name)，video_name 为用于识别的视频文件名（basename）。"""
-        enc = item.get("enclosure", "") or item.get("link", "")
-        fns = self._rss_fnames(enc)
-        # 当前 RSS 资源内暂存所有失败候选；只有文件名候选和 RSS 标题候选全部失败时才落盘负缓存。
+        返回 (media, meta, title_name)，title_name 为用于识别的报文标题候选。"""
+        # 当前 RSS 资源内暂存所有失败候选；所有标题候选全部失败时才落盘负缓存。
         failed_candidates: Dict[str, str] = {}
 
         def _try_recognize(title: str, subtitle: str = "", source_label: str = ""):
@@ -2634,35 +2639,10 @@ class SpaceCleaner(_PluginBase):
             self._rss_log("识别未命中", title, "TMDB 官方 API 未匹配到媒体，暂存失败候选")
             return None, meta, False
 
-        # 1) 优先用种子内的视频文件名识别（命中率更高）
-        if fns:
-            self._rss_log("识别", rt, f"种子含 {len(fns)} 个文件，优先用视频文件名识别")
-            best_file_media, best_file_meta, best_file_base = None, None, ""
-            for fn in fns:
-                try:
-                    base = fn.rsplit("/", 1)[-1]
-                    media, meta, ok = _try_recognize(base, source_label="文件名候选")
-                    if not ok:
-                        continue
-                    # 优先选用带集号的识别结果
-                    if meta.begin_episode is not None:
-                        return media, meta, base
-                    if best_file_media is None:
-                        best_file_media, best_file_meta, best_file_base = media, meta, base
-                except Exception as ex:
-                    self._rss_log("识别异常", fn, str(ex))
-                    continue
-            # 所有文件名候选都无集号，保留第一个成功的，从原始标题补充集号
-            if best_file_media is not None:
-                media, meta, base = best_file_media, best_file_meta, best_file_base
-                meta = self._rss_merge_episode_from_title(meta, rt)
-                return media, meta, base
-
-        # 2) 回退到 RSS 标题识别
-        # 优先用原始标题整体识别（MetaInfo 能自动跳过【发布组】等前缀标记）；
-        # 若整体识别失败，再按 "/" 分隔中英文名拆成多个候选分别尝试。
-        cands = [rt] + [x.strip() for x in rt.split("/") if x.strip() and x.strip() != rt]
-        self._rss_log("识别", rt, f"回退用标题识别，共 {len(cands)} 个候选")
+        # 直接使用 RSS 报文标题识别：按 "/" 拆分的不同译名逐个作为候选
+        # （每个候选 = 译名 + 集号/质量标记，避免多个译名合并识别导致失败）。
+        cands = self._rss_title_candidates(rt)
+        self._rss_log("识别", rt, f"标题识别，共 {len(cands)} 个候选")
         best_media, best_meta, best_c = None, None, ""
         for c in cands:
             media, meta, ok = _try_recognize(c, subtitle=item.get("description", ""), source_label="标题候选")
@@ -2678,10 +2658,41 @@ class SpaceCleaner(_PluginBase):
             meta = self._rss_merge_episode_from_title(best_meta, rt)
             return best_media, meta, best_c
 
-        # 文件名候选与 RSS 报文标题候选均失败后，才写入负缓存；同一标题只写一条。
+        # 所有标题候选均失败后，才写入负缓存；同一标题只写一条。
         for failed_key, failed_name in failed_candidates.items():
             self._save_api_negative_cache(failed_key, failed_name)
         return None, None, ""
+
+    @classmethod
+    def _rss_title_candidates(cls, rt: str) -> List[str]:
+        """把 RSS 报文标题拆分为多个识别候选。
+
+        标题以 "/" 分隔不同译名（如 "[字幕组] 译名A / 译名B / 英文名 [04][1080P]"）时，
+        每个译名 + 集号/质量标记组成一个候选，取其中一个译名识别；
+        无 "/" 时直接用原始标题作为唯一候选（MetaInfo 能自动跳过【发布组】前缀）。
+        """
+        if "/" not in rt:
+            return [rt]
+        # 去掉开头的发布组标记（如 [字幕组]、【字幕组】★07月新番★）
+        body = re.sub(r'^[\[【][^\]】\[]+[\]】]\s*(?:★[^★]*★\s*)?', "", rt).strip()
+        parts = [p.strip() for p in body.split("/") if p.strip()] or [body]
+        last = parts[-1]
+        # 提取最后一个译名段末尾的集号/质量标记（[...] 序列）
+        tail_match = re.search(r'((?:\[[^\[\]]*\]\s*)+)$', last)
+        tail = tail_match.group(1).strip() if tail_match else ""
+        cands = []
+        for i, p in enumerate(parts):
+            if i == len(parts) - 1 and tail:
+                name = last[:len(last) - len(tail)].strip()
+            else:
+                name = p
+            # 清理段首尾多余括号与段内其他标记
+            name = name.strip('[【').strip('】]').strip()
+            name = re.sub(r'\[[^\[\]]*\]', '', name).strip()
+            cand = (name + " " + tail).strip()
+            if cand and name:
+                cands.append(cand)
+        return cands or [rt]
 
     def _rss_merge_episode_from_title(self, meta, rt: str):
         """当 MetaInfo 解析结果缺少集号时，从原始 RSS 标题中重新提取季集信息，
@@ -2748,46 +2759,6 @@ class SpaceCleaner(_PluginBase):
         self._rss_log("季集解析", getattr(m, "title", ""),
                       f"MP识别 S{season:02d}" + (f"E{episode:02d}" if episode is not None else "（无集号）"))
         return season, episode
-
-    # 视频文件扩展名（洗版识别时优先取这些文件的文件名）
-    _VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
-                   ".flv", ".rmvb", ".rm", ".mpg", ".mpeg", ".webm", ".iso")
-
-    @classmethod
-    def _rss_fnames(cls, enc: str) -> List[str]:
-        """解析种子文件的文件列表，仅返回视频文件（按体积从大到小），
-        无视频文件时回退到全部文件名。"""
-        if not enc:
-            return []
-        try:
-            import bencode
-
-            r = RequestUtils(timeout=30).get_res(enc)
-            if not r or r.status_code != 200:
-                logger.warning(f"SC-RSS 下载种子文件失败: {enc} status={getattr(r, 'status_code', None)}")
-                return []
-            t = bencode.bdecode(r.content)
-            info = t.get("info", {})
-            files = info.get("files", [])
-            if files:
-                all_files = []  # (path, length)
-                for f in files:
-                    parts = [p.decode("utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p in f.get("path", [])]
-                    if parts:
-                        all_files.append(("/".join(parts), f.get("length", 0) or 0))
-                # 优先取视频文件，按体积从大到小（正片通常最大）
-                videos = [(p, l) for p, l in all_files if p.lower().endswith(cls._VIDEO_EXTS)]
-                if videos:
-                    videos.sort(key=lambda x: x[1], reverse=True)
-                    return [p for p, _ in videos]
-                return [p for p, _ in all_files]
-            name = info.get("name", "")
-            if isinstance(name, bytes):
-                name = name.decode("utf-8", errors="replace")
-            return [name] if name else []
-        except Exception as exc:
-            logger.warning(f"SC-RSS 解析种子文件失败: {enc} err={exc}")
-            return []
 
     def _rss_dl_add(self, item: dict, m, meta: MetaInfo) -> bool:
         try:
