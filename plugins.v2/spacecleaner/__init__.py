@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.8.4"
+    plugin_version = "4.8.5"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -74,6 +74,7 @@ class SpaceCleaner(_PluginBase):
     _rss_ntf = False
     _rss_th = 85
     _rss_wash_mode = False  # 洗版模式：播放进度低于阈值时触发洗版，只下载最早版本
+    _rss_fname_identify = False  # 种子文件名优先识别：开启后下载种子解析视频文件名优先识别
     _rss_save_path = ""  # RSS 下载自定义保存路径
 
     # === 内部状态 ===
@@ -228,6 +229,7 @@ class SpaceCleaner(_PluginBase):
             "rss_sz": self._rss_sz, "rss_inc": self._rss_inc,
             "rss_exc": self._rss_exc, "rss_once": self._rss_once, "rss_ntf": self._rss_ntf,
             "rss_th": self._rss_th, "rss_wash_mode": self._rss_wash_mode,
+            "rss_fname_identify": self._rss_fname_identify,
             "rss_save_path": self._rss_save_path,
             "clean_downloader": self._clean_downloader,
         })
@@ -605,10 +607,11 @@ class SpaceCleaner(_PluginBase):
             "component": "VForm",
             "content": [
                 {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_on", "label": "启用"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_ntf", "label": "通知"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_once", "label": "立即刷新RSS"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_on", "label": "启用"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_ntf", "label": "通知"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_once", "label": "立即刷新RSS"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_wash_mode", "label": "洗版模式", "hint": "播放进度低于阈值或无播放缓存时触发洗版，洗版只下载最早发布的版本", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_fname_identify", "label": "种子文件名识别", "hint": "开启后下载RSS中的种子文件，优先用视频文件名识别（识别更准但会多下载种子文件）", "persistent-hint": True}}]},
                 ]},
                 {"component": "VDivider", "props": {"class": "my-2"}},
                 {"component": "VRow", "content": [
@@ -657,7 +660,7 @@ class SpaceCleaner(_PluginBase):
             "pb_filter_watched": True, "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
             "rss_dl": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
-            "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False, "rss_save_path": "",
+            "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False, "rss_fname_identify": False, "rss_save_path": "",
         }
 
     # ==================== 详情页（三区块平铺） ====================
@@ -2564,7 +2567,10 @@ class SpaceCleaner(_PluginBase):
         logger.info(f"SC-RSS 写入 TMDB API 失败独立缓存（{len(snapshot)}/{self._api_recognize_cache_max}）: {name}")
 
     def _rss_id(self, item: dict, rt: str):
-        """洗版模式：直接用 RSS 报文标题做 TMDB 识别（不再下载种子解析文件名）。
+        """洗版模式：RSS 报文识别（可选用种子文件名优先识别）。
+
+        识别开关（种子文件名识别）开启时，先下载 RSS 中的种子文件，取视频文件名
+        优先识别；关闭时直接使用报文标题识别（按 "/" 拆分的译名逐个识别）。
 
         识别时统一走 MoviePilot 的 MetaInfo()，它在解析前会自动套用用户在
         “设定-自定义识别词”里配置的识别词（屏蔽/替换/集偏移等），套用结果记录在
@@ -2578,8 +2584,11 @@ class SpaceCleaner(_PluginBase):
         整个识别过程会写入日志：候选来源、原始串、套用的识别词、解析出的标题/季集、
         以及最终 TMDB 命中结果，便于排查识别错误。
 
-        返回 (media, meta, title_name)，title_name 为用于识别的报文标题候选。"""
-        # 当前 RSS 资源内暂存所有失败候选；所有标题候选全部失败时才落盘负缓存。
+        返回 (media, meta, title_name)，title_name 为用于识别的候选名称。"""
+        # 识别开关开启时下载种子解析视频文件名；关闭时不做任何种子下载
+        enc = item.get("enclosure", "") or item.get("link", "")
+        fns = self._rss_fnames(enc) if self._rss_fname_identify else []
+        # 当前 RSS 资源内暂存所有失败候选；所有候选全部失败时才落盘负缓存。
         failed_candidates: Dict[str, str] = {}
 
         def _try_recognize(title: str, subtitle: str = "", source_label: str = ""):
@@ -2639,6 +2648,30 @@ class SpaceCleaner(_PluginBase):
             self._rss_log("识别未命中", title, "TMDB 官方 API 未匹配到媒体，暂存失败候选")
             return None, meta, False
 
+        # 开关开启且取到种子内视频文件名时，优先用文件名识别（命中率更高）
+        if fns:
+            self._rss_log("识别", rt, f"种子含 {len(fns)} 个文件，优先用视频文件名识别")
+            best_file_media, best_file_meta, best_file_base = None, None, ""
+            for fn in fns:
+                try:
+                    base = fn.rsplit("/", 1)[-1]
+                    media, meta, ok = _try_recognize(base, source_label="文件名候选")
+                    if not ok:
+                        continue
+                    # 优先选用带集号的识别结果
+                    if meta.begin_episode is not None:
+                        return media, meta, base
+                    if best_file_media is None:
+                        best_file_media, best_file_meta, best_file_base = media, meta, base
+                except Exception as ex:
+                    self._rss_log("识别异常", fn, str(ex))
+                    continue
+            # 所有文件名候选都无集号，保留第一个成功的，从原始标题补充集号
+            if best_file_media is not None:
+                media, meta, base = best_file_media, best_file_meta, best_file_base
+                meta = self._rss_merge_episode_from_title(meta, rt)
+                return media, meta, base
+
         # 直接使用 RSS 报文标题识别：按 "/" 拆分的不同译名逐个作为候选
         # （每个候选 = 译名 + 集号/质量标记，避免多个译名合并识别导致失败）。
         cands = self._rss_title_candidates(rt)
@@ -2693,6 +2726,46 @@ class SpaceCleaner(_PluginBase):
             if cand and name:
                 cands.append(cand)
         return cands or [rt]
+
+    # 视频文件扩展名（种子文件名识别时按这些扩展名筛选文件）
+    _VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
+                   ".flv", ".rmvb", ".rm", ".mpg", ".mpeg", ".webm", ".iso")
+
+    @classmethod
+    def _rss_fnames(cls, enc: str) -> List[str]:
+        """下载种子文件并解析文件列表，仅返回视频文件（按体积从大到小），
+        无视频文件时回退到全部文件名。"""
+        if not enc:
+            return []
+        try:
+            import bencode
+
+            r = RequestUtils(timeout=30).get_res(enc)
+            if not r or r.status_code != 200:
+                logger.warning(f"SC-RSS 下载种子文件失败: {enc} status={getattr(r, 'status_code', None)}")
+                return []
+            t = bencode.bdecode(r.content)
+            info = t.get("info", {})
+            files = info.get("files", [])
+            if files:
+                all_files = []  # (path, length)
+                for f in files:
+                    parts = [p.decode("utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p in f.get("path", [])]
+                    if parts:
+                        all_files.append(("/".join(parts), f.get("length", 0) or 0))
+                # 优先取视频文件，按体积从大到小（正片通常最大）
+                videos = [(p, l) for p, l in all_files if p.lower().endswith(cls._VIDEO_EXTS)]
+                if videos:
+                    videos.sort(key=lambda x: x[1], reverse=True)
+                    return [p for p, _ in videos]
+                return [p for p, _ in all_files]
+            name = info.get("name", "")
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="replace")
+            return [name] if name else []
+        except Exception as exc:
+            logger.warning(f"SC-RSS 解析种子文件失败: {enc} err={exc}")
+            return []
 
     def _rss_merge_episode_from_title(self, meta, rt: str):
         """当 MetaInfo 解析结果缺少集号时，从原始 RSS 标题中重新提取季集信息，
