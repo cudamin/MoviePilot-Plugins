@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.8.5"
+    plugin_version = "4.8.6"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -129,6 +129,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_once = self._rss_ntf = False
         self._rss_th = 85
         self._rss_wash_mode = False
+        self._rss_fname_identify = False
         self._rss_save_path = ""
         self._pb = self._latest_episode_records(list(self.get_data("pb") or []))
         self.save_data("pb", self._pb)
@@ -190,6 +191,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_seen = set(self.get_data("rss_seen") or [])
         self._rss_washed = set(self.get_data("rss_washed") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
+        self._rss_fname_identify = bool(config.get("rss_fname_identify"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
 
         if self._enabled:
