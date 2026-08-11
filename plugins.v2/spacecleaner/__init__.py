@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.8.7"
+    plugin_version = "4.8.8"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -2135,6 +2135,19 @@ class SpaceCleaner(_PluginBase):
                 cr = self._rss_ck(m, meta, s_season, s_episode)
                 if is_tv:
                     se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}" if s_episode else f"S{int(s_season):02d}"
+                    # 同一 TMDB 已有播放缓存但季号不一致时，视为分季策略不同，避免按错误季号下载。
+                    cached_seasons = self._rss_cached_seasons(m.tmdb_id)
+                    if cached_seasons and int(s_season) not in cached_seasons:
+                        cached_text = "、".join(f"S{season:02d}" for season in cached_seasons)
+                        self._rss_log("跳过季号不一致", m.title,
+                                      f"RSS={se_fmt}，播放缓存季={cached_text}，疑似分季策略不同")
+                        if self._rss_ntf:
+                            self.post_message(
+                                title="SC-RSS季号不一致",
+                                text=f"资源: {m.title}\nRSS识别: {se_fmt}\n播放缓存季: {cached_text}\n"
+                                     "疑似分季策略不同，已跳过下载"
+                            )
+                        continue
                 else:
                     se_fmt = "电影"
                 # 洗版模式：若该季已有更新集的播放记录，则跳过之前的所有旧集
@@ -2360,6 +2373,19 @@ class SpaceCleaner(_PluginBase):
                 if latest is None or ep > latest:
                     latest = ep
         return latest
+
+    def _rss_cached_seasons(self, tmdb_id: int) -> List[int]:
+        """获取指定电视剧在播放缓存中已有记录的季号列表。"""
+        if self._media_cache_disabled or not tmdb_id:
+            return []
+        seasons = set()
+        pattern = re.compile(rf"^{re.escape(str(tmdb_id))}:S(\d+)E")
+        with self._pb_lock:
+            for record in self._pb:
+                match = pattern.match(str(record.get("k") or ""))
+                if match:
+                    seasons.add(int(match.group(1)))
+        return sorted(seasons)
 
     @staticmethod
     def _normalize_api_media_name(name: str) -> str:
