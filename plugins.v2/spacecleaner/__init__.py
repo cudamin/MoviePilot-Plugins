@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.8.6"
+    plugin_version = "4.8.7"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -2672,7 +2672,13 @@ class SpaceCleaner(_PluginBase):
             if best_file_media is not None:
                 media, meta, base = best_file_media, best_file_meta, best_file_base
                 meta = self._rss_merge_episode_from_title(meta, rt)
-                return media, meta, base
+                if meta.begin_episode is not None:
+                    return media, meta, base
+                # 文件名识别无集号且标题补充失败：继续回退标题识别兜底
+                self._rss_log("文件名无集号", rt, "视频文件名无法解析集号，回退标题识别")
+                file_media, file_meta, file_base = media, meta, base
+            else:
+                file_media, file_meta, file_base = None, None, ""
 
         # 直接使用 RSS 报文标题识别：按 "/" 拆分的不同译名逐个作为候选
         # （每个候选 = 译名 + 集号/质量标记，避免多个译名合并识别导致失败）。
@@ -2692,6 +2698,9 @@ class SpaceCleaner(_PluginBase):
             self._rss_log("识别回退", best_c, "所有候选均无集号，从原始标题补充")
             meta = self._rss_merge_episode_from_title(best_meta, rt)
             return best_media, meta, best_c
+        # 标题识别全部失败：若文件名识别有成功结果（仅缺集号），返回该结果避免误写负缓存
+        if file_media is not None:
+            return file_media, file_meta, file_base
 
         # 所有标题候选均失败后，才写入负缓存；同一标题只写一条。
         for failed_key, failed_name in failed_candidates.items():
@@ -2780,6 +2789,15 @@ class SpaceCleaner(_PluginBase):
             return meta
         # 从原始 RSS 标题重新解析季集（直接用完整标题，MetaInfo 能跳过【发布组】等前缀）
         fallback = MetaInfo(title=rt)
+        if fallback.begin_episode is None:
+            # MetaInfo 无法解析集号时，兼容 "- 17(89)"（第17话/总第89话）、"E17/EP17"、"第17话" 等格式
+            mm = re.search(r'[-_]\s*(\d+)\s*\(\s*\d+\s*\)', rt)
+            if not mm:
+                mm = re.search(r'(?i)(?:E|EP)\s*(\d+)', rt)
+            if not mm:
+                mm = re.search(r'第\s*(\d+)\s*[话集]', rt)
+            if mm:
+                fallback.begin_episode = int(mm.group(1))
         if fallback.begin_episode is not None:
             self._rss_log("季集补充", rt,
                           f"从原始标题提取 S{fallback.begin_season or 1:02d}E{fallback.begin_episode:02d}")
