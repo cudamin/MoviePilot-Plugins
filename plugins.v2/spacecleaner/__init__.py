@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.9.0"
+    plugin_version = "4.9.1"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -951,24 +951,19 @@ class SpaceCleaner(_PluginBase):
 
     def _start_scheduler(self) -> None:
         if self._scheduler_thread and self._scheduler_thread.is_alive():
-            logger.info(f"SC 调度线程已存在且存活，跳过启动 (cron={self._check_cron})")
             return
         self._scheduler_running = True
         self._scheduler_event = threading.Event()
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True, name="SC-Scheduler")
         self._scheduler_thread.start()
-        logger.info(f"SC 调度线程已启动 (cron={self._check_cron}, alive={self._scheduler_thread.is_alive()})")
 
     def _scheduler_loop(self) -> None:
-        # 使用 APScheduler 的 CronTrigger 进行定时调度
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.cron import CronTrigger
         scheduler = BackgroundScheduler(timezone=settings.TZ)
         try:
             scheduler.add_job(self._check_and_clean, CronTrigger.from_crontab(self._check_cron))
             scheduler.start()
-            logger.info(f"SC 定时任务已添加: {self._check_cron}")
-            # 等待停止信号
             self._scheduler_event.wait()
         except Exception as e:
             logger.error(f"SC 定时任务启动失败: {str(e)}")
