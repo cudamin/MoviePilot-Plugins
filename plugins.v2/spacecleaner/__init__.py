@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.8.8"
+    plugin_version = "4.9.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -46,7 +46,7 @@ class SpaceCleaner(_PluginBase):
     _delete_by_target = False
     _target_free_percent = 20
     _delete_count = 1
-    _check_interval = 6
+    _check_cron = "0 */6 * * *"  # 执行周期，默认每6小时
     _dry_run = False
     _delete_other_versions = True  # 删种时检索整理记录，删除同一集/同一部电影的其他版本
     _delete_by_record = False  # 按媒体整理记录删除：优先删除整理记录中最早入库的已看资源
@@ -121,7 +121,7 @@ class SpaceCleaner(_PluginBase):
         self._pb_search = ""
         self._watched_threshold = 85
         self._delete_count = 1
-        self._check_interval = 6
+        self._check_cron = "0 */6 * * *"
         self._clean_downloader = []
         self._rss_cron = self._rss_urls = self._rss_sz = self._rss_inc = self._rss_exc = ""
         self._rss_dl = ""
@@ -148,7 +148,7 @@ class SpaceCleaner(_PluginBase):
         self._delete_by_target = bool(config.get("delete_by_target"))
         self._target_free_percent = int(config.get("target_free_percent") or 20)
         self._delete_count = int(config.get("delete_count") or 1)
-        self._check_interval = int(config.get("check_interval") or 6)
+        self._check_cron = str(config.get("check_cron") or "0 */6 * * *")
         self._dry_run = bool(config.get("dry_run"))
         self._delete_other_versions = bool(config.get("delete_other_versions", True))
         self._delete_by_record = bool(config.get("delete_by_record"))
@@ -220,7 +220,7 @@ class SpaceCleaner(_PluginBase):
         self.update_config({
             "enabled": self._enabled, "min_free_percent": self._min_free_percent,
             "delete_by_target": self._delete_by_target, "target_free_percent": self._target_free_percent,
-            "delete_count": self._delete_count, "check_interval": self._check_interval,
+            "delete_count": self._delete_count, "check_cron": self._check_cron,
             "dry_run": self._dry_run,
             "delete_other_versions": self._delete_other_versions, "notify": self._notify,
             "delete_by_record": self._delete_by_record,
@@ -594,7 +594,7 @@ class SpaceCleaner(_PluginBase):
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "min_free_percent", "label": "删种触发阈值（%）", "type": "number", "min": 1, "max": 99}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "target_free_percent", "label": "目标剩余百分比", "type": "number", "min": 1, "max": 99}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "check_interval", "label": "检查间隔（小时）", "type": "number", "min": 1}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VCronField", "props": {"model": "check_cron", "label": "执行周期"}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "delete_count", "label": "单次删除资源数", "type": "number", "min": 1}}]},
                 ]},
                 {"component": "VRow", "content": [
@@ -656,7 +656,7 @@ class SpaceCleaner(_PluginBase):
             "_active_tab": "clean",
             "enabled": False, "min_free_percent": 10,
             "delete_by_target": False, "target_free_percent": 20,
-            "delete_count": 1, "check_interval": 6,
+            "delete_count": 1, "check_cron": "0 */6 * * *",
             "dry_run": False, "delete_other_versions": True, "delete_by_record": False, "notify": True,
             "media_cache_disabled": False, "clean_downloader": [], "run_now": False,
             "pb_filter_watched": True, "watched_threshold": 85,
@@ -951,23 +951,32 @@ class SpaceCleaner(_PluginBase):
 
     def _start_scheduler(self) -> None:
         if self._scheduler_thread and self._scheduler_thread.is_alive():
+            logger.info(f"SC 调度线程已存在且存活，跳过启动 (cron={self._check_cron})")
             return
         self._scheduler_running = True
         self._scheduler_event = threading.Event()
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True, name="SC-Scheduler")
         self._scheduler_thread.start()
+        logger.info(f"SC 调度线程已启动 (cron={self._check_cron}, alive={self._scheduler_thread.is_alive()})")
 
     def _scheduler_loop(self) -> None:
-        interval_seconds = self._check_interval * 3600
-        self._scheduler_event.wait(interval_seconds)
-        while self._scheduler_running:
+        # 使用 APScheduler 的 CronTrigger 进行定时调度
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        scheduler = BackgroundScheduler(timezone=settings.TZ)
+        try:
+            scheduler.add_job(self._check_and_clean, CronTrigger.from_crontab(self._check_cron))
+            scheduler.start()
+            logger.info(f"SC 定时任务已添加: {self._check_cron}")
+            # 等待停止信号
+            self._scheduler_event.wait()
+        except Exception as e:
+            logger.error(f"SC 定时任务启动失败: {str(e)}")
+        finally:
             try:
-                self._check_and_clean()
-            except Exception as e:
-                logger.error(f"SC检查异常: {str(e)}")
-            self._scheduler_event.clear()
-            if self._scheduler_event.wait(interval_seconds):
-                break
+                scheduler.shutdown(wait=False)
+            except Exception:
+                pass
 
     def _run_now_task(self) -> None:
         logger.info("SC 开始立即清理...")
