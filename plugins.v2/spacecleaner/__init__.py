@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.9.2"
+    plugin_version = "4.9.3"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -56,7 +56,6 @@ class SpaceCleaner(_PluginBase):
     _pb_sort_desc = True  # 播放缓存排序方向：True 降序 / False 升序
     _pb_filter_watched = True  # 播放缓存默认只显示已看完
     _pb_search = ""  # 播放缓存搜索关键字
-    _pb_interacted = False  # 本次数据页会话是否发生过页内交互（用于判断是否为首次打开）
     _watched_threshold = 85  # 标记已看播放进度阈值（%）
     _clean_downloader = []  # 空间清理扫描的下载器，空列表扫描全部
 
@@ -82,6 +81,7 @@ class SpaceCleaner(_PluginBase):
     _scheduler_event = None
     _chain = None
     _running = False
+    _run_lock = threading.Lock()  # 保护 _running / _rss_busy 的检查与置位
     _cached_space_info = None
     _cached_space_time = 0
     _space_cache_ttl = 10
@@ -92,12 +92,14 @@ class SpaceCleaner(_PluginBase):
     _pb_cache_time = 0
     _pb_cache_ttl = 30
     _pb: List[dict] = []
-    _pb_max = 0  # 播放缓存最大条数，0 表示无上限
     _pb_lock = threading.Lock()
     _rss_s: Optional[BackgroundScheduler] = None
     _rss_busy = False
-    _rss_seen: set = set()
-    _rss_washed: set = set()  # 已洗版下载过的集(tmdbid:SxxExx)，一集一个槽位
+    # 去重容器用 dict 充当「有序集合」：保留插入顺序，裁剪时才能真正丢弃最早记录
+    _rss_seen: Dict[str, None] = {}
+    _rss_washed: Dict[str, None] = {}  # 已洗版下载过的集(tmdbid:SxxExx)，一集一个槽位
+    _rss_seen_max = 2000
+    _rss_washed_max = 3000
     _rss_lk = threading.Lock()
     _api_recognize_cache: List[dict] = []  # TMDB API 识别失败后的独立负缓存
     _api_recognize_cache_max = 5
@@ -105,10 +107,27 @@ class SpaceCleaner(_PluginBase):
     _api_recognize_success_cache_max = 100
     _api_recognize_cache_lock = threading.Lock()
 
+    @staticmethod
+    def _to_int(value: Any, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+        """安全地把配置值转为 int：无法解析时用默认值，并按需钳制范围。
+
+        表单数字框可能回传空串、小数或非法字符，直接 int() 会抛异常导致 init_plugin 失败。
+        """
+        try:
+            result = int(float(str(value).strip()))
+        except (TypeError, ValueError, AttributeError):
+            result = default
+        if minimum is not None and result < minimum:
+            result = minimum
+        if maximum is not None and result > maximum:
+            result = maximum
+        return result
+
     def init_plugin(self, config: dict = None) -> None:
         self.stop_service()
         self._enabled = self._rss_on = False
         self._min_free_percent = 10
+        self._target_free_percent = 20
         self._delete_by_target = self._dry_run = self._notify = False
         self._delete_other_versions = True
         self._delete_by_record = False
@@ -131,8 +150,8 @@ class SpaceCleaner(_PluginBase):
         self._rss_save_path = ""
         self._pb = self._latest_episode_records(list(self.get_data("pb") or []))
         self.save_data("pb", self._pb)
-        self._rss_seen = set()
-        self._rss_washed = set()
+        self._rss_seen = {}
+        self._rss_washed = {}
         self._api_recognize_cache = self._load_api_recognize_cache()
         self._api_recognize_success_cache = self._load_api_recognize_success_cache()
         self._stop_rss_scheduler()
@@ -142,10 +161,10 @@ class SpaceCleaner(_PluginBase):
 
         # 空间清理配置
         self._enabled = bool(config.get("enabled"))
-        self._min_free_percent = int(config.get("min_free_percent") or 10)
+        self._min_free_percent = self._to_int(config.get("min_free_percent"), 10, 1, 99)
         self._delete_by_target = bool(config.get("delete_by_target"))
-        self._target_free_percent = int(config.get("target_free_percent") or 20)
-        self._delete_count = int(config.get("delete_count") or 1)
+        self._target_free_percent = self._to_int(config.get("target_free_percent"), 20, 1, 99)
+        self._delete_count = self._to_int(config.get("delete_count"), 1, 1)
         self._check_cron = str(config.get("check_cron") or "").strip()
         if not self._check_cron:
             # 兼容旧版「执行周期（小时）」配置，迁移为等价 cron 表达式
@@ -165,10 +184,7 @@ class SpaceCleaner(_PluginBase):
         self._pb_sort_desc = True  # 时间降序（从近到远）
         self._pb_filter_watched = bool(config.get("pb_filter_watched", True))
         self._pb_search = ""
-        try:
-            self._watched_threshold = int(config.get("watched_threshold") or 85)
-        except (ValueError, TypeError):
-            self._watched_threshold = 85
+        self._watched_threshold = self._to_int(config.get("watched_threshold"), 85, 1, 100)
         raw = config.get("clean_downloader") or []
         if isinstance(raw, list):
             self._clean_downloader = [str(d) for d in raw if d]
@@ -188,13 +204,10 @@ class SpaceCleaner(_PluginBase):
         self._rss_inc = str(config.get("rss_inc") or "")
         self._rss_exc = str(config.get("rss_exc") or "")
         self._rss_once = bool(config.get("rss_once"))
-        self._rss_ntf = bool(config.get("rss_ntf"))
-        try:
-            self._rss_th = int(config.get("rss_th") or 85)
-        except (ValueError, TypeError):
-            self._rss_th = 85
-        self._rss_seen = set(self.get_data("rss_seen") or [])
-        self._rss_washed = set(self.get_data("rss_washed") or [])
+        self._rss_ntf = bool(config.get("rss_ntf", True))
+        self._rss_th = self._to_int(config.get("rss_th"), 85, 1, 100)
+        self._rss_seen = dict.fromkeys(self.get_data("rss_seen") or [])
+        self._rss_washed = dict.fromkeys(self.get_data("rss_washed") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_fname_identify = bool(config.get("rss_fname_identify"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
@@ -210,14 +223,17 @@ class SpaceCleaner(_PluginBase):
             self._rss_once = False
             self._update_config()
             if self._rss_on and self._rss_urls:
-                s = BackgroundScheduler(timezone=settings.TZ)
-                s.add_job(self._rss_run, "date", run_date=datetime.now())
-                s.start()
-                self._rss_s = s
-            return
+                threading.Thread(target=self._rss_run, daemon=True, name="SC-RssOnce").start()
         if self._rss_on and self._rss_cron and self._rss_urls:
+            # 重新注册前先停掉上一轮调度器，避免重复保存配置后多个调度器并发跑 RSS
+            self._stop_rss_scheduler()
+            try:
+                trigger = CronTrigger.from_crontab(self._rss_cron)
+            except Exception as exc:
+                logger.error(f"SC-RSS 执行周期表达式无效（{self._rss_cron}）: {exc}，回退为 */30 * * * *")
+                trigger = CronTrigger.from_crontab("*/30 * * * *")
             s = BackgroundScheduler(timezone=settings.TZ)
-            s.add_job(self._rss_run, CronTrigger.from_crontab(self._rss_cron))
+            s.add_job(self._rss_run, trigger)
             s.start()
             self._rss_s = s
 
@@ -249,7 +265,7 @@ class SpaceCleaner(_PluginBase):
     @eventmanager.register(EventType.WebhookMessage)
     def on_webhook(self, event: Event) -> None:
         if not self._enabled and not self._rss_on:
-            logger.info(f"SC on_webhook skipped: enabled={self._enabled} rss_on={self._rss_on}")
+            logger.debug(f"SC on_webhook skipped: enabled={self._enabled} rss_on={self._rss_on}")
             return
         try:
             from app.schemas.mediaserver import WebhookEventInfo
@@ -331,8 +347,6 @@ class SpaceCleaner(_PluginBase):
                     return
                 self._pb = [r for r in self._pb if not str(r.get("k", "")).startswith(prefix)]
             self._pb.append({"k": k, "n": n, "s": sn, "e": en, "p": pct, "t": ts})
-            if self._pb_max > 0 and len(self._pb) > self._pb_max:
-                self._pb = self._pb[-self._pb_max:]
         self.save_data("pb", self._pb)
         logger.info(f"SC cached: {n} {se_display} {pct:.1f}%")
 
@@ -370,26 +384,19 @@ class SpaceCleaner(_PluginBase):
             {"path": "/pb_mark_watched", "endpoint": self.pb_mark_watched, "methods": ["GET"], "summary": "将单条播放记录标记为已看"},
             {"path": "/pb_mark_all_watched", "endpoint": self.pb_mark_all_watched, "methods": ["GET"], "summary": "将所有未看完记录标记为已看"},
             {"path": "/pb_toggle_prio", "endpoint": self.pb_toggle_prio, "methods": ["GET"], "summary": "切换播放记录优先删除标记"},
-            {"path": "/rss_dh", "endpoint": self.rss_dh, "methods": ["GET"], "summary": "删除RSS历史"},
             {"path": "/rss_ca", "endpoint": self.rss_ca, "methods": ["GET"], "summary": "清除RSS数据"},
         ]
-
-    def rss_dh(self, k: str, apikey: str):
-        if apikey != settings.API_TOKEN:
-            return schemas.Response(success=False)
-        return schemas.Response(success=True)
 
     def rss_ca(self, apikey: str):
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
         self.save_data("rss_seen", [])
-        self._rss_seen = set()
+        self._rss_seen = {}
         return schemas.Response(success=True)
 
     def del_pb_item(self, k: str, apikey: str):
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        self._pb_interacted = True
         with self._pb_lock:
             before = len(self._pb)
             self._pb = [r for r in self._pb if r.get("k") != k]
@@ -402,7 +409,6 @@ class SpaceCleaner(_PluginBase):
     def clear_pb(self, apikey: str):
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        self._pb_interacted = True
         with self._pb_lock:
             self._pb.clear()
         self.save_data("pb", [])
@@ -462,7 +468,6 @@ class SpaceCleaner(_PluginBase):
         """切换播放缓存已看完筛选。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        self._pb_interacted = True
         self._pb_filter_watched = not self._pb_filter_watched
         self._pb_page = 1
         self._update_config()
@@ -472,7 +477,6 @@ class SpaceCleaner(_PluginBase):
         """设置播放缓存搜索关键字（空串表示清除搜索）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        self._pb_interacted = True
         self._pb_search = (q or "").strip()
         self._pb_page = 1
         return schemas.Response(success=True)
@@ -481,7 +485,6 @@ class SpaceCleaner(_PluginBase):
         """将单条未看完的播放记录标记为已看（进度置为100%）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        self._pb_interacted = True
         marked = False
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._pb_lock:
@@ -501,7 +504,6 @@ class SpaceCleaner(_PluginBase):
         """切换单条播放记录的优先删除标记。被标记的资源在空间清理时优先删除。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        self._pb_interacted = True
         new_state = None
         with self._pb_lock:
             for r in self._pb:
@@ -519,7 +521,6 @@ class SpaceCleaner(_PluginBase):
         """将所有未看完的播放记录批量标记为已看（进度置为100%）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        self._pb_interacted = True
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cnt = 0
         with self._pb_lock:
@@ -691,7 +692,6 @@ class SpaceCleaner(_PluginBase):
         # API 操作与页面渲染可能落到不同插件实例，渲染前从插件数据恢复视图状态。
         self._load_pb_view_state()
         space_info = self._get_space_info()
-        delete_history = self._get_delete_history()
         pb = self._get_playback_pb()
         cards = []
 
@@ -971,15 +971,15 @@ class SpaceCleaner(_PluginBase):
 
     def _start_scheduler(self) -> None:
         if self._scheduler_thread and self._scheduler_thread.is_alive():
-            logger.info(f"SC 调度线程已存在且存活，跳过启动 (执行周期={self._check_cron})")
             return
         self._scheduler_running = True
-        self._scheduler_event = threading.Event()
-        self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True, name="SC-Scheduler")
+        event = threading.Event()
+        self._scheduler_event = event
+        self._scheduler_thread = threading.Thread(target=self._scheduler_loop, args=(event,), daemon=True,
+                                                 name="SC-Scheduler")
         self._scheduler_thread.start()
-        logger.info(f"SC 调度线程已启动 (执行周期={self._check_cron}, alive={self._scheduler_thread.is_alive()})")
 
-    def _scheduler_loop(self) -> None:
+    def _scheduler_loop(self, event: threading.Event) -> None:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.cron import CronTrigger
         scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -993,8 +993,8 @@ class SpaceCleaner(_PluginBase):
                 trigger = CronTrigger.from_crontab(cron)
             scheduler.add_job(self._check_and_clean, trigger)
             scheduler.start()
-            logger.info(f"SC 定时任务已启动，执行周期: {cron}")
-            self._scheduler_event.wait()
+            # 用本地 event 等待，避免 stop_service 把 _scheduler_event 置 None 后空指针
+            event.wait()
         except Exception as e:
             logger.error(f"SC 定时任务启动失败: {str(e)}")
         finally:
@@ -1033,8 +1033,9 @@ class SpaceCleaner(_PluginBase):
         pb = self._get_playback_pb()
         if not pb:
             return False
-        if season and episode:
-            k = f"{tmdbid}:S{season:02d}E{episode:02d}"
+        # 用 is not None 判断，季 0（Specials）与集 0 也要能正常匹配
+        if season is not None and episode is not None:
+            k = f"{tmdbid}:S{int(season):02d}E{int(episode):02d}"
             for r in pb:
                 if r.get("k") == k:
                     return (r.get("p", 0) or 0) >= self._watched_threshold
@@ -1091,16 +1092,28 @@ class SpaceCleaner(_PluginBase):
             return self._is_watched_pb(tmdb, season_num, max_ep)
         return False
 
+    def _configured_dirs(self) -> List[Path]:
+        """读取系统「目录配置」中的下载目录与媒体库目录。
+
+        MoviePilot V2 只有 SystemConfigKey.Directories 一个键，每项内含
+        download_path / library_path；早期实现读的 DownloadDirectories /
+        LibraryDirectories 并不存在，会让所有目录保护逻辑静默失效。
+        """
+        dirs: List[Path] = []
+        for item in (self.systemconfig.get("Directories") or []):
+            if not isinstance(item, dict):
+                continue
+            for key in ("download_path", "library_path"):
+                path = str(item.get(key) or "").strip()
+                if path:
+                    p = Path(path)
+                    if p not in dirs:
+                        dirs.append(p)
+        return dirs
+
     def _get_space_info(self) -> Optional[Dict[str, float]]:
         try:
-            download_dirs, library_dirs = [], []
-            for d in (self.systemconfig.get("DownloadDirectories") or []):
-                if isinstance(d, dict) and d.get("path"):
-                    download_dirs.append(Path(d["path"]))
-            for d in (self.systemconfig.get("LibraryDirectories") or []):
-                if isinstance(d, dict) and d.get("path"):
-                    library_dirs.append(Path(d["path"]))
-            all_dirs = download_dirs + library_dirs or [settings.CONFIG_PATH]
+            all_dirs = self._configured_dirs() or [Path(settings.CONFIG_PATH)]
             total_space, free_space = SystemUtils.space_usage(all_dirs)
             if total_space == 0:
                 return None
@@ -1112,9 +1125,12 @@ class SpaceCleaner(_PluginBase):
             return None
 
     def _check_and_clean(self) -> None:
-        if self._running:
-            return
-        self._running = True
+        # 定时任务与「立即运行」可能并发触发，用锁保证「检查+置位」原子，避免双跑
+        with self._run_lock:
+            if self._running:
+                logger.info("SC 上一轮清理仍在进行，跳过本次触发")
+                return
+            self._running = True
         try:
             si = self._get_cached_space_info()
             if not si:
@@ -1133,9 +1149,8 @@ class SpaceCleaner(_PluginBase):
         self._prune_orphan_pb()
         chain = self._get_chain()
         dc = 0
-        md = self._delete_count if not self._delete_by_target else 0
-        # 试运行模式不需要种子列表
-        all_torrents = None if self._dry_run else self._get_cached_torrents(chain)
+        # 试运行不会真正释放空间，若按目标百分比删除会遍历全部单元，因此仍按单次数量限制
+        md = self._delete_count if (not self._delete_by_target or self._dry_run) else 0
         from app.db import ScopedSession
         from sqlalchemy import asc
         sess = ScopedSession()
@@ -1403,12 +1418,13 @@ class SpaceCleaner(_PluginBase):
 
         # 按目标百分比删除时：预估每个单元可释放空间，避免删过头超过目标太多
         for unit in delete_units:
-            if not self._delete_by_target and dc >= md:
+            if md and dc >= md:
                 fr = "limit"
                 break
             # 完全删除上一个资源后强制刷新空间信息，再检查是否达到目标，避免缓存旧值导致多删
             cs = self._get_cached_space_info()
-            if cs:
+            # 试运行不会真正释放空间，跳过空间达标判断，否则首轮就会误判为已达标
+            if cs and not self._dry_run:
                 if self._delete_by_target and cs["free_percent"] >= self._target_free_percent:
                     logger.info(f"SC 空间已达到目标阈值 {self._target_free_percent}% (当前 {cs['free_percent']:.1f}%)，停止清理")
                     fr = "space_ok"
@@ -1419,12 +1435,13 @@ class SpaceCleaner(_PluginBase):
                     break
             # 完整删除一个资源（种子+文件+记录），删除完成后立即使空间缓存失效，
             # 下一次循环重新查询真实剩余空间，达标即停，否则继续删除下一个
-            self._delete_unit(unit, chain, cs or space_info, all_torrents)
+            # 种子列表也重新获取：上一轮删种后旧列表已过期（_delete_downloader_torrents 会清缓存）
+            unit_torrents = None if self._dry_run else self._get_cached_torrents(chain)
+            self._delete_unit(unit, chain, cs or space_info, unit_torrents)
             dc += 1
             self._cached_space_info = None
-        if fr:
-            return
-        logger.info(f"SC 清理完成，删除 {dc} 个资源")
+        reason = {"limit": "达到单次删除数量上限", "space_ok": "空间已达标"}.get(fr, "已处理全部候选资源")
+        logger.info(f"SC 清理完成，删除 {dc} 个资源（{reason}）")
 
     def _delete_unit(self, unit, chain, space_info, all_torrents=None):
         """删除一个删除单元（合集的所有集一起删除）。
@@ -1684,6 +1701,7 @@ class SpaceCleaner(_PluginBase):
             self._pb = [r for r in self._pb if not _match(r.get("k", ""))]
             after = len(self._pb)
         if before != after:
+            self._pb_cache = None
             self.save_data("pb", self._pb)
             logger.info(f"从 pb 缓存删除 {scope} 共 {before - after} 条")
 
@@ -1870,17 +1888,24 @@ class SpaceCleaner(_PluginBase):
         torrents = all_torrents if all_torrents is not None else self._get_cached_torrents(chain)
         to_delete = self._collect_torrents_to_delete(download_hash, torrents)
         cross_cnt = sum(1 for _, _, is_cross in to_delete if is_cross)
-        logger.info(f"SC 准备删种 [{display_name}]: 主种子 1 个" +
+        main_cnt = len(to_delete) - cross_cnt
+        logger.info(f"SC 准备删种 [{display_name}]: 主种子 {main_cnt} 个" +
                     (f"，辅种 {cross_cnt} 个" if cross_cnt else "，无辅种"))
         deleted = 0
         for h, name, is_cross in to_delete:
             role = "辅种" if is_cross else "主种子"
             try:
-                chain.remove_torrents(hashs=h, delete_file=True)
-                logger.info(f"SC   已删除{role}: {name} ({h})")
-                deleted += 1
+                # remove_torrents 返回布尔，失败时不能计入删除数，否则统计虚高且失败被静默
+                if chain.remove_torrents(hashs=h, delete_file=True):
+                    logger.info(f"SC   已删除{role}: {name} ({h})")
+                    deleted += 1
+                else:
+                    logger.warning(f"SC   删除{role}未成功: {name} ({h})")
             except Exception as e:
                 logger.error(f"SC   删除{role}失败 {name} ({h}): {str(e)}")
+        # 删种后下载器种子列表已变化，清除缓存，避免后续单元用陈旧列表匹配辅种
+        self._all_torrents_cache = None
+        self._all_torrents_cache_time = 0
         return deleted
 
     @staticmethod
@@ -1904,18 +1929,21 @@ class SpaceCleaner(_PluginBase):
             return ""
         return (getattr(t, "name", None) or getattr(t, "title", None) or "").strip()
 
-    def _safe_delete_path(self, path: Path):
+    def _safe_delete_path(self, path: Path) -> bool:
+        """删除文件或目录，返回是否确实删除成功。"""
         try:
             if path.is_file() or path.is_symlink():
                 path.unlink()
             elif path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
-        except Exception:
-            pass
+            return not path.exists()
+        except Exception as e:
+            logger.warning(f"SC 删除路径失败 {path}: {e}")
+            return False
 
-    # 视频文件扩展名：目录内若含此类文件则不视为可清理的残留目录
-    _VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv",
-                   ".iso", ".rmvb", ".rm", ".mpg", ".mpeg", ".m4v", ".webm", ".vob", ".strm"}
+    # 判定「残留元数据目录」时使用的视频扩展名（目录内含这些文件则不删除）
+    _LEFTOVER_VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv",
+                            ".iso", ".rmvb", ".rm", ".mpg", ".mpeg", ".m4v", ".webm", ".vob", ".strm"}
 
     def _dir_is_leftover_metadata(self, path: Path) -> bool:
         """目录是否为「资源删除后残留的元数据目录」——可安全删除。
@@ -1930,11 +1958,29 @@ class SpaceCleaner(_PluginBase):
             for e in path.iterdir():
                 if e.is_dir():
                     return False  # 存在子目录（其他剧集/其他季），保留
-                if e.is_file() and e.suffix.lower() in self._VIDEO_EXTS:
+                if e.is_file() and e.suffix.lower() in self._LEFTOVER_VIDEO_EXTS:
                     return False  # 仍有视频文件，保留
             return True
         except Exception:
             return False
+
+    def _dir_is_protected(self, path: Path, configured_dirs: List[Path]) -> bool:
+        """目录是否受保护（不允许删除）。
+
+        受保护的情况：根目录、挂载点、系统配置中的下载/媒体库目录本身，
+        以及这些配置目录的任意上级目录。
+        """
+        try:
+            if not path or path.parent == path:
+                return True
+            if os.path.ismount(str(path)):
+                return True
+            for cfg in configured_dirs:
+                if path == cfg or cfg.is_relative_to(path):
+                    return True
+        except Exception:
+            return True
+        return False
 
     def _delete_media_dir(self, media_dir: Path, max_levels: int = 3):
         """删除媒体库中该资源所在目录（MP 软链接/硬链接、重命名、刮削生成的成品目录）。
@@ -1944,41 +1990,36 @@ class SpaceCleaner(_PluginBase):
         电视剧的季目录（如 .../剧名 (2026) {tmdbid=x}/Season 1）删除后，
         若上层剧名目录随之变空，也一并向上清理（最多 max_levels 层），
         遇到仍有内容的目录（如同类目录下的其他剧集）、挂载点或根目录即停止。
-        不会删除配置的下载目录或媒体库目录本身。
+        目标目录必须只剩元数据文件，且不能是配置的下载/媒体库目录或其上级目录，
+        否则只记录日志并跳过，避免整目录误删。
         """
         try:
             if not media_dir or not media_dir.exists() or not media_dir.is_dir():
                 return
-            # 避免误删挂载点/根目录
-            if media_dir.parent == media_dir or os.path.ismount(str(media_dir)):
-                logger.warning(f"SC 跳过删除媒体库目录（疑似挂载点/根目录）: {media_dir}")
+            configured_dirs = self._configured_dirs()
+            if self._dir_is_protected(media_dir, configured_dirs):
+                logger.warning(f"SC 跳过删除目录（挂载点/根目录/配置的下载或媒体库目录）: {media_dir}")
                 return
-            # 获取配置的下载目录和媒体库目录，用于向上追溯时保护
-            configured_dirs = []
-            for d in (self.systemconfig.get("DownloadDirectories") or []):
-                if isinstance(d, dict) and d.get("path"):
-                    configured_dirs.append(Path(d["path"]))
-            for d in (self.systemconfig.get("LibraryDirectories") or []):
-                if isinstance(d, dict) and d.get("path"):
-                    configured_dirs.append(Path(d["path"]))
-            self._safe_delete_path(media_dir)
-            logger.info(f"SC 已删除媒体库目录: {media_dir}")
+            if not self._dir_is_leftover_metadata(media_dir):
+                logger.info(f"SC 目录仍有子目录或视频文件，跳过删除: {media_dir}")
+                return
+            if self._safe_delete_path(media_dir):
+                logger.info(f"SC 已删除媒体库目录: {media_dir}")
+            else:
+                logger.warning(f"SC 删除媒体库目录未成功: {media_dir}")
+                return
             # 向上清理因删除季目录而残留的空目录（如剧名根目录）
             cur = media_dir.parent
             for _ in range(max_levels):
                 if not cur or not cur.exists() or not cur.is_dir():
                     break
-                if cur.parent == cur or os.path.ismount(str(cur)):
-                    break
-                # 检查是否到达配置的下载/媒体库目录或其上级，不删除
-                if any(cfg_dir.is_relative_to(cur) for cfg_dir in configured_dirs):
-                    logger.debug(f"SC 目录 {cur} 位于配置的下载/媒体库目录结构中，不删除")
+                if self._dir_is_protected(cur, configured_dirs):
                     break
                 if not self._dir_is_leftover_metadata(cur):
                     break  # 仍有子目录或视频文件（如同目录下别的剧集），停止上溯
                 parent = cur.parent
-                self._safe_delete_path(cur)
-                logger.info(f"SC 已删除残留空目录: {cur}")
+                if self._safe_delete_path(cur):
+                    logger.info(f"SC 已删除残留空目录: {cur}")
                 cur = parent
         except Exception as e:
             logger.error(f"SC 删除媒体库目录失败 {media_dir}: {e}")
@@ -1993,23 +2034,23 @@ class SpaceCleaner(_PluginBase):
         try:
             if not download_dir or not download_dir.exists() or not download_dir.is_dir():
                 return
-            if download_dir.parent == download_dir or os.path.ismount(str(download_dir)):
+            if self._dir_is_protected(download_dir, self._configured_dirs()):
                 return
             # 检查目录是否为空（或仅剩元数据/垃圾文件）
             if not self._dir_is_leftover_metadata(download_dir):
                 return  # 目录内仍有子目录或视频文件，不清理
-            self._safe_delete_path(download_dir)
-            logger.info(f"SC 已清理下载残留目录: {download_dir}")
+            if self._safe_delete_path(download_dir):
+                logger.info(f"SC 已清理下载残留目录: {download_dir}")
         except Exception as e:
             logger.error(f"SC 清理下载残留目录失败 {download_dir}: {e}")
 
     def _find_residual_dirs(self, directories: set) -> List[Path]:
-        """检查资源删除后仍存在内容的目录，返回需要在通知中提示的路径。"""
-        configured_dirs = []
-        for key in ("DownloadDirectories", "LibraryDirectories"):
-            for item in self.systemconfig.get(key) or []:
-                if isinstance(item, dict) and item.get("path"):
-                    configured_dirs.append(Path(item["path"]))
+        """检查资源删除后仍存在内容的目录，返回需要在通知中提示的路径。
+
+        只跳过配置的下载/媒体库目录本身及其上级目录；位于配置目录「之内」的
+        资源目录才是需要提示的残留对象（旧实现判断方向相反，结果恒为空）。
+        """
+        configured_dirs = self._configured_dirs()
         residual = []
         seen = set()
         for directory in directories:
@@ -2017,46 +2058,21 @@ class SpaceCleaner(_PluginBase):
             if str(path) in seen or not path.exists() or not path.is_dir():
                 continue
             seen.add(str(path))
-            if path.parent == path or os.path.ismount(str(path)):
+            if self._dir_is_protected(path, configured_dirs):
                 continue
             try:
-                if any(path == configured or configured in path.parents for configured in configured_dirs):
-                    continue
                 if any(path.iterdir()):
                     residual.append(path)
             except OSError:
                 continue
         return sorted(residual, key=str)
 
-    @staticmethod
-    def _parse_episode_info(record: TransferHistory) -> Tuple[Optional[bool], Optional[int], List[int]]:
-        """解析转移记录中的剧集信息，返回 (is_single_episode, season_num, episode_numbers)。"""
-        season_num = None
-        if record.seasons:
-            s = record.seasons.strip().upper().replace("S", "")
-            if s.isdigit():
-                season_num = int(s)
-        episodes_str = (record.episodes or "").strip().upper().replace("E", "")
-        if not episodes_str:
-            return False, season_num, []
-        if "-" in episodes_str or "~" in episodes_str:
-            sep = "-" if "-" in episodes_str else "~"
-            parts = episodes_str.split(sep)
-            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                return False, season_num, list(range(int(parts[0]), int(parts[1]) + 1))
-            return False, season_num, []
-        if "," in episodes_str:
-            parts = [p.strip() for p in episodes_str.split(",") if p.strip().isdigit()]
-            if parts:
-                return False, season_num, [int(p) for p in parts]
-            return False, season_num, []
-        if episodes_str.isdigit():
-            return True, season_num, [int(episodes_str)]
-        return None, season_num, []
-
     def _add_delete_history(self, title: str, action: str):
         h = self.get_data("delete_history") or []
         h.append({"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "title": title, "action": action})
+        # 只保留最近 500 条，避免插件数据无限增长
+        if len(h) > 500:
+            h = h[-500:]
         self.save_data("delete_history", h)
 
     def _get_delete_history(self) -> List[Dict[str, str]]:
@@ -2104,13 +2120,17 @@ class SpaceCleaner(_PluginBase):
     # ==================== RSS 下载 ====================
 
     def _rss_run(self):
-        if self._rss_busy or not self._rss_urls:
+        if not self._rss_urls:
             return
         urls = [u.strip() for u in self._rss_urls.split("\n") if u.strip()]
         if not urls:
             return
+        with self._run_lock:
+            if self._rss_busy:
+                logger.info("SC-RSS 上一轮刷新仍在进行，跳过本次触发")
+                return
+            self._rss_busy = True
         logger.info("SC-RSS 开始运行...")
-        self._rss_busy = True
         try:
             if self._rss_wash_mode:
                 # 洗版模式：先收集所有 URL 的条目，统一去重后再下载
@@ -2133,7 +2153,11 @@ class SpaceCleaner(_PluginBase):
         all_candidates = OrderedDict()  # dedup_key -> (item, m, meta, s_season, se_fmt, ts)
         total_items = 0
         for url in urls:
-            items = RssHelper().parse(url)
+            try:
+                items = RssHelper().parse(url)
+            except Exception as e:
+                logger.error(f"SC-RSS 解析 RSS 失败 [{url}]: {e}")
+                continue
             if not items:
                 logger.info(f"SC-RSS 未获取到新报文: {url}")
                 continue
@@ -2146,7 +2170,7 @@ class SpaceCleaner(_PluginBase):
                 with self._rss_lk:
                     if e in self._rss_seen:
                         continue
-                    self._rss_seen.add(e)
+                    self._rss_seen[e] = None
                 if self._rss_inc and not re.search(self._rss_inc, t, re.IGNORECASE):
                     continue
                 if self._rss_exc and re.search(self._rss_exc, t, re.IGNORECASE):
@@ -2207,7 +2231,7 @@ class SpaceCleaner(_PluginBase):
                 else:
                     s_season, s_episode = None, None
                 if is_tv:
-                    se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}" if s_episode else f"S{int(s_season):02d}"
+                    se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}" if s_episode is not None else f"S{int(s_season):02d}"
                     # 同一 TMDB 已有播放缓存但季号不一致时，先尝试种子文件名兜底识别，仍不一致才跳过。
                     cached_seasons = self._rss_cached_seasons(m.tmdb_id)
                     if cached_seasons and int(s_season) not in cached_seasons:
@@ -2257,7 +2281,7 @@ class SpaceCleaner(_PluginBase):
                                           text=f"{m.title} {se_fmt} {cr['r']}")
                     continue
                 # 构造去重 key：电视剧按 tmdb+季+集，电影按 tmdb，缺字段时用 enclosure
-                if is_tv and m.tmdb_id and s_episode:
+                if is_tv and m.tmdb_id and s_episode is not None:
                     dedup_key = (m.tmdb_id, int(s_season), int(s_episode))
                 elif m.tmdb_id and not is_tv:
                     dedup_key = ("movie", m.tmdb_id)
@@ -2289,7 +2313,7 @@ class SpaceCleaner(_PluginBase):
                 dc += 1
                 ep_key = self._rss_wash_key(dedup_key)
                 if ep_key:
-                    self._rss_washed.add(ep_key)
+                    self._rss_washed[ep_key] = None
                 self._rss_log("下载", m.title)
                 if self._rss_ntf:
                     self.post_message(title="SC-RSS 已添加下载",
@@ -2299,16 +2323,7 @@ class SpaceCleaner(_PluginBase):
                 if self._rss_ntf:
                     self.post_message(title="SC-RSS 添加失败",
                                       text=f"名称: {m.title} {se_fmt}")
-        s = list(self._rss_seen)
-        if len(s) > 2000:
-            s = s[-2000:]
-            self._rss_seen = set(s)
-        self.save_data("rss_seen", s)
-        w = list(self._rss_washed)
-        if len(w) > 3000:
-            w = w[-3000:]
-            self._rss_washed = set(w)
-        self.save_data("rss_washed", w)
+        self._rss_save_dedup()
 
     @staticmethod
     def _rss_wash_key(dedup_key) -> Optional[str]:
@@ -2328,16 +2343,27 @@ class SpaceCleaner(_PluginBase):
             v = item.get(key)
             if not v:
                 continue
+            if isinstance(v, datetime):
+                # RssHelper 解析结果通常已是带时区的 datetime，直接取时间戳
+                try:
+                    return v.timestamp()
+                except (OverflowError, OSError, ValueError):
+                    continue
             if isinstance(v, (int, float)):
                 return float(v)
             s = str(v).strip()
             for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z",
                         "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S",
-                        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                        "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
                 try:
                     return datetime.strptime(s, fmt).timestamp()
                 except (ValueError, TypeError):
                     continue
+            # 兜底：ISO 格式（如 2022-10-15 14:02:54+08:00）
+            try:
+                return datetime.fromisoformat(s).timestamp()
+            except (ValueError, TypeError):
+                continue
         return float("inf")
 
     @staticmethod
@@ -2345,10 +2371,30 @@ class SpaceCleaner(_PluginBase):
         """ts_a 是否比 ts_b 更早发布。"""
         return ts_a < ts_b
 
+    def _rss_save_dedup(self) -> None:
+        """裁剪并持久化 RSS 去重容器。
+
+        _rss_seen / _rss_washed 用 dict 保留插入顺序，超限时丢弃最早记录；
+        旧实现用 set 转 list 后切片，丢弃的是随机记录，会导致老资源重复下载。
+        """
+        with self._rss_lk:
+            if len(self._rss_seen) > self._rss_seen_max:
+                self._rss_seen = dict.fromkeys(list(self._rss_seen)[-self._rss_seen_max:])
+            if len(self._rss_washed) > self._rss_washed_max:
+                self._rss_washed = dict.fromkeys(list(self._rss_washed)[-self._rss_washed_max:])
+            seen_snapshot = list(self._rss_seen)
+            washed_snapshot = list(self._rss_washed)
+        self.save_data("rss_seen", seen_snapshot)
+        self.save_data("rss_washed", washed_snapshot)
+
     def _rss_proc(self, url: str):
         """普通模式（未开启洗版）：不做 TMDB 识别，直接添加种子到下载器。
-        去重由 _rss_seen（enclosure 集合，持久化）保证，避免重复添加同一个种子。"""
-        items = RssHelper().parse(url)
+        去重由 _rss_seen（enclosure 有序集合，持久化）保证，避免重复添加同一个种子。"""
+        try:
+            items = RssHelper().parse(url)
+        except Exception as e:
+            logger.error(f"SC-RSS 解析 RSS 失败 [{url}]: {e}")
+            return
         if not items:
             logger.info(f"SC-RSS 未获取到新报文: {url}")
             return
@@ -2362,7 +2408,7 @@ class SpaceCleaner(_PluginBase):
             with self._rss_lk:
                 if e in self._rss_seen:
                     continue
-                self._rss_seen.add(e)
+                self._rss_seen[e] = None
             url_new += 1
             if self._rss_inc and not re.search(self._rss_inc, t, re.IGNORECASE):
                 continue
@@ -2396,11 +2442,7 @@ class SpaceCleaner(_PluginBase):
                 if self._rss_ntf:
                     self.post_message(title="SC-RSS 添加失败", text=f"名称: {t}")
         logger.info(f"SC-RSS [{url}] 获取到 {url_new} 个新报文，过滤后剩余 {url_filtered} 个")
-        s = list(self._rss_seen)
-        if len(s) > 2000:
-            s = s[-2000:]
-            self._rss_seen = set(s)
-        self.save_data("rss_seen", s)
+        self._rss_save_dedup()
 
     def _rss_ck(self, m, meta: MetaInfo, season: Optional[int] = None, episode: Optional[int] = None) -> dict:
         """检查 RSS 资源对应媒体是否已达到洗版跳过条件。"""
@@ -2500,7 +2542,7 @@ class SpaceCleaner(_PluginBase):
         return cls._api_recognize_cache_key_from_name(raw_name)
 
     def _load_api_recognize_cache(self) -> List[dict]:
-        """加载独立负缓存，最多保留 100 条媒体标题记录。"""
+        """加载独立负缓存，最多保留 _api_recognize_cache_max 条媒体标题记录。"""
         raw = self.get_data("api_recognize_cache") or []
         if not isinstance(raw, list):
             return []
@@ -2588,6 +2630,11 @@ class SpaceCleaner(_PluginBase):
                     break
         if not entry or not entry.get("tmdb_id"):
             return None
+        # 同名不同年份（如 Alien 1979 / 2017）不能共用缓存，年份冲突时视为未命中
+        meta_year = str(getattr(meta, "year", "") or "").strip()
+        entry_year = str(entry.get("year") or "").strip()
+        if meta_year and entry_year and meta_year != entry_year:
+            return None
         try:
             media_type = entry.get("media_type")
             if isinstance(media_type, str):
@@ -2661,7 +2708,7 @@ class SpaceCleaner(_PluginBase):
         return False
 
     def _save_api_negative_cache(self, key: str, name: str) -> None:
-        """保存一次 TMDB 官方 API 识别失败结果，正负缓存共享 100 条上限。"""
+        """保存一次 TMDB 官方 API 识别失败结果，负缓存上限 _api_recognize_cache_max 条。"""
         if not key:
             return
         entry = {
@@ -2800,9 +2847,11 @@ class SpaceCleaner(_PluginBase):
             else:
                 file_media, file_meta, file_base = None, None, ""
         if filename_only:
-            # 回退模式只接受带集号的文件名结果，避免把整季文件误当作单集下载。
-            if file_media is not None and file_meta is not None and file_meta.begin_episode is not None:
-                return file_media, file_meta, file_base
+            # 电视剧回退只接受带集号的结果，避免把整季文件误当作单集下载；电影没有集号，直接接受。
+            if file_media is not None and file_meta is not None:
+                is_movie = getattr(file_media, "type", None) == MediaType.MOVIE
+                if file_meta.begin_episode is not None or is_movie:
+                    return file_media, file_meta, file_base
             for failed_key, failed_name in failed_candidates.items():
                 self._save_api_negative_cache(failed_key, failed_name)
             return None, None, ""
@@ -2866,7 +2915,7 @@ class SpaceCleaner(_PluginBase):
         return cands or [rt]
 
     # 视频文件扩展名（种子文件名识别时按这些扩展名筛选文件）
-    _VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
+    _VIDEO_EXTS_TORRENT = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
                    ".flv", ".rmvb", ".rm", ".mpg", ".mpeg", ".webm", ".iso")
 
     @classmethod
@@ -2892,7 +2941,7 @@ class SpaceCleaner(_PluginBase):
                     if parts:
                         all_files.append(("/".join(parts), f.get("length", 0) or 0))
                 # 优先取视频文件，按体积从大到小（正片通常最大）
-                videos = [(p, l) for p, l in all_files if p.lower().endswith(cls._VIDEO_EXTS)]
+                videos = [(p, l) for p, l in all_files if p.lower().endswith(cls._VIDEO_EXTS_TORRENT)]
                 if videos:
                     videos.sort(key=lambda x: x[1], reverse=True)
                     return [p for p, _ in videos]
@@ -2995,7 +3044,7 @@ class SpaceCleaner(_PluginBase):
                 return False
             return True
         except Exception as e:
-            logger.warn(f"SC-RSS 优先级规则组过滤失败（{group}）: {e}，本条不过滤")
+            logger.warning(f"SC-RSS 优先级规则组过滤失败（{group}）: {e}，本条不过滤")
             return True
 
     def _rss_dl_add(self, item: dict, m, meta: MetaInfo) -> bool:
@@ -3017,7 +3066,7 @@ class SpaceCleaner(_PluginBase):
                 if h:
                     return True
                 if err:
-                    logger.warn(f"SC-RSS 下载失败: {m.title} {err}")
+                    logger.warning(f"SC-RSS 下载失败: {m.title} {err}")
                 return False
             return bool(result)
         except Exception as e:
@@ -3045,7 +3094,7 @@ class SpaceCleaner(_PluginBase):
                         svc = s
                         break
             if not svc or not svc.instance:
-                logger.warn("SC-RSS 未找到可用下载器，无法直接添加种子")
+                logger.warning("SC-RSS 未找到可用下载器，无法直接添加种子")
                 return False
             downloader = svc.instance
             content = enc
@@ -3053,7 +3102,7 @@ class SpaceCleaner(_PluginBase):
             if not enc.lower().startswith("magnet:"):
                 r = RequestUtils(timeout=30).get_res(enc)
                 if not r or r.status_code != 200:
-                    logger.warn(f"SC-RSS 下载种子文件失败: {item.get('title', '')}")
+                    logger.warning(f"SC-RSS 下载种子文件失败: {item.get('title', '')}")
                     return False
                 content = r.content
             r = downloader.add_torrent(content=content, download_dir=self._rss_save_path or None)
