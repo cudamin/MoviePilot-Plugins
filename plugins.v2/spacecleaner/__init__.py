@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.9.1"
+    plugin_version = "4.9.2"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -46,12 +46,11 @@ class SpaceCleaner(_PluginBase):
     _delete_by_target = False
     _target_free_percent = 20
     _delete_count = 1
-    _check_cron = "0 */6 * * *"  # 执行周期，默认每6小时
+    _check_cron = "0 */6 * * *"  # 执行周期（cron），默认每6小时的0分执行
     _dry_run = False
     _delete_other_versions = True  # 删种时检索整理记录，删除同一集/同一部电影的其他版本
     _delete_by_record = False  # 按媒体整理记录删除：优先删除整理记录中最早入库的已看资源
     _notify = True
-    _media_cache_disabled = False  # 关闭媒体缓存（默认开启）
     _pb_page = 1
     _pb_sort_by = "time"  # 播放缓存排序：time / title / status
     _pb_sort_desc = True  # 播放缓存排序方向：True 降序 / False 升序
@@ -74,7 +73,7 @@ class SpaceCleaner(_PluginBase):
     _rss_ntf = False
     _rss_th = 85
     _rss_wash_mode = False  # 洗版模式：播放进度低于阈值时触发洗版，只下载最早版本
-    _rss_fname_identify = False  # 种子文件名优先识别：开启后下载种子解析视频文件名优先识别
+    _rss_fname_identify = False  # 种子文件名兜底识别：报文识别失败/无集号/季号不一致时下载种子用文件名再识别
     _rss_save_path = ""  # RSS 下载自定义保存路径
 
     # === 内部状态 ===
@@ -103,7 +102,7 @@ class SpaceCleaner(_PluginBase):
     _api_recognize_cache: List[dict] = []  # TMDB API 识别失败后的独立负缓存
     _api_recognize_cache_max = 5
     _api_recognize_success_cache: List[dict] = []  # TMDB API 识别成功后的独立正缓存
-    _api_recognize_success_cache_max = 20
+    _api_recognize_success_cache_max = 100
     _api_recognize_cache_lock = threading.Lock()
 
     def init_plugin(self, config: dict = None) -> None:
@@ -113,7 +112,6 @@ class SpaceCleaner(_PluginBase):
         self._delete_by_target = self._dry_run = self._notify = False
         self._delete_other_versions = True
         self._delete_by_record = False
-        self._media_cache_disabled = False
         self._pb_page = 1
         self._pb_sort_by = "time"
         self._pb_sort_desc = True
@@ -148,12 +146,19 @@ class SpaceCleaner(_PluginBase):
         self._delete_by_target = bool(config.get("delete_by_target"))
         self._target_free_percent = int(config.get("target_free_percent") or 20)
         self._delete_count = int(config.get("delete_count") or 1)
-        self._check_cron = str(config.get("check_cron") or "0 */6 * * *")
+        self._check_cron = str(config.get("check_cron") or "").strip()
+        if not self._check_cron:
+            # 兼容旧版「执行周期（小时）」配置，迁移为等价 cron 表达式
+            legacy_hours = str(config.get("check_interval") or "").strip()
+            if legacy_hours.isdigit() and int(legacy_hours) > 0:
+                hours = min(23, int(legacy_hours))
+                self._check_cron = "0 * * * *" if hours == 1 else f"0 */{hours} * * *"
+            else:
+                self._check_cron = "0 */6 * * *"
         self._dry_run = bool(config.get("dry_run"))
         self._delete_other_versions = bool(config.get("delete_other_versions", True))
         self._delete_by_record = bool(config.get("delete_by_record"))
         self._notify = bool(config.get("notify", True))
-        self._media_cache_disabled = bool(config.get("media_cache_disabled", False))
         # 播放缓存视图状态不持久化：每次加载插件默认按时间从近到远排序，并清空搜索
         self._pb_page = 1
         self._pb_sort_by = "time"
@@ -224,7 +229,7 @@ class SpaceCleaner(_PluginBase):
             "dry_run": self._dry_run,
             "delete_other_versions": self._delete_other_versions, "notify": self._notify,
             "delete_by_record": self._delete_by_record,
-            "media_cache_disabled": self._media_cache_disabled, "run_now": False,
+            "run_now": False,
             "pb_filter_watched": self._pb_filter_watched, "watched_threshold": self._watched_threshold,
             "rss_on": self._rss_on, "rss_cron": self._rss_cron, "rss_urls": self._rss_urls,
             "rss_dl": self._rss_dl, "rss_rule_group": self._rss_rule_group,
@@ -243,9 +248,6 @@ class SpaceCleaner(_PluginBase):
 
     @eventmanager.register(EventType.WebhookMessage)
     def on_webhook(self, event: Event) -> None:
-        if self._media_cache_disabled:
-            logger.info("SC on_webhook skipped: media_cache_disabled=True")
-            return
         if not self._enabled and not self._rss_on:
             logger.info(f"SC on_webhook skipped: enabled={self._enabled} rss_on={self._rss_on}")
             return
@@ -564,42 +566,55 @@ class SpaceCleaner(_PluginBase):
             dls = [{"title": n, "value": n} for n, s in svcs.items() if s.config and s.config.enabled]
         except Exception:
             pass
+        # 优先级规则组：供 RSS 下载过滤使用
+        groups = []
+        try:
+            groups = [{"title": g.name, "value": g.name} for g in RuleHelper().get_rule_groups() or []]
+        except Exception:
+            pass
+
+        def section(text: str, first: bool = False) -> dict:
+            """小节标题，统一间距。"""
+            cls = "text-caption text-medium-emphasis mb-1" if first else "text-caption text-medium-emphasis mb-1 mt-2"
+            return {"component": "div", "props": {"class": cls}, "text": text}
+
+        divider = {"component": "VDivider", "props": {"class": "my-3"}}
 
         # ---------- 空间清理 ----------
         clean_form = {
             "component": "VForm",
             "content": [
-                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": "基本设置"},
-                {"component": "VRow", "content": [
+                section("基本设置", first=True),
+                {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "删除时发送通知"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "通知"}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "dry_run", "label": "试运行模式", "hint": "仅在日志中显示将要删除的资源，不实际删除", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "run_now", "label": "立即运行一次"}}]},
                 ]},
-                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1 mt-3"}, "text": "删除策略"},
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_by_target", "label": "按目标百分比删除", "hint": "持续删除资源直到剩余空间达到目标百分比", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_other_versions", "label": "删除不同版本", "hint": "删种时检索整理记录，删除同一集/同一部电影的不同版本（不同分辨率、字幕组等）", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delete_by_record", "label": "按媒体整理记录删除", "hint": "开启后优先删除媒体整理记录中最早入库的已看资源（否则按播放缓存最早看完时间）", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "media_cache_disabled", "label": "关闭媒体缓存", "hint": "开启后不再接收播放进度，也不新增播放记录", "persistent-hint": True}}]},
+                divider,
+                section("清理参数"),
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "min_free_percent", "label": "删种触发阈值（%）", "type": "number", "min": 1, "max": 99, "hint": "剩余空间低于此值开始删除", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "target_free_percent", "label": "目标剩余百分比（%）", "type": "number", "min": 1, "max": 99, "hint": "配合「按目标百分比删除」使用", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "delete_count", "label": "单次删除资源数", "type": "number", "min": 1, "hint": "每次检查最多删除的资源数", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "watched_threshold", "label": "标记已看进度阈值（%）", "type": "number", "min": 1, "max": 100, "hint": "播放进度达到此值标记为已观看", "persistent-hint": True}}]},
                 ]},
-                {"component": "VRow", "content": [
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VCronField", "props": {"model": "check_cron", "label": "执行周期", "hint": "cron 表达式，如 0 */6 * * * 表示每 6 小时", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [{"component": "VSelect", "props": {"model": "clean_downloader", "label": "扫描下载器", "items": dls, "multiple": True, "chips": True, "clearable": True, "hint": "删种时扫描的下载器，留空扫描全部", "persistent-hint": True}}]},
+                ]},
+                divider,
+                section("删除策略"),
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "delete_by_target", "label": "按目标百分比删除", "hint": "持续删除资源直到剩余空间达到目标百分比", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "delete_other_versions", "label": "删除不同版本", "hint": "删种时检索整理记录，删除同一集/同一部电影的不同版本", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "delete_by_record", "label": "按媒体整理记录删除", "hint": "优先删除整理记录中最早入库的已看资源（否则按播放缓存最早看完时间）", "persistent-hint": True}}]},
+                ]},
+                {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
                         {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mb-0"},
                          "content": [{"component": "div", "props": {"class": "text-caption"}, "text": "「删除不同版本」：删种时会检索媒体整理记录，把同一集电视剧或同一部电影的其他版本（不同分辨率、编码、字幕组、发布组等）一并删除，包括它们对应的源文件、媒体库文件、下载器种子（含辅种）及整理记录。电视剧按 tmdbid + 季 + 集号匹配，电影按 tmdbid 匹配。"}]}
                     ]},
-                ]},
-                {"component": "VDivider", "props": {"class": "my-2"}},
-                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1 mt-2"}, "text": "清理参数"},
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "min_free_percent", "label": "删种触发阈值（%）", "type": "number", "min": 1, "max": 99}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "target_free_percent", "label": "目标剩余百分比", "type": "number", "min": 1, "max": 99}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VCronField", "props": {"model": "check_cron", "label": "执行周期"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "delete_count", "label": "单次删除资源数", "type": "number", "min": 1}}]},
-                ]},
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "watched_threshold", "label": "标记已看播放进度阈值（%）", "type": "number", "min": 1, "max": 100, "hint": "播放进度达到此百分比时标记为已观看", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [{"component": "VSelect", "props": {"model": "clean_downloader", "label": "扫描下载器", "items": dls, "multiple": True, "chips": True, "clearable": True, "hint": "删种时扫描的下载器，留空扫描全部", "persistent-hint": True}}]},
                 ]},
             ],
         }
@@ -608,29 +623,34 @@ class SpaceCleaner(_PluginBase):
         rss_form = {
             "component": "VForm",
             "content": [
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_on", "label": "启用"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_ntf", "label": "通知"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_once", "label": "立即刷新RSS"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_wash_mode", "label": "洗版模式", "hint": "播放进度低于阈值或无播放缓存时触发洗版，洗版只下载最早发布的版本", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_fname_identify", "label": "种子文件名识别", "hint": "开启后下载RSS中的种子文件，优先用视频文件名识别（识别更准但会多下载种子文件）", "persistent-hint": True}}]},
+                section("基本设置", first=True),
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_on", "label": "启用"}}]},
+                    {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_ntf", "label": "通知"}}]},
+                    {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_once", "label": "立即刷新RSS"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_wash_mode", "label": "洗版模式", "hint": "播放进度低于阈值或无播放缓存时触发洗版，只下载最早发布的版本", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_fname_identify", "label": "种子文件名兜底识别", "hint": "报文识别失败、无集号或季号与播放缓存不一致时，下载种子用视频文件名再识别一次", "persistent-hint": True}}]},
                 ]},
-                {"component": "VDivider", "props": {"class": "my-2"}},
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "rss_th", "label": "洗版播放进度阈值(%)", "type": "number"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "rss_sz", "label": "种子大小过滤(GB)", "placeholder": "1-10"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VCronField", "props": {"model": "rss_cron", "label": "执行周期"}}]},
+                divider,
+                section("下载参数"),
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "rss_th", "label": "洗版播放进度阈值（%）", "type": "number", "min": 1, "max": 100}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "rss_sz", "label": "种子大小过滤（GB）", "placeholder": "1-10"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCronField", "props": {"model": "rss_cron", "label": "执行周期"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSelect", "props": {"model": "rss_dl", "label": "下载器", "items": dls, "clearable": True}}]},
                 ]},
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextField", "props": {"model": "rss_save_path", "label": "自定义保存路径", "placeholder": "留空使用默认路径", "hint": "支持 <storage>:<path> 格式", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "rss_urls", "label": "RSS链接", "rows": 4}}]},
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSelect", "props": {"model": "rss_rule_group", "label": "优先级规则组", "items": groups, "clearable": True, "hint": "留空不过滤；选中后仅下载符合该规则组的资源", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "rss_save_path", "label": "自定义保存路径", "placeholder": "留空使用默认路径", "hint": "支持 <storage>:<path> 格式", "persistent-hint": True}}]},
                 ]},
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "rss_inc", "label": "包含(正则)"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "rss_exc", "label": "排除(正则)"}}]},
+                divider,
+                section("RSS 源与过滤"),
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "rss_urls", "label": "RSS链接", "rows": 4, "hint": "支持多个RSS链接，一行一个", "persistent-hint": True}}]},
                 ]},
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VSelect", "props": {"model": "rss_dl", "label": "下载器", "items": dls}}]},
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "rss_inc", "label": "包含(正则)", "hint": "示例：字幕组A|字幕组B；| 表示“或”，不区分大小写", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "rss_exc", "label": "排除(正则)", "hint": "示例：合集|繁体|720p；命中即跳过该报文", "persistent-hint": True}}]},
                 ]},
             ],
         }
@@ -658,10 +678,10 @@ class SpaceCleaner(_PluginBase):
             "delete_by_target": False, "target_free_percent": 20,
             "delete_count": 1, "check_cron": "0 */6 * * *",
             "dry_run": False, "delete_other_versions": True, "delete_by_record": False, "notify": True,
-            "media_cache_disabled": False, "clean_downloader": [], "run_now": False,
+            "clean_downloader": [], "run_now": False,
             "pb_filter_watched": True, "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
-            "rss_dl": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
+            "rss_dl": "", "rss_rule_group": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
             "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False, "rss_fname_identify": False, "rss_save_path": "",
         }
 
@@ -951,19 +971,29 @@ class SpaceCleaner(_PluginBase):
 
     def _start_scheduler(self) -> None:
         if self._scheduler_thread and self._scheduler_thread.is_alive():
+            logger.info(f"SC 调度线程已存在且存活，跳过启动 (执行周期={self._check_cron})")
             return
         self._scheduler_running = True
         self._scheduler_event = threading.Event()
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True, name="SC-Scheduler")
         self._scheduler_thread.start()
+        logger.info(f"SC 调度线程已启动 (执行周期={self._check_cron}, alive={self._scheduler_thread.is_alive()})")
 
     def _scheduler_loop(self) -> None:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.cron import CronTrigger
         scheduler = BackgroundScheduler(timezone=settings.TZ)
+        cron = (self._check_cron or "").strip() or "0 */6 * * *"
         try:
-            scheduler.add_job(self._check_and_clean, CronTrigger.from_crontab(self._check_cron))
+            try:
+                trigger = CronTrigger.from_crontab(cron)
+            except Exception as exc:
+                logger.error(f"SC 执行周期表达式无效（{cron}）: {exc}，回退为 0 */6 * * *")
+                cron = "0 */6 * * *"
+                trigger = CronTrigger.from_crontab(cron)
+            scheduler.add_job(self._check_and_clean, trigger)
             scheduler.start()
+            logger.info(f"SC 定时任务已启动，执行周期: {cron}")
             self._scheduler_event.wait()
         except Exception as e:
             logger.error(f"SC 定时任务启动失败: {str(e)}")
@@ -989,8 +1019,6 @@ class SpaceCleaner(_PluginBase):
         return self._chain
 
     def _get_playback_pb(self) -> List[Dict[str, Any]]:
-        if self._media_cache_disabled:
-            return []
         now = time.time()
         if self._pb_cache is not None and now - self._pb_cache_time < self._pb_cache_ttl:
             return self._pb_cache
@@ -1499,10 +1527,11 @@ class SpaceCleaner(_PluginBase):
                 dest = rec.get("dest", "")
                 if dest:
                     cleanup_dirs.add(Path(dest).parent)
-            # 清理下载残留目录和媒体库空目录
+            # 清理下载残留目录和媒体库空目录，并记录仍未清理的目录。
             for d in cleanup_dirs:
                 self._cleanup_download_dir(d)
                 self._delete_media_dir(d, max_levels=3)
+            leftover_dirs = self._find_residual_dirs(cleanup_dirs)
             # 用独立 session 删除所有相关转移记录
             from app.db import ScopedSession
             ds = ScopedSession()
@@ -1529,8 +1558,11 @@ class SpaceCleaner(_PluginBase):
                 f"已删除（记录 {len(records)} 条{extra}，种子 {torrents_deleted} 个）")
             if self._notify:
                 ver_line = f"\n不同版本: {len(other_versions)} 条" if other_versions else ""
+                leftover_line = ""
+                if leftover_dirs:
+                    leftover_line = "\n残留目录:\n" + "\n".join(str(path) for path in leftover_dirs)
                 self.post_message(title="空间清理器 - 资源已删除",
-                                  text=f"资源: {display_name}{ver_line}\n删除种子: {torrents_deleted} 个\n当前剩余空间: {space_info['free_gb']:.2f} GB ({space_info['free_percent']:.1f}%)")
+                                  text=f"资源: {display_name}{ver_line}\n删除种子: {torrents_deleted} 个\n当前剩余空间: {space_info['free_gb']:.2f} GB ({space_info['free_percent']:.1f}%){leftover_line}")
         except Exception as e:
             logger.error(f"删除 {display_name} 失败: {str(e)}")
             self._add_delete_history(display_name, f"删除失败: {str(e)}")
@@ -1971,6 +2003,31 @@ class SpaceCleaner(_PluginBase):
         except Exception as e:
             logger.error(f"SC 清理下载残留目录失败 {download_dir}: {e}")
 
+    def _find_residual_dirs(self, directories: set) -> List[Path]:
+        """检查资源删除后仍存在内容的目录，返回需要在通知中提示的路径。"""
+        configured_dirs = []
+        for key in ("DownloadDirectories", "LibraryDirectories"):
+            for item in self.systemconfig.get(key) or []:
+                if isinstance(item, dict) and item.get("path"):
+                    configured_dirs.append(Path(item["path"]))
+        residual = []
+        seen = set()
+        for directory in directories:
+            path = Path(directory)
+            if str(path) in seen or not path.exists() or not path.is_dir():
+                continue
+            seen.add(str(path))
+            if path.parent == path or os.path.ismount(str(path)):
+                continue
+            try:
+                if any(path == configured or configured in path.parents for configured in configured_dirs):
+                    continue
+                if any(path.iterdir()):
+                    residual.append(path)
+            except OSError:
+                continue
+        return sorted(residual, key=str)
+
     @staticmethod
     def _parse_episode_info(record: TransferHistory) -> Tuple[Optional[bool], Optional[int], List[int]]:
         """解析转移记录中的剧集信息，返回 (is_single_episode, season_num, episode_numbers)。"""
@@ -2111,11 +2168,16 @@ class SpaceCleaner(_PluginBase):
                             continue
                 m, meta, video_name = self._rss_id(item, t)
                 if not m or not meta:
-                    self._rss_log("识别失败", t)
-                    if self._rss_ntf:
-                        self.post_message(title="SC-RSS识别失败",
-                                          text=f"资源无法识别: {t}")
-                    continue
+                    fb_m, fb_meta, fb_name = self._rss_filename_fallback(item, t, "报文标题识别失败")
+                    if fb_m and fb_meta:
+                        m, meta, video_name = fb_m, fb_meta, fb_name
+                        self._rss_log("文件名回退命中", getattr(m, "title", t), "改用种子文件名识别结果")
+                    else:
+                        self._rss_log("识别失败", t)
+                        if self._rss_ntf:
+                            self.post_message(title="SC-RSS识别失败",
+                                              text=f"资源无法识别: {t}")
+                        continue
                 # 跳过无 TMDB ID 的识别结果
                 if not m.tmdb_id:
                     self._rss_log("跳过无TMDB", t, "未识别到 TMDB ID")
@@ -2127,6 +2189,14 @@ class SpaceCleaner(_PluginBase):
                 is_tv = (getattr(m, "type", None) == MediaType.TV) or (m.season is not None) or (meta.begin_episode is not None)
                 if is_tv:
                     s_season, s_episode = self._rss_tv_season_episode(m, meta, video_name)
+                    if s_episode is None:
+                        # 报文未解析出集号时，按配置回退到种子文件名识别。
+                        fb_m, fb_meta, fb_name = self._rss_filename_fallback(item, t, "报文未识别到集号")
+                        if fb_m and fb_meta:
+                            m, meta, video_name = fb_m, fb_meta, fb_name
+                            s_season, s_episode = self._rss_tv_season_episode(m, meta, video_name)
+                            if s_episode is not None:
+                                self._rss_log("文件名回退命中", m.title, "改用种子文件名识别集号")
                     # 电视剧无集号则跳过
                     if s_episode is None:
                         self._rss_log("跳过无集号", t, "电视剧未识别到集号")
@@ -2136,24 +2206,37 @@ class SpaceCleaner(_PluginBase):
                         continue
                 else:
                     s_season, s_episode = None, None
-                cr = self._rss_ck(m, meta, s_season, s_episode)
                 if is_tv:
                     se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}" if s_episode else f"S{int(s_season):02d}"
-                    # 同一 TMDB 已有播放缓存但季号不一致时，视为分季策略不同，避免按错误季号下载。
+                    # 同一 TMDB 已有播放缓存但季号不一致时，先尝试种子文件名兜底识别，仍不一致才跳过。
                     cached_seasons = self._rss_cached_seasons(m.tmdb_id)
                     if cached_seasons and int(s_season) not in cached_seasons:
                         cached_text = "、".join(f"S{season:02d}" for season in cached_seasons)
-                        self._rss_log("跳过季号不一致", m.title,
-                                      f"RSS={se_fmt}，播放缓存季={cached_text}，疑似分季策略不同")
-                        if self._rss_ntf:
-                            self.post_message(
-                                title="SC-RSS季号不一致",
-                                text=f"资源: {m.title}\nRSS识别: {se_fmt}\n播放缓存季: {cached_text}\n"
-                                     "疑似分季策略不同，已跳过下载"
-                            )
-                        continue
+                        fb_m, fb_meta, fb_name = self._rss_filename_fallback(
+                            item, t, f"报文季号 {se_fmt} 与播放缓存季（{cached_text}）不一致")
+                        fb_ok = False
+                        if fb_m and fb_meta:
+                            fb_season, fb_episode = self._rss_tv_season_episode(fb_m, fb_meta, fb_name)
+                            fb_cached = self._rss_cached_seasons(fb_m.tmdb_id) if fb_m.tmdb_id else []
+                            if fb_episode is not None and (not fb_cached or int(fb_season) in fb_cached):
+                                m, meta, video_name = fb_m, fb_meta, fb_name
+                                s_season, s_episode = fb_season, fb_episode
+                                se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}"
+                                self._rss_log("文件名回退命中", m.title, f"改用文件名识别结果 {se_fmt}")
+                                fb_ok = True
+                        if not fb_ok:
+                            self._rss_log("跳过季号不一致", m.title,
+                                          f"RSS={se_fmt}，播放缓存季={cached_text}，疑似分季策略不同")
+                            if self._rss_ntf:
+                                self.post_message(
+                                    title="SC-RSS季号不一致",
+                                    text=f"资源: {m.title}\nRSS识别: {se_fmt}\n播放缓存季: {cached_text}\n"
+                                         "疑似分季策略不同，已跳过下载"
+                                )
+                            continue
                 else:
                     se_fmt = "电影"
+                cr = self._rss_ck(m, meta, s_season, s_episode)
                 # 洗版模式：若该季已有更新集的播放记录，则跳过之前的所有旧集
                 # 例：缓存中已有第 10 集记录，则该季 1-9 集不再洗版下载
                 if is_tv and s_episode is not None:
@@ -2320,8 +2403,7 @@ class SpaceCleaner(_PluginBase):
         self.save_data("rss_seen", s)
 
     def _rss_ck(self, m, meta: MetaInfo, season: Optional[int] = None, episode: Optional[int] = None) -> dict:
-        if self._media_cache_disabled:
-            return {"s": False, "r": "媒体缓存关闭"}
+        """检查 RSS 资源对应媒体是否已达到洗版跳过条件。"""
         if not m.tmdb_id:
             return {"s": False, "r": "no tmdb"}
         # 电影：查 {tmdbid}:M 播放记录
@@ -2361,7 +2443,7 @@ class SpaceCleaner(_PluginBase):
         因为“有记录”本身就代表已获取过更新的集。
 
         返回最大已观看集号；无任何记录返回 None。"""
-        if self._media_cache_disabled or not tmdb_id or season is None:
+        if not tmdb_id or season is None:
             return None
         prefix = f"{tmdb_id}:S{int(season):02d}E"
         latest = None
@@ -2380,7 +2462,7 @@ class SpaceCleaner(_PluginBase):
 
     def _rss_cached_seasons(self, tmdb_id: int) -> List[int]:
         """获取指定电视剧在播放缓存中已有记录的季号列表。"""
-        if self._media_cache_disabled or not tmdb_id:
+        if not tmdb_id:
             return []
         seasons = set()
         pattern = re.compile(rf"^{re.escape(str(tmdb_id))}:S(\d+)E")
@@ -2443,7 +2525,7 @@ class SpaceCleaner(_PluginBase):
         return cache
 
     def _load_api_recognize_success_cache(self) -> List[dict]:
-        """加载识别成功独立正缓存，最多保留 20 条媒体标题识别结果。"""
+        """加载识别成功独立正缓存，最多保留 100 条媒体标题识别结果。"""
         raw = self.get_data("api_recognize_success_cache") or []
         if not isinstance(raw, list):
             return []
@@ -2470,7 +2552,7 @@ class SpaceCleaner(_PluginBase):
         return cache
 
     def _save_api_success_cache(self, key: str, name: str, media: MediaInfo) -> None:
-        """保存一次识别成功结果到独立正缓存，超过 20 条时覆盖最早记录。"""
+        """保存一次识别成功结果到独立正缓存，超过 100 条时覆盖最早记录。"""
         if not key or not media or not media.tmdb_id:
             return
         entry = {
@@ -2598,11 +2680,18 @@ class SpaceCleaner(_PluginBase):
         self.save_data("api_recognize_cache", snapshot)
         logger.info(f"SC-RSS 写入 TMDB API 失败独立缓存（{len(snapshot)}/{self._api_recognize_cache_max}）: {name}")
 
-    def _rss_id(self, item: dict, rt: str):
-        """洗版模式：RSS 报文识别（可选用种子文件名优先识别）。
+    def _rss_filename_fallback(self, item: dict, rt: str, reason: str):
+        """在 RSS 报文识别失败或季号不一致时，按配置回退到种子文件名识别。"""
+        if not self._rss_fname_identify:
+            return None, None, ""
+        self._rss_log("文件名回退", rt, reason)
+        return self._rss_id(item, rt, filename_only=True)
 
-        识别开关（种子文件名识别）开启时，先下载 RSS 中的种子文件，取视频文件名
-        优先识别；关闭时直接使用报文标题识别（按 "/" 拆分的译名逐个识别）。
+    def _rss_id(self, item: dict, rt: str, filename_only: bool = False):
+        """洗版模式：优先识别 RSS 报文，必要时用种子文件名回退识别。
+
+        默认先使用 RSS 报文标题识别；filename_only 为 True 时仅下载种子并使用视频文件名识别，
+        供报文识别失败、缺少集号或季号与播放缓存不一致时回退使用。
 
         识别时统一走 MoviePilot 的 MetaInfo()，它在解析前会自动套用用户在
         “设定-自定义识别词”里配置的识别词（屏蔽/替换/集偏移等），套用结果记录在
@@ -2610,16 +2699,16 @@ class SpaceCleaner(_PluginBase):
         MoviePilot 本地识别缓存、TMDB 官方 API 的顺序识别。
         独立正缓存命中时直接用缓存重建媒体信息，不再请求 TMDB；独立负缓存命中时直接
         跳过识别和下载；MoviePilot 本地缓存命中时直接重建媒体信息；官方 API 识别成功的
-        结果写入独立正缓存（最多 20 条，超出覆盖最早记录），API 识别失败的标题级负缓存
+        结果写入独立正缓存（最多 100 条，超出覆盖最早记录），API 识别失败的标题级负缓存
         最多 5 条。
 
         整个识别过程会写入日志：候选来源、原始串、套用的识别词、解析出的标题/季集、
         以及最终 TMDB 命中结果，便于排查识别错误。
 
         返回 (media, meta, title_name)，title_name 为用于识别的候选名称。"""
-        # 识别开关开启时下载种子解析视频文件名；关闭时不做任何种子下载
+        # 仅 filename_only 回退分支下载种子；默认报文识别不下载种子。
         enc = item.get("enclosure", "") or item.get("link", "")
-        fns = self._rss_fnames(enc) if self._rss_fname_identify else []
+        fns = self._rss_fnames(enc) if filename_only and self._rss_fname_identify else []
         # 当前 RSS 资源内暂存所有失败候选；所有候选全部失败时才落盘负缓存。
         failed_candidates: Dict[str, str] = {}
 
@@ -2680,8 +2769,9 @@ class SpaceCleaner(_PluginBase):
             self._rss_log("识别未命中", title, "TMDB 官方 API 未匹配到媒体，暂存失败候选")
             return None, meta, False
 
-        # 开关开启且取到种子内视频文件名时，优先用文件名识别（命中率更高）
-        if fns:
+        file_media, file_meta, file_base = None, None, ""
+        # 仅在回退分支使用种子内视频文件名识别。
+        if filename_only and fns:
             self._rss_log("识别", rt, f"种子含 {len(fns)} 个文件，优先用视频文件名识别")
             best_file_media, best_file_meta, best_file_base = None, None, ""
             for fn in fns:
@@ -2709,6 +2799,13 @@ class SpaceCleaner(_PluginBase):
                 file_media, file_meta, file_base = media, meta, base
             else:
                 file_media, file_meta, file_base = None, None, ""
+        if filename_only:
+            # 回退模式只接受带集号的文件名结果，避免把整季文件误当作单集下载。
+            if file_media is not None and file_meta is not None and file_meta.begin_episode is not None:
+                return file_media, file_meta, file_base
+            for failed_key, failed_name in failed_candidates.items():
+                self._save_api_negative_cache(failed_key, failed_name)
+            return None, None, ""
 
         # 直接使用 RSS 报文标题识别：按 "/" 拆分的不同译名逐个作为候选
         # （每个候选 = 译名 + 集号/质量标记，避免多个译名合并识别导致失败）。
@@ -2883,10 +2980,30 @@ class SpaceCleaner(_PluginBase):
                       f"MP识别 S{season:02d}" + (f"E{episode:02d}" if episode is not None else "（无集号）"))
         return season, episode
 
+    def _rss_rule_pass(self, item: dict, m=None) -> bool:
+        """按选中的优先级规则组过滤 RSS 资源；未选择规则组时直接通过。"""
+        group = (self._rss_rule_group or "").strip()
+        if not group:
+            return True
+        try:
+            ti = TorrentInfo(title=item.get("title", ""), description=item.get("description", "") or "",
+                             enclosure=item.get("enclosure", "") or item.get("link", ""),
+                             page_url=item.get("link", ""), size=item.get("size", 0))
+            kept = self._get_chain().filter_torrents(rule_groups=[group], torrent_list=[ti], mediainfo=m)
+            if not kept:
+                self._rss_log("规则组过滤跳过", item.get("title", ""), f"不符合优先级规则组「{group}」")
+                return False
+            return True
+        except Exception as e:
+            logger.warn(f"SC-RSS 优先级规则组过滤失败（{group}）: {e}，本条不过滤")
+            return True
+
     def _rss_dl_add(self, item: dict, m, meta: MetaInfo) -> bool:
         try:
             enc = item.get("enclosure", "") or item.get("link", "")
             if not enc:
+                return False
+            if not self._rss_rule_pass(item, m):
                 return False
             ti = TorrentInfo(title=item.get("title", ""), description="",
                              enclosure=enc, page_url=item.get("link", ""), size=item.get("size", 0))
@@ -2913,6 +3030,8 @@ class SpaceCleaner(_PluginBase):
         try:
             enc = item.get("enclosure", "") or item.get("link", "")
             if not enc:
+                return False
+            if not self._rss_rule_pass(item):
                 return False
             from app.helper.downloader import DownloaderHelper
             helper = DownloaderHelper()
