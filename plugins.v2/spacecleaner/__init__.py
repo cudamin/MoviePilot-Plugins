@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.9.3"
+    plugin_version = "4.9.4"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -73,6 +73,7 @@ class SpaceCleaner(_PluginBase):
     _rss_th = 85
     _rss_wash_mode = False  # 洗版模式：播放进度低于阈值时触发洗版，只下载最早版本
     _rss_fname_identify = False  # 种子文件名兜底识别：报文识别失败/无集号/季号不一致时下载种子用文件名再识别
+    _rss_proxy_retry = False  # 种子下载失败时使用系统代理服务器重试一次
     _rss_save_path = ""  # RSS 下载自定义保存路径
 
     # === 内部状态 ===
@@ -147,6 +148,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_th = 85
         self._rss_wash_mode = False
         self._rss_fname_identify = False
+        self._rss_proxy_retry = False
         self._rss_save_path = ""
         self._pb = self._latest_episode_records(list(self.get_data("pb") or []))
         self.save_data("pb", self._pb)
@@ -210,6 +212,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_washed = dict.fromkeys(self.get_data("rss_washed") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_fname_identify = bool(config.get("rss_fname_identify"))
+        self._rss_proxy_retry = bool(config.get("rss_proxy_retry"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
 
         if self._enabled:
@@ -253,6 +256,7 @@ class SpaceCleaner(_PluginBase):
             "rss_exc": self._rss_exc, "rss_once": self._rss_once, "rss_ntf": self._rss_ntf,
             "rss_th": self._rss_th, "rss_wash_mode": self._rss_wash_mode,
             "rss_fname_identify": self._rss_fname_identify,
+            "rss_proxy_retry": self._rss_proxy_retry,
             "rss_save_path": self._rss_save_path,
             "clean_downloader": self._clean_downloader,
         })
@@ -629,8 +633,9 @@ class SpaceCleaner(_PluginBase):
                     {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_on", "label": "启用"}}]},
                     {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_ntf", "label": "通知"}}]},
                     {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_once", "label": "立即刷新RSS"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_wash_mode", "label": "洗版模式", "hint": "播放进度低于阈值或无播放缓存时触发洗版，只下载最早发布的版本", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_fname_identify", "label": "种子文件名兜底识别", "hint": "报文识别失败、无集号或季号与播放缓存不一致时，下载种子用视频文件名再识别一次", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_wash_mode", "label": "洗版模式", "hint": "播放进度低于阈值或无播放缓存时触发洗版，只下载最早发布的版本", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_fname_identify", "label": "种子文件名兜底识别", "hint": "报文识别失败、无集号或季号与播放缓存不一致时，下载种子用视频文件名再识别一次", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_proxy_retry", "label": "代理重试", "hint": "种子下载失败时，使用系统设置的代理服务器再重试一次", "persistent-hint": True}}]},
                 ]},
                 divider,
                 section("下载参数"),
@@ -683,7 +688,7 @@ class SpaceCleaner(_PluginBase):
             "pb_filter_watched": True, "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
             "rss_dl": "", "rss_rule_group": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
-            "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False, "rss_fname_identify": False, "rss_save_path": "",
+            "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False, "rss_fname_identify": False, "rss_proxy_retry": False, "rss_save_path": "",
         }
 
     # ==================== 详情页（三区块平铺） ====================
@@ -2918,8 +2923,41 @@ class SpaceCleaner(_PluginBase):
     _VIDEO_EXTS_TORRENT = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
                    ".flv", ".rmvb", ".rm", ".mpg", ".mpeg", ".webm", ".iso")
 
-    @classmethod
-    def _rss_fnames(cls, enc: str) -> List[str]:
+    @staticmethod
+    def _rss_http_torrent(enc: str, proxies: Optional[dict] = None) -> Tuple[Optional[bytes], str]:
+        """请求 .torrent 文件内容，返回 (内容, 错误信息)。"""
+        try:
+            r = RequestUtils(timeout=30, proxies=proxies).get_res(enc)
+        except Exception as exc:
+            return None, str(exc)
+        if not r or r.status_code != 200:
+            return None, f"status={getattr(r, 'status_code', None)}"
+        if not r.content:
+            return None, "响应内容为空"
+        return r.content, ""
+
+    def _rss_fetch_torrent(self, enc: str, tag: str = "") -> Optional[bytes]:
+        """下载 .torrent 文件内容；失败且开启「代理重试」时，用系统代理服务器再重试一次。"""
+        if not enc:
+            return None
+        content, err = self._rss_http_torrent(enc)
+        if content is not None:
+            return content
+        if not self._rss_proxy_retry:
+            logger.warning(f"SC-RSS 下载种子文件失败{tag}: {enc} {err}")
+            return None
+        if not settings.PROXY:
+            logger.warning(f"SC-RSS 下载种子文件失败{tag}: {enc} {err}，未配置代理服务器，无法重试")
+            return None
+        logger.info(f"SC-RSS 下载种子文件失败{tag}: {err}，使用代理服务器重试")
+        content, perr = self._rss_http_torrent(enc, proxies=settings.PROXY)
+        if content is not None:
+            logger.info(f"SC-RSS 代理重试下载种子文件成功{tag}: {enc}")
+            return content
+        logger.warning(f"SC-RSS 代理重试下载种子文件仍失败{tag}: {enc} {perr}")
+        return None
+
+    def _rss_fnames(self, enc: str) -> List[str]:
         """下载种子文件并解析文件列表，仅返回视频文件（按体积从大到小），
         无视频文件时回退到全部文件名。"""
         if not enc:
@@ -2927,11 +2965,10 @@ class SpaceCleaner(_PluginBase):
         try:
             import bencode
 
-            r = RequestUtils(timeout=30).get_res(enc)
-            if not r or r.status_code != 200:
-                logger.warning(f"SC-RSS 下载种子文件失败: {enc} status={getattr(r, 'status_code', None)}")
+            content = self._rss_fetch_torrent(enc, tag="（文件名识别）")
+            if not content:
                 return []
-            t = bencode.bdecode(r.content)
+            t = bencode.bdecode(content)
             info = t.get("info", {})
             files = info.get("files", [])
             if files:
@@ -2941,7 +2978,7 @@ class SpaceCleaner(_PluginBase):
                     if parts:
                         all_files.append(("/".join(parts), f.get("length", 0) or 0))
                 # 优先取视频文件，按体积从大到小（正片通常最大）
-                videos = [(p, l) for p, l in all_files if p.lower().endswith(cls._VIDEO_EXTS_TORRENT)]
+                videos = [(p, l) for p, l in all_files if p.lower().endswith(self._VIDEO_EXTS_TORRENT)]
                 if videos:
                     videos.sort(key=lambda x: x[1], reverse=True)
                     return [p for p, _ in videos]
@@ -3057,18 +3094,39 @@ class SpaceCleaner(_PluginBase):
             ti = TorrentInfo(title=item.get("title", ""), description="",
                              enclosure=enc, page_url=item.get("link", ""), size=item.get("size", 0))
             ctx = Context(meta_info=meta, media_info=m, torrent_info=ti)
-            result = DownloadChain().download_single(
-                context=ctx, downloader=self._rss_dl or None,
-                save_path=self._rss_save_path or None,
-                username="SC-RSS", return_detail=True)
-            if isinstance(result, tuple):
-                h, err = result
-                if h:
+
+            def _do_download(content: Optional[bytes] = None) -> Tuple[Optional[str], Optional[str]]:
+                result = DownloadChain().download_single(
+                    context=ctx, torrent_content=content,
+                    downloader=self._rss_dl or None,
+                    save_path=self._rss_save_path or None,
+                    username="SC-RSS", return_detail=True)
+                if isinstance(result, tuple):
+                    return result
+                return result, None
+
+            h, err = _do_download()
+            if h:
+                return True
+            # 代理重试：自行用系统代理下载种子内容后再交给下载链
+            if self._rss_proxy_retry and not enc.lower().startswith("magnet:"):
+                if not settings.PROXY:
+                    logger.warning(f"SC-RSS 下载失败: {m.title} {err}，未配置代理服务器，无法重试")
+                    return False
+                logger.info(f"SC-RSS 下载失败: {m.title} {err}，使用代理服务器重试")
+                content, perr = self._rss_http_torrent(enc, proxies=settings.PROXY)
+                if content is None:
+                    logger.warning(f"SC-RSS 代理重试下载种子文件失败: {m.title} {perr}")
+                    return False
+                h2, err2 = _do_download(content)
+                if h2:
+                    logger.info(f"SC-RSS 代理重试下载成功: {m.title}")
                     return True
-                if err:
-                    logger.warning(f"SC-RSS 下载失败: {m.title} {err}")
+                logger.warning(f"SC-RSS 代理重试下载仍失败: {m.title} {err2}")
                 return False
-            return bool(result)
+            if err:
+                logger.warning(f"SC-RSS 下载失败: {m.title} {err}")
+            return False
         except Exception as e:
             logger.error(f"RSS dl err {e}")
             return False
@@ -3100,11 +3158,9 @@ class SpaceCleaner(_PluginBase):
             content = enc
             # 非磁链：先下载 .torrent 文件内容
             if not enc.lower().startswith("magnet:"):
-                r = RequestUtils(timeout=30).get_res(enc)
-                if not r or r.status_code != 200:
-                    logger.warning(f"SC-RSS 下载种子文件失败: {item.get('title', '')}")
+                content = self._rss_fetch_torrent(enc, tag=f"（{item.get('title', '')}）")
+                if not content:
                     return False
-                content = r.content
             r = downloader.add_torrent(content=content, download_dir=self._rss_save_path or None)
             return bool(r)
         except Exception as e:
