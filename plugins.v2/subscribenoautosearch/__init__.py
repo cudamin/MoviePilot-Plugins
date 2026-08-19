@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.event import Event as MPEvent
 from app.core.event import eventmanager
@@ -14,7 +14,7 @@ class SubscribeNoAutoSearch(_PluginBase):
     plugin_name = "新增订阅不自动搜索"
     plugin_desc = "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。"
     plugin_icon = "pause.png"
-    plugin_version = "1.2.2"
+    plugin_version = "1.3.0"
     plugin_label = "订阅管理"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -26,7 +26,8 @@ class SubscribeNoAutoSearch(_PluginBase):
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。"""
-        self._enabled = bool(config.get("enabled")) if config else False
+        config = config or {}
+        self._enabled = bool(config.get("enabled"))
 
     def get_state(self) -> bool:
         """获取插件启用状态。"""
@@ -49,6 +50,7 @@ class SubscribeNoAutoSearch(_PluginBase):
                 "content": [
                     {
                         "component": "VRow",
+                        "props": {"dense": True},
                         "content": [
                             {
                                 "component": "VCol",
@@ -79,15 +81,15 @@ class SubscribeNoAutoSearch(_PluginBase):
                                 ],
                             },
                         ],
-                    }
+                    },
                 ],
             }
         ], {
             "enabled": False,
         }
 
-    def get_page(self):
-        """返回插件详情页面。"""
+    def get_page(self) -> Optional[List[dict]]:
+        """不提供详情页：框架按 has_page=False 处理，点击插件直接进入设置页。"""
         pass
 
     def stop_service(self) -> None:
