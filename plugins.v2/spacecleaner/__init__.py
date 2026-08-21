@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.9.4"
+    plugin_version = "4.9.5"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -1541,19 +1541,24 @@ class SpaceCleaner(_PluginBase):
                         if dp.exists():
                             self._safe_delete_path(dp)
                             cleanup_dirs.add(dp.parent)
-            # 收集 src/dest 路径的父目录（含 fileitem 场景）
+            # 收集 src/dest 路径的父目录（含 fileitem 场景），同时记录本单元自己的
+            # 文件路径：下载器 delete_file 为异步操作，这些文件可能仍短暂存在，
+            # 清理目录时应视为已删除，避免单文件种子的专属目录被误判为「仍有视频文件」
+            unit_paths: set = set()
             for rec in all_recs:
                 src = rec.get("src", "")
                 if src:
                     cleanup_dirs.add(Path(src).parent)
+                    unit_paths.add(str(Path(src)))
                 dest = rec.get("dest", "")
                 if dest:
                     cleanup_dirs.add(Path(dest).parent)
+                    unit_paths.add(str(Path(dest)))
             # 清理下载残留目录和媒体库空目录，并记录仍未清理的目录。
             for d in cleanup_dirs:
-                self._cleanup_download_dir(d)
-                self._delete_media_dir(d, max_levels=3)
-            leftover_dirs = self._find_residual_dirs(cleanup_dirs)
+                self._cleanup_download_dir(d, unit_paths)
+                self._delete_media_dir(d, max_levels=3, ignore_paths=unit_paths)
+            leftover_dirs = self._find_residual_dirs(cleanup_dirs, unit_paths)
             # 用独立 session 删除所有相关转移记录
             from app.db import ScopedSession
             ds = ScopedSession()
@@ -1950,7 +1955,7 @@ class SpaceCleaner(_PluginBase):
     _LEFTOVER_VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv",
                             ".iso", ".rmvb", ".rm", ".mpg", ".mpeg", ".m4v", ".webm", ".vob", ".strm"}
 
-    def _dir_is_leftover_metadata(self, path: Path) -> bool:
+    def _dir_is_leftover_metadata(self, path: Path, ignore_paths: Optional[set] = None) -> bool:
         """目录是否为「资源删除后残留的元数据目录」——可安全删除。
 
         判定为 True 的条件：目录内不含任何子目录，且不含任何视频文件；
@@ -1958,13 +1963,21 @@ class SpaceCleaner(_PluginBase):
         这类目录（如某剧删除全部季后仅剩 tvshow.nfo、poster.jpg 的剧名根目录）
         应连同删除。若目录内仍有子目录（如同类目录下的其他剧集、其他季）
         或仍存在视频文件，则返回 False 以停止上溯，避免误删。
+
+        ignore_paths 为「本次删除单元自己的文件路径」集合：下载器 delete_file
+        为异步操作，删种后源文件可能仍短暂存在，这类文件本就属于本次删除范围，
+        判定时应视为已删除，否则单文件种子的专属目录会被误判为「仍有视频文件」
+        而永久残留。
         """
         try:
+            ignore = ignore_paths or set()
             for e in path.iterdir():
                 if e.is_dir():
                     return False  # 存在子目录（其他剧集/其他季），保留
                 if e.is_file() and e.suffix.lower() in self._LEFTOVER_VIDEO_EXTS:
-                    return False  # 仍有视频文件，保留
+                    if str(e) in ignore:
+                        continue  # 本单元自己的文件（下载器异步删除中），视为已删
+                    return False  # 仍有其他视频文件，保留
             return True
         except Exception:
             return False
@@ -1987,7 +2000,7 @@ class SpaceCleaner(_PluginBase):
             return True
         return False
 
-    def _delete_media_dir(self, media_dir: Path, max_levels: int = 3):
+    def _delete_media_dir(self, media_dir: Path, max_levels: int = 3, ignore_paths: Optional[set] = None):
         """删除媒体库中该资源所在目录（MP 软链接/硬链接、重命名、刮削生成的成品目录）。
 
         MP 通常为每部电影/每季电视剧建立独立目录，目录内除媒体文件外还含
@@ -2003,9 +2016,9 @@ class SpaceCleaner(_PluginBase):
                 return
             configured_dirs = self._configured_dirs()
             if self._dir_is_protected(media_dir, configured_dirs):
-                logger.warning(f"SC 跳过删除目录（挂载点/根目录/配置的下载或媒体库目录）: {media_dir}")
+                logger.debug(f"SC 跳过删除目录（挂载点/根目录/配置的下载或媒体库目录）: {media_dir}")
                 return
-            if not self._dir_is_leftover_metadata(media_dir):
+            if not self._dir_is_leftover_metadata(media_dir, ignore_paths):
                 logger.info(f"SC 目录仍有子目录或视频文件，跳过删除: {media_dir}")
                 return
             if self._safe_delete_path(media_dir):
@@ -2020,7 +2033,7 @@ class SpaceCleaner(_PluginBase):
                     break
                 if self._dir_is_protected(cur, configured_dirs):
                     break
-                if not self._dir_is_leftover_metadata(cur):
+                if not self._dir_is_leftover_metadata(cur, ignore_paths):
                     break  # 仍有子目录或视频文件（如同目录下别的剧集），停止上溯
                 parent = cur.parent
                 if self._safe_delete_path(cur):
@@ -2029,33 +2042,38 @@ class SpaceCleaner(_PluginBase):
         except Exception as e:
             logger.error(f"SC 删除媒体库目录失败 {media_dir}: {e}")
 
-    def _cleanup_download_dir(self, download_dir: Path):
+    def _cleanup_download_dir(self, download_dir: Path, ignore_paths: Optional[set] = None):
         """清理下载目录中残留的空目录。
 
         下载器删种时 delete_file=True 只删除种子对应的文件，不会删除种子所在的
         父目录（如 qBittorrent 为每个种子创建的独立子目录）。此方法仅删除该目录
         本身（若已空），不向上追溯，避免误删下载根目录或媒体库目录。
+        ignore_paths 为本次删除单元自己的文件路径，下载器异步删除尚未完成时
+        也视为已删除。
         """
         try:
             if not download_dir or not download_dir.exists() or not download_dir.is_dir():
                 return
             if self._dir_is_protected(download_dir, self._configured_dirs()):
                 return
-            # 检查目录是否为空（或仅剩元数据/垃圾文件）
-            if not self._dir_is_leftover_metadata(download_dir):
-                return  # 目录内仍有子目录或视频文件，不清理
+            # 检查目录是否为空（或仅剩元数据/垃圾文件、本单元待删文件）
+            if not self._dir_is_leftover_metadata(download_dir, ignore_paths):
+                return  # 目录内仍有子目录或其他视频文件，不清理
             if self._safe_delete_path(download_dir):
                 logger.info(f"SC 已清理下载残留目录: {download_dir}")
         except Exception as e:
             logger.error(f"SC 清理下载残留目录失败 {download_dir}: {e}")
 
-    def _find_residual_dirs(self, directories: set) -> List[Path]:
+    def _find_residual_dirs(self, directories: set, ignore_paths: Optional[set] = None) -> List[Path]:
         """检查资源删除后仍存在内容的目录，返回需要在通知中提示的路径。
 
         只跳过配置的下载/媒体库目录本身及其上级目录；位于配置目录「之内」的
         资源目录才是需要提示的残留对象（旧实现判断方向相反，结果恒为空）。
+        ignore_paths 为本次删除单元自己的文件路径，下载器异步删除可能尚未完成，
+        不计入残留。
         """
         configured_dirs = self._configured_dirs()
+        ignore = ignore_paths or set()
         residual = []
         seen = set()
         for directory in directories:
@@ -2066,7 +2084,7 @@ class SpaceCleaner(_PluginBase):
             if self._dir_is_protected(path, configured_dirs):
                 continue
             try:
-                if any(path.iterdir()):
+                if any(str(e) not in ignore for e in path.iterdir()):
                     residual.append(path)
             except OSError:
                 continue
