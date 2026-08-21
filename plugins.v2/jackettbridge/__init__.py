@@ -46,7 +46,7 @@ class JackettBridge(_PluginBase):
     # 插件描述
     plugin_desc = "将 Jackett 中已配置的索引器接入 MoviePilot 搜索与订阅。"
     # 插件图标
-    plugin_icon = "Jackett_A.png"
+    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Jackett_A.png"
     # 插件版本
     plugin_version = "1.0.0"
     # 插件标签
