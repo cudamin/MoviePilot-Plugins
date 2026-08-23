@@ -73,12 +73,13 @@
     "name": "JackettBridge",
     "description": "将 Jackett 中已配置的索引器接入 MoviePilot 搜索与订阅。",
     "labels": "站点",
-    "version": "1.0.0",
+    "version": "1.2.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Jackett_A.png",
     "author": "tafei",
     "level": 1,
     "history": {
-      "v1.0.0": "test"
+      "v1.0.0": "test",
+      "v1.2.0": "修复bug"
     }
   }
 }
