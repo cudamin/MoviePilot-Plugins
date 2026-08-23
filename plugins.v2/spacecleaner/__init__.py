@@ -32,7 +32,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.9.5"
+    plugin_version = "4.9.6"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -2717,6 +2717,47 @@ class SpaceCleaner(_PluginBase):
             meta.type = original_type
         return None
 
+    def _complete_media_by_tmdbid(self, meta: MetaInfo, media: MediaInfo) -> MediaInfo:
+        """缓存命中后按 tmdb_id 补全媒体详情，并让 MoviePilot 的季集修正逻辑生效。
+
+        独立正缓存与 MoviePilot 本地识别缓存只保存 tmdb_id、标题、年份等精简字段，
+        据此重建的 MediaInfo 缺少 genre_ids、seasons、number_of_seasons 等详情；
+        而 MoviePilot 生态里的季集修正（例如把动画的绝对集号 "- 79" 分离成 S04E13
+        的插件，通过 TMDB 模块构建 MediaInfo 时的 set_category 钩子生效）依赖这些
+        详情字段。若缓存命中后直接返回精简 MediaInfo，季集就会停留在报文解析出的
+        绝对集号，与 MoviePilot 入库时的季集不一致。
+
+        因此电视剧命中缓存后，用 tmdb_id 调用 TMDB 模块按 ID 查询一次详情
+        （不是按名称搜索识别，开销远小于重新识别），复用 MoviePilot 的标准构建流程，
+        同时让季集修正作用在同一个 meta 上。补全失败时保留精简结果，不影响下载。
+        """
+        try:
+            if not media or not getattr(media, "tmdb_id", None):
+                return media
+            if getattr(media, "type", None) != MediaType.TV:
+                # 电影无季集换算需求，无需额外请求详情
+                return media
+            tmdb_module = self.chain.modulemanager.get_running_module("TheMovieDbModule")
+            if not tmdb_module:
+                return media
+            before = (meta.begin_season, meta.begin_episode)
+            full = tmdb_module.recognize_media(meta=meta, mtype=MediaType.TV,
+                                               tmdbid=int(media.tmdb_id))
+            if not full:
+                self._rss_log("详情补全失败", getattr(media, "title", ""),
+                              f"TMDB={media.tmdb_id} 未取到详情，沿用缓存精简信息")
+                return media
+            after = (meta.begin_season, meta.begin_episode)
+            if after != before:
+                self._rss_log("季集修正", getattr(full, "title", ""),
+                              f"缓存命中后按 TMDB 详情修正 "
+                              f"S{before[0] or 1:02d}E{before[1] or 0:02d} -> "
+                              f"S{after[0] or 1:02d}E{after[1] or 0:02d}")
+            return full
+        except Exception as exc:
+            self._rss_log("详情补全异常", getattr(media, "title", ""), str(exc))
+            return media
+
     def _has_api_negative_cache(self, key: str) -> bool:
         """判断是否已有该解析名称的 TMDB 识别失败缓存。"""
         if not key:
@@ -2796,6 +2837,7 @@ class SpaceCleaner(_PluginBase):
             if success_media:
                 self._rss_log("命中空间清理器识别成功独立缓存", title,
                               f"TMDB={success_media.tmdb_id} 《{success_media.title}》")
+                success_media = self._complete_media_by_tmdbid(meta, success_media)
                 return success_media, meta, True
 
             # 第二层：读取空间清理器独立负缓存；命中后直接跳过识别及添加下载。
@@ -2814,6 +2856,7 @@ class SpaceCleaner(_PluginBase):
                               f"TMDB={native_media.tmdb_id} 《{native_media.title}》")
                 # 识别成功结果同步写入独立正缓存，后续相同标题报文直接命中。
                 self._save_api_success_cache(cache_key, meta.name, native_media)
+                native_media = self._complete_media_by_tmdbid(meta, native_media)
                 return native_media, meta, True
 
             # 第四层：以上均未命中，直接调用正在运行的 TMDB 官方模块并绕过其识别缓存。
