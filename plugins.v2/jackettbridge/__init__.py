@@ -42,7 +42,7 @@ class JackettBridge(_PluginBase):
     """
 
     # 插件名称
-    plugin_name = "Jackett"
+    plugin_name = "jackettbridge"
     # 插件描述
     plugin_desc = "将 Jackett 中已配置的索引器接入 MoviePilot 搜索与订阅。"
     # 插件图标
