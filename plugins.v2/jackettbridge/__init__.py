@@ -20,7 +20,7 @@ from app.db.models.site import Site
 from app.helper.sites import SitesHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import EventType, MediaType, SystemConfigKey
+from app.schemas.types import EventType, MediaType
 from app.utils.http import RequestUtils
 
 # Torznab 命名空间
@@ -31,8 +31,6 @@ DEFAULT_CRON = "0 0 * * *"
 DEFAULT_SEARCH_TIMEOUT = 30
 # 默认单个索引器返回条数
 DEFAULT_RESULT_NUM = 100
-# 检索时自动同步索引器的最小间隔（秒）
-AUTO_SYNC_MIN_INTERVAL = 600
 
 
 class JackettBridge(_PluginBase):
@@ -50,7 +48,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -71,14 +69,9 @@ class JackettBridge(_PluginBase):
     # 运行时状态默认值
     _enabled = False
     _onlyonce = False
-    _sync_search_sites = True
     _host = ""
     _api_key = ""
     _password = ""
-    # 检索时自动同步索引器
-    _auto_sync = True
-    # 最近一次成功拉取 Jackett 索引器列表的时间戳
-    _last_sync_ts = 0.0
     _cron = DEFAULT_CRON
     _search_timeout = DEFAULT_SEARCH_TIMEOUT
     _result_num = DEFAULT_RESULT_NUM
@@ -96,12 +89,9 @@ class JackettBridge(_PluginBase):
         self.sites_helper = SitesHelper()
         self._enabled = False
         self._onlyonce = False
-        self._sync_search_sites = True
         self._host = ""
         self._api_key = ""
         self._password = ""
-        self._auto_sync = True
-        self._last_sync_ts = 0.0
         self._cron = DEFAULT_CRON
         self._search_timeout = DEFAULT_SEARCH_TIMEOUT
         self._result_num = DEFAULT_RESULT_NUM
@@ -122,11 +112,9 @@ class JackettBridge(_PluginBase):
         saved_config = self.get_config() or {}
         self._enabled = bool(config.get("enabled"))
         self._onlyonce = bool(config.get("onlyonce"))
-        self._sync_search_sites = bool(config.get("sync_search_sites", True))
         self._host = self.__normalize_host(config.get("host"))
         self._api_key = str(config.get("api_key") or "").strip()
         self._password = str(config.get("password") or "")
-        self._auto_sync = bool(config.get("auto_sync_on_search", True))
         self._cron = str(config.get("cron") or "").strip() or DEFAULT_CRON
         self._search_timeout = self.__to_int(config.get("search_timeout"), DEFAULT_SEARCH_TIMEOUT, 5, 600)
         self._result_num = self.__to_int(config.get("result_num"), DEFAULT_RESULT_NUM, 10, 500)
@@ -298,11 +286,9 @@ class JackettBridge(_PluginBase):
         self.update_config({
             "enabled": self._enabled,
             "onlyonce": self._onlyonce,
-            "sync_search_sites": self._sync_search_sites,
             "host": self._host,
             "api_key": self._api_key,
             "password": self._password,
-            "auto_sync_on_search": self._auto_sync,
             "cron": self._cron,
             "search_timeout": self._search_timeout,
             "result_num": self._result_num,
@@ -311,21 +297,6 @@ class JackettBridge(_PluginBase):
         })
 
     # ------------------------------------------------------------------ 同步
-
-    def __maybe_auto_sync(self) -> None:
-        """
-        检索时按最小间隔在后台同步索引器，让 Jackett 中新增/删除的索引器
-        自动反映到 MoviePilot 的站点列表与搜索范围，无需等待定时同步。
-        """
-        if not self._auto_sync:
-            return
-        now = time.time()
-        if now - self._last_sync_ts < AUTO_SYNC_MIN_INTERVAL:
-            return
-        # 先占位，避免并发检索时重复触发
-        self._last_sync_ts = now
-        logger.info(f"【{self.plugin_name}】检索触发索引器自动同步")
-        self.__start_sync_thread()
 
     def __start_sync_thread(self, restore_only: bool = False) -> None:
         """
@@ -359,16 +330,13 @@ class JackettBridge(_PluginBase):
                 self._indexers = indexers
                 self.save_data("indexers", indexers)
                 self.save_data("last_sync", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                self._last_sync_ts = time.time()
                 self.__update_config()
 
             if not self._indexers:
                 logger.info(f"【{self.plugin_name}】没有可用索引器")
 
             registered, updated = self.__sync_helper_indexers()
-            site_ids, removed_site_ids = self.__sync_site_records()
-            if self._sync_search_sites:
-                self.__sync_search_sites(site_ids, removed_site_ids)
+            self.__sync_site_records()
             logger.info(
                 f"【{self.plugin_name}】同步完成：索引器 {len(self._indexers)} 个，"
                 f"新注册 {registered} 个、更新 {updated} 个"
@@ -759,25 +727,6 @@ class JackettBridge(_PluginBase):
             )
         return site_ids, removed_site_ids
 
-    def __sync_search_sites(self, site_ids: List[int], removed_site_ids: List[int]) -> None:
-        """
-        将虚拟站点同步到搜索站点范围，并清理已删除的站点。
-        """
-        selected = self.systemconfig.get(SystemConfigKey.IndexerSites) or []
-        if not selected:
-            # 搜索范围为空表示使用全部站点，无需处理
-            return
-        removed_keys = {str(site_id) for site_id in removed_site_ids}
-        cleaned = [site_id for site_id in selected if str(site_id) not in removed_keys]
-        exists_keys = {str(site_id) for site_id in cleaned}
-        missing = [site_id for site_id in site_ids if str(site_id) not in exists_keys]
-        if not missing and cleaned == selected:
-            return
-        self.systemconfig.set(SystemConfigKey.IndexerSites, cleaned + missing)
-        logger.info(
-            f"【{self.plugin_name}】已同步 {len(missing)} 个站点到搜索范围，清理 {len(removed_keys)} 个失效站点"
-        )
-
     # ------------------------------------------------------------------ 检索
 
     def __get_indexer_id(self, site: dict) -> str:
@@ -839,8 +788,6 @@ class JackettBridge(_PluginBase):
         results: List[TorrentInfo] = []
         if not self.get_state():
             return results
-        # 检索时顺带检查 Jackett 索引器变化（有最小间隔限制，后台执行不阻塞检索）
-        self.__maybe_auto_sync()
         if not site or not self.__is_managed_site(site):
             return results
 
@@ -1156,7 +1103,7 @@ class JackettBridge(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [{
                                     "component": "VSwitch",
                                     "props": {"model": "enabled", "label": "启用插件"}
@@ -1164,31 +1111,7 @@ class JackettBridge(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "sync_search_sites",
-                                        "label": "同步至搜索范围"
-                                    }
-                                }]
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "model": "auto_sync_on_search",
-                                        "label": "检索时自动同步",
-                                        "hint": "检索时后台检查索引器变化，最小间隔 10 分钟",
-                                        "persistent-hint": True
-                                    }
-                                }]
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [{
                                     "component": "VSwitch",
                                     "props": {"model": "onlyonce", "label": "立即同步一次"}
@@ -1355,11 +1278,9 @@ class JackettBridge(_PluginBase):
         ], {
             "enabled": False,
             "onlyonce": False,
-            "sync_search_sites": True,
             "host": "",
             "api_key": "",
             "password": "",
-            "auto_sync_on_search": True,
             "cron": DEFAULT_CRON,
             "search_timeout": DEFAULT_SEARCH_TIMEOUT,
             "result_num": DEFAULT_RESULT_NUM,
