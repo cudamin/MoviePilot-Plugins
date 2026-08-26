@@ -14,25 +14,42 @@ from app.core.config import settings
 from app.core.context import Context, MediaInfo, TorrentInfo
 from app.core.event import eventmanager, Event
 from app.core.metainfo import MetaInfo
-from app.core.meta.metavideo import MetaVideo
 from app.log import logger
 from app.plugins import _PluginBase
-from app.db.transferhistory_oper import TransferHistoryOper
 from app.db.models.transferhistory import TransferHistory
 from app.utils.system import SystemUtils
 from app.chain import ChainBase
 from app.helper.rss import RssHelper
 from app.helper.rule import RuleHelper
-from app.schemas import NotificationType
-from app.schemas.types import EventType, MediaImageType, MediaType
+from app.schemas.types import EventType, MediaType
 from app.utils.http import RequestUtils
+
+
+class RawTorrent:
+    """从下载器原生接口取到的轻量种子对象，只保留删种与索引需要的字段。
+
+    MoviePilot 统一接口 list_torrents 会对每个种子执行一次 MetaInfo 名称识别
+    （要过全部自定义识别词），几百个种子即可占满一个 CPU 核数十秒。删除阶段
+    只需要 hash / 名称 / 体积 / 路径 / 所属下载器，因此直接读原始数据即可。
+    """
+    __slots__ = ("hash", "name", "size", "save_path", "content_path", "path", "downloader")
+
+    def __init__(self, torrent_hash: str, name: str, size: int,
+                 save_path: str = "", content_path: str = "", downloader: str = ""):
+        self.hash = torrent_hash
+        self.name = name
+        self.size = size
+        self.save_path = save_path
+        self.content_path = content_path
+        self.path = content_path
+        self.downloader = downloader
 
 
 class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
     plugin_icon = "delete.png"
-    plugin_version = "4.9.6"
+    plugin_version = "4.10.1"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -92,6 +109,8 @@ class SpaceCleaner(_PluginBase):
     _pb_cache = None
     _pb_cache_time = 0
     _pb_cache_ttl = 30
+    # 连续删除多个资源时，单元之间的停顿秒数：删种、删文件、清目录会带来瞬时 CPU/IO 峰值
+    _unit_delete_interval = 1.0
     _pb: List[dict] = []
     _pb_lock = threading.Lock()
     _rss_s: Optional[BackgroundScheduler] = None
@@ -940,15 +959,86 @@ class SpaceCleaner(_PluginBase):
             self._cached_space_time = now
         return info
 
+    def _list_raw_torrents(self) -> Optional[List[RawTorrent]]:
+        """直接从下载器原生接口读取种子列表，避开统一接口的逐种子名称识别。
+
+        任一选中下载器取种失败或类型不支持时返回 None，由调用方整体回退到
+        统一接口：只拿到部分下载器的数据会让辅种漏检、并误报「不在扫描范围」。
+        """
+        try:
+            from app.helper.downloader import DownloaderHelper
+            services = DownloaderHelper().get_services(name_filters=self._clean_downloader or None)
+        except Exception as e:
+            logger.debug(f"SC 获取下载器实例失败，回退统一接口: {str(e)}")
+            return None
+        if not services:
+            return None
+        result: List[RawTorrent] = []
+        for name, service in services.items():
+            instance = getattr(service, "instance", None)
+            if not instance:
+                return None
+            try:
+                if instance.is_inactive():
+                    logger.warning(f"SC 下载器 {name} 未连接，跳过扫描")
+                    continue
+            except Exception:
+                pass
+            service_type = (getattr(service, "type", "") or "").lower()
+            if service_type not in ("qbittorrent", "transmission"):
+                logger.debug(f"SC 下载器 {name} 类型 {service_type} 不支持原生取种，回退统一接口")
+                return None
+            try:
+                torrents, err = instance.get_torrents()
+            except Exception as e:
+                logger.warning(f"SC 下载器 {name} 原生取种失败，回退统一接口: {str(e)}")
+                return None
+            if err:
+                logger.warning(f"SC 下载器 {name} 原生取种返回异常，回退统一接口")
+                return None
+            for t in torrents or []:
+                if service_type == "qbittorrent":
+                    torrent_hash = t.get("hash")
+                    if not torrent_hash:
+                        continue
+                    result.append(RawTorrent(
+                        torrent_hash=torrent_hash,
+                        name=(t.get("name") or "").strip(),
+                        size=int(t.get("total_size") or t.get("size") or 0),
+                        save_path=str(t.get("save_path") or ""),
+                        content_path=str(t.get("content_path") or ""),
+                        downloader=name,
+                    ))
+                else:
+                    torrent_hash = getattr(t, "hashString", None)
+                    if not torrent_hash:
+                        continue
+                    download_dir = str(getattr(t, "download_dir", "") or "")
+                    torrent_name = (getattr(t, "name", "") or "").strip()
+                    result.append(RawTorrent(
+                        torrent_hash=torrent_hash,
+                        name=torrent_name,
+                        size=int(getattr(t, "total_size", 0) or 0),
+                        save_path=download_dir,
+                        content_path=str(Path(download_dir) / torrent_name) if download_dir and torrent_name else "",
+                        downloader=name,
+                    ))
+        return result
+
     def _get_cached_torrents(self, chain: ChainBase) -> List[Any]:
         now = time.time()
         if self._all_torrents_cache is not None and now - self._all_torrents_cache_time < self._torrents_cache_ttl:
             return self._all_torrents_cache
-        downloaders = self._clean_downloader or [None]
-        all_t = []
-        for dl in downloaders:
-            t = chain.list_torrents(downloader=dl or None, include_all_tags=True) or []
-            all_t.extend(t)
+        start = time.time()
+        all_t: Optional[List[Any]] = self._list_raw_torrents()
+        source = "下载器原生接口"
+        if all_t is None:
+            # 回退路径：统一接口会对每个种子做一次 MetaInfo 名称识别，CPU 开销明显
+            source = "MoviePilot 统一接口"
+            all_t = []
+            for dl in (self._clean_downloader or [None]):
+                all_t.extend(chain.list_torrents(downloader=dl or None, include_all_tags=True) or [])
+        logger.info(f"SC 已获取下载器种子 {len(all_t)} 个（{source}，耗时 {time.time() - start:.1f}s）")
         self._all_torrents_cache = all_t
         self._all_torrents_cache_time = now
         return all_t
@@ -1162,12 +1252,29 @@ class SpaceCleaner(_PluginBase):
         fr = ""
         try:
             pb = self._get_playback_pb()
-            # 有播放缓存记录的 tmdbid 集合：没有播放缓存的整理记录无需检查（不可能满足"已看完"条件）
+            # 播放缓存一次遍历建好索引，避免后续每个删除单元都重新线性扫描整份缓存：
+            #   pb_tmdbids:       有播放缓存的 tmdbid（没有缓存的整理记录不可能满足"已看完"）
+            #   pb_by_key:        缓存键 -> 缓存条目，用于按 {tmdbid}:M / {tmdbid}:SxxExx 直接取
+            #   pb_season_times:  (tmdbid, 季) -> 该季各集标记时间，取最小值即最早标记时间
+            #   prio_tmdbids:     被标记优先删除的 tmdbid（字符串形式）
             pb_tmdbids = set()
+            pb_by_key: Dict[str, dict] = {}
+            pb_season_times: Dict[tuple, List[str]] = {}
+            prio_tmdbids = set()
             for p in pb:
-                km = re.match(r'(\d+):', p.get("k", "") or "")
-                if km:
-                    pb_tmdbids.add(int(km.group(1)))
+                key = p.get("k", "") or ""
+                km = re.match(r'^(\d+):', key)
+                if not km:
+                    continue
+                tid_str = km.group(1)
+                pb_tmdbids.add(int(tid_str))
+                pb_by_key.setdefault(key, p)
+                if p.get("prio"):
+                    prio_tmdbids.add(tid_str)
+                sm = re.match(r'^(\d+):S(\d+)E\d+$', key)
+                if sm:
+                    pb_season_times.setdefault((int(sm.group(1)), int(sm.group(2))), []).append(
+                        p.get("t", "9999"))
 
             offset = 0
             # 按 download_hash 分组：收集每组所有记录的(tmdbid, season, episodes)
@@ -1190,14 +1297,6 @@ class SpaceCleaner(_PluginBase):
                         no_hash_records.append(r)
                 offset += len(recs)
 
-            # 优先删除标记：pb 中被标记 prio 的资源对应的 tmdbid 集合
-            prio_tmdbids = set()
-            for p in pb:
-                if p.get("prio"):
-                    km = re.match(r'(\d+):', p.get("k", "") or "")
-                    if km:
-                        prio_tmdbids.add(km.group(1))
-
             def _snap(r):
                 return {"id": r.id, "title": r.title or "未知", "type": r.type or "",
                         "seasons": r.seasons or "", "episodes": r.episodes or "",
@@ -1212,12 +1311,11 @@ class SpaceCleaner(_PluginBase):
 
             def _movie_watched_time(rec):
                 """电影：pb 中 {tmdbid}:M 已看完才返回其缓存时间，否则 None。"""
-                k = f"{rec.tmdbid}:M"
-                for p in pb:
-                    if p.get("k") == k:
-                        if (p.get("p", 0) or 0) >= self._watched_threshold:
-                            return p.get("t", "9999")
-                        return None
+                p = pb_by_key.get(f"{rec.tmdbid}:M")
+                if not p:
+                    return None
+                if (p.get("p", 0) or 0) >= self._watched_threshold:
+                    return p.get("t", "9999")
                 return None
 
             def _unit_earliest_mark_time(tmdbid, season=None):
@@ -1228,14 +1326,9 @@ class SpaceCleaner(_PluginBase):
                 无匹配缓存时返回 "9999"（排到最后）。
                 """
                 if season is None:
-                    prefix = f"{tmdbid}:M"
-                    def _m(k):
-                        return k == prefix
-                else:
-                    sp = f"{tmdbid}:S{season:02d}E"
-                    def _m(k):
-                        return k.startswith(sp)
-                times = [p.get("t", "9999") for p in pb if _m(p.get("k", "") or "")]
+                    p = pb_by_key.get(f"{tmdbid}:M")
+                    return p.get("t", "9999") if p else "9999"
+                times = pb_season_times.get((tmdbid, season)) or []
                 return min(times) if times else "9999"
 
             def _unit_earliest_lib_time(recs):
@@ -1266,12 +1359,12 @@ class SpaceCleaner(_PluginBase):
                     return None, f"{title}: 无法解析季/集号，跳过"
                 se = f"S{season:02d}E{max_ep:02d}"
                 k = f"{tmdbid}:{se}"
-                for p in pb:
-                    if p.get("k") == k:
-                        prog = p.get("p", 0) or 0
-                        if prog >= self._watched_threshold:
-                            return p.get("t", "9999"), None
-                        return None, f"{title} S{season:02d}: 最后一集 {se} 未看完（进度 {prog:.0f}% < {self._watched_threshold}%），整季跳过"
+                p = pb_by_key.get(k)
+                if p:
+                    prog = p.get("p", 0) or 0
+                    if prog >= self._watched_threshold:
+                        return p.get("t", "9999"), None
+                    return None, f"{title} S{season:02d}: 最后一集 {se} 未看完（进度 {prog:.0f}% < {self._watched_threshold}%），整季跳过"
                 return None, f"{title} S{season:02d}: 最后一集 {se} 无播放记录，整季跳过"
 
             # 删除单元：电视剧整季一起删除、电影单条删除
@@ -1421,7 +1514,10 @@ class SpaceCleaner(_PluginBase):
         finally:
             sess.close()
 
-        # 按目标百分比删除时：预估每个单元可释放空间，避免删过头超过目标太多
+        # 一轮清理只拉取一次下载器种子列表并建索引：种子名解析（MetaInfo + 自定义识别词）
+        # 是 CPU 密集操作，每个删除单元重复全量拉取会造成明显的 CPU 峰值。
+        # 删种后由 _delete_downloader_torrents 从索引与缓存中剔除已删 hash，保持数据新鲜。
+        torrent_index = self._build_torrent_index(self._get_cached_torrents(chain))
         for unit in delete_units:
             if md and dc >= md:
                 fr = "limit"
@@ -1440,18 +1536,20 @@ class SpaceCleaner(_PluginBase):
                     break
             # 完整删除一个资源（种子+文件+记录），删除完成后立即使空间缓存失效，
             # 下一次循环重新查询真实剩余空间，达标即停，否则继续删除下一个
-            # 种子列表也重新获取：上一轮删种后旧列表已过期（_delete_downloader_torrents 会清缓存）
-            unit_torrents = None if self._dry_run else self._get_cached_torrents(chain)
-            self._delete_unit(unit, chain, cs or space_info, unit_torrents)
+            self._delete_unit(unit, chain, cs or space_info, torrent_index)
             dc += 1
             self._cached_space_info = None
+            # 单元之间稍作停顿，把删种/删文件/清目录带来的瞬时占用摊平
+            if not self._dry_run and self._unit_delete_interval > 0:
+                time.sleep(self._unit_delete_interval)
         reason = {"limit": "达到单次删除数量上限", "space_ok": "空间已达标"}.get(fr, "已处理全部候选资源")
         logger.info(f"SC 清理完成，删除 {dc} 个资源（{reason}）")
 
-    def _delete_unit(self, unit, chain, space_info, all_torrents=None):
+    def _delete_unit(self, unit, chain, space_info, torrent_index=None):
         """删除一个删除单元（合集的所有集一起删除）。
 
         使用预先快照的记录字典，避免跨 Session 访问 ORM 懒加载属性。
+        torrent_index 为调用方预建的种子索引（见 _build_torrent_index），一轮清理复用同一份。
         """
         records = unit["records"]
         display_name = unit["display"]
@@ -1462,16 +1560,17 @@ class SpaceCleaner(_PluginBase):
         # 其他版本：同一集/同一部电影的不同发布版本（分辨率、字幕组、编码等）
         other_versions = self._find_other_version_records(records) if self._delete_other_versions else []
         all_recs = records + other_versions
+        if torrent_index is None:
+            torrent_index = self._build_torrent_index(self._get_cached_torrents(chain))
         if self._dry_run:
             # 统计将删除的种子（主种子 + 辅种）。部分不同版本整理记录没有
             # download_hash，需要通过源文件路径反查下载器任务及其辅种。
-            torrents = self._get_cached_torrents(chain)
-            main_hashes = self._collect_record_torrent_hashes(all_recs, torrents)
+            main_hashes = self._collect_record_torrent_hashes(all_recs, torrent_index)
             counted_hashes = set()
             main_cnt = cross_cnt = 0
             for dh in main_hashes:
-                tl = self._collect_torrents_to_delete(dh, torrents)
-                for torrent_hash, _, is_cross in tl:
+                tl = self._collect_torrents_to_delete(dh, torrent_index)
+                for torrent_hash, _, is_cross, _dl in tl:
                     if torrent_hash in counted_hashes:
                         continue
                     counted_hashes.add(torrent_hash)
@@ -1501,13 +1600,12 @@ class SpaceCleaner(_PluginBase):
             # 1) 从下载器删除该单元涉及的全部种子及其辅种（整季可能跨多个种子）
             #    删种时 delete_file=True 会一并删除下载目录中的源文件
             torrents_deleted = 0
-            torrents = all_torrents if all_torrents is not None else self._get_cached_torrents(chain)
-            main_hashes = self._collect_record_torrent_hashes(all_recs, torrents)
+            main_hashes = self._collect_record_torrent_hashes(all_recs, torrent_index)
             if not main_hashes and download_hash:
                 main_hashes = [download_hash]
             for dh in main_hashes:
                 torrents_deleted += self._delete_downloader_torrents(
-                    chain, dh, display_name, torrents
+                    chain, dh, display_name, torrent_index
                 )
             if not main_hashes:
                 logger.info(f"SC [{display_name}] 无关联种子（可能为无 hash 记录），跳过删种")
@@ -1767,6 +1865,9 @@ class SpaceCleaner(_PluginBase):
             logger.error(f"SC 清理失效播放缓存时查询整理记录失败: {str(e)}")
             return 0
 
+        # 存在可解析季号记录的剧集集合，避免在 _is_orphan 中对每个缓存键线性扫描季集合
+        covered_tv_season_tmdbids = {t for (t, _s) in covered_tv_seasons}
+
         def _is_orphan(k: str) -> bool:
             # 电影键 {tmdbid}:M
             m_movie = re.match(r'^(\d+):M$', k)
@@ -1781,7 +1882,7 @@ class SpaceCleaner(_PluginBase):
                 if tid not in covered_tv_tmdbids:
                     return True
                 # 该剧存在，但无任何可解析季号的记录 -> 无法按季判定，保守保留
-                if not any(t == tid for (t, s) in covered_tv_seasons):
+                if tid not in covered_tv_season_tmdbids:
                     return False
                 # 该季在整理记录中不存在 -> 失效
                 return (tid, season) not in covered_tv_seasons
@@ -1807,26 +1908,72 @@ class SpaceCleaner(_PluginBase):
                 logger.info(f"SC   - 其余 {len(orphans) - 20} 条略")
         return removed
 
-    def _collect_record_torrent_hashes(self, records: List[dict], torrents: List[Any]) -> List[str]:
-        """收集整理记录关联的主种子哈希，缺少哈希时按源路径反查下载器任务。"""
-        hashes = []
-        seen = set()
-        torrent_paths = []
+    # ==================== 种子索引 ====================
+
+    def _torrent_paths(self, torrent: Any) -> List[str]:
+        """收集一个下载器任务对应的磁盘路径（内容路径、任务路径、保存目录+名称）。"""
+        paths = []
+        for attr in ("content_path", "path"):
+            value = getattr(torrent, attr, None)
+            if value:
+                paths.append(str(value))
+        save_path = getattr(torrent, "save_path", None)
+        name = self._torrent_name(torrent)
+        if save_path and name:
+            paths.append(str(Path(str(save_path)) / name))
+        return paths
+
+    def _build_torrent_index(self, torrents: List[Any]) -> Dict[str, dict]:
+        """把种子列表预处理为索引，避免删除阶段反复做 O(整理记录 × 种子) 线性扫描。
+
+        - by_hash:    hash -> 种子对象
+        - by_content: (体积, 名称) -> [hash, ...]，用于常数级查找辅种
+        - by_path:    磁盘路径 -> hash，用于无 download_hash 的整理记录按源文件反查任务
+        """
+        index: Dict[str, dict] = {"by_hash": {}, "by_content": {}, "by_path": {}}
         for torrent in torrents or []:
             torrent_hash = getattr(torrent, "hash", None)
             if not torrent_hash:
                 continue
-            paths = []
-            for attr in ("content_path", "path"):
-                value = getattr(torrent, attr, None)
-                if value:
-                    paths.append(str(value))
-            save_path = getattr(torrent, "save_path", None)
+            index["by_hash"][torrent_hash] = torrent
+            size = self._torrent_size(torrent)
             name = self._torrent_name(torrent)
-            if save_path and name:
-                paths.append(str(Path(str(save_path)) / name))
-            torrent_paths.append((torrent_hash, paths))
+            if size and name:
+                index["by_content"].setdefault((size, name), []).append(torrent_hash)
+            for path in self._torrent_paths(torrent):
+                # 同一路径可能对应多个辅种，保留首个即可：辅种会在 by_content 中一并取出
+                index["by_path"].setdefault(path, torrent_hash)
+        return index
 
+    def _drop_torrents_from_index(self, index: Optional[dict], hashes: set) -> None:
+        """种子删除后同步剔除索引与列表缓存，无需清空缓存重新全量拉取。"""
+        if not hashes:
+            return
+        if index:
+            for h in hashes:
+                index["by_hash"].pop(h, None)
+            for key, hs in list(index["by_content"].items()):
+                kept = [h for h in hs if h not in hashes]
+                if kept:
+                    index["by_content"][key] = kept
+                else:
+                    index["by_content"].pop(key, None)
+            for key, h in list(index["by_path"].items()):
+                if h in hashes:
+                    index["by_path"].pop(key, None)
+        if self._all_torrents_cache:
+            self._all_torrents_cache = [t for t in self._all_torrents_cache
+                                        if getattr(t, "hash", None) not in hashes]
+
+    def _collect_record_torrent_hashes(self, records: List[dict], index: dict) -> List[str]:
+        """收集整理记录关联的主种子哈希，缺少哈希时按源路径反查下载器任务。
+
+        反查用路径索引从源文件自身逐级向上匹配父目录，命中最深的任务路径即停：
+        既避免遍历全部种子，也不再依赖 Path.relative_to 抛异常来判断包含关系。
+        """
+        hashes = []
+        seen = set()
+        by_path = (index or {}).get("by_path") or {}
         for record in records:
             download_hash = record.get("download_hash", "")
             if download_hash:
@@ -1835,29 +1982,21 @@ class SpaceCleaner(_PluginBase):
                     hashes.append(download_hash)
                 continue
             src = record.get("src", "")
-            if not src:
+            if not src or not by_path:
                 continue
             src_path = Path(src)
-            for torrent_hash, paths in torrent_paths:
-                if torrent_hash in seen:
+            for candidate in (src_path, *src_path.parents):
+                torrent_hash = by_path.get(str(candidate))
+                if not torrent_hash:
                     continue
-                if any(self._path_contains(path, src_path) for path in paths):
+                if torrent_hash not in seen:
                     seen.add(torrent_hash)
                     hashes.append(torrent_hash)
-                    break
+                break
         return hashes
 
-    @staticmethod
-    def _path_contains(torrent_path: str, source_path: Path) -> bool:
-        """判断整理源文件是否位于下载器任务路径内。"""
-        try:
-            source_path.relative_to(Path(torrent_path))
-            return True
-        except (TypeError, ValueError):
-            return False
-
-    def _collect_torrents_to_delete(self, download_hash, torrents):
-        """收集该主种子及其辅种，返回 [(hash, name, is_cross), ...]（含主种子本身）。
+    def _collect_torrents_to_delete(self, download_hash: str, index: dict) -> List[tuple]:
+        """收集该主种子及其辅种，返回 [(hash, name, is_cross, downloader), ...]（含主种子本身）。
 
         辅种定义：与主种子内容相同（体积一致且名称一致）但 tracker 不同的私有种子。
         辅种共享同一份磁盘文件，通常由不同站点重复做种；删除时必须一并处理，
@@ -1866,56 +2005,57 @@ class SpaceCleaner(_PluginBase):
         result = []
         if not download_hash:
             return result
-        main_t = None
-        for t in (torrents or []):
-            if getattr(t, "hash", None) == download_hash:
-                main_t = t
-                break
-        result.append((download_hash, self._torrent_name(main_t) if main_t else download_hash, False))
-        main_size = self._torrent_size(main_t) if main_t else 0
-        main_name = self._torrent_name(main_t) if main_t else ""
+        by_hash = (index or {}).get("by_hash") or {}
+        main_t = by_hash.get(download_hash)
+        main_name = self._torrent_name(main_t)
+        main_size = self._torrent_size(main_t)
+        result.append((download_hash, main_name or download_hash, False, self._torrent_downloader(main_t)))
         if not main_size or not main_name:
             return result
-        for t in (torrents or []):
-            h = getattr(t, "hash", None)
-            if not h or h == download_hash:
+        for h in ((index or {}).get("by_content") or {}).get((main_size, main_name), []):
+            if h == download_hash:
                 continue
-            if self._torrent_size(t) != main_size:
-                continue
-            if self._torrent_name(t) != main_name:
-                continue
-            result.append((h, self._torrent_name(t) or h, True))
+            t = by_hash.get(h)
+            result.append((h, self._torrent_name(t) or h, True, self._torrent_downloader(t)))
         return result
 
-    def _delete_downloader_torrents(self, chain, download_hash, display_name, all_torrents=None):
+    def _delete_downloader_torrents(self, chain, download_hash, display_name, index) -> int:
         """删除主种子及其辅种（cross-seed），返回实际删除的种子数量。
 
-        此处扫描整个下载器，包含非 MP 管理的种子，因此非 MP 管理的辅种也会被删除。
+        删除请求按种子实际所属下载器下发：MoviePilot 的 remove_torrents 不带下载器名时
+        只作用于默认下载器，其他下载器中的种子既删不掉、qb 又会返回成功，导致漏删被静默。
+        扫描范围为「扫描下载器」选中的下载器，其中包含非 MP 管理的种子。
         """
         if not download_hash:
             logger.warning(f"SC 无 download_hash，跳过删种: {display_name}")
             return 0
-        torrents = all_torrents if all_torrents is not None else self._get_cached_torrents(chain)
-        to_delete = self._collect_torrents_to_delete(download_hash, torrents)
-        cross_cnt = sum(1 for _, _, is_cross in to_delete if is_cross)
+        to_delete = self._collect_torrents_to_delete(download_hash, index)
+        if not ((index or {}).get("by_hash") or {}).get(download_hash):
+            # 种子不在扫描范围内（未选中的下载器 / 已被移除），此时拿不到所属下载器，
+            # 删除请求只能下发到默认下载器，且无法发现它的辅种
+            logger.warning(f"SC 种子 {download_hash} 不在扫描下载器范围内，"
+                           f"将按默认下载器尝试删除且不检索辅种: {display_name}")
+        cross_cnt = sum(1 for item in to_delete if item[2])
         main_cnt = len(to_delete) - cross_cnt
         logger.info(f"SC 准备删种 [{display_name}]: 主种子 {main_cnt} 个" +
                     (f"，辅种 {cross_cnt} 个" if cross_cnt else "，无辅种"))
         deleted = 0
-        for h, name, is_cross in to_delete:
+        deleted_hashes = set()
+        for h, name, is_cross, downloader in to_delete:
             role = "辅种" if is_cross else "主种子"
+            dl_label = f" @{downloader}" if downloader else ""
             try:
                 # remove_torrents 返回布尔，失败时不能计入删除数，否则统计虚高且失败被静默
-                if chain.remove_torrents(hashs=h, delete_file=True):
-                    logger.info(f"SC   已删除{role}: {name} ({h})")
+                if chain.remove_torrents(hashs=h, delete_file=True, downloader=downloader or None):
+                    logger.info(f"SC   已删除{role}: {name} ({h}){dl_label}")
                     deleted += 1
+                    deleted_hashes.add(h)
                 else:
-                    logger.warning(f"SC   删除{role}未成功: {name} ({h})")
+                    logger.warning(f"SC   删除{role}未成功: {name} ({h}){dl_label}")
             except Exception as e:
-                logger.error(f"SC   删除{role}失败 {name} ({h}): {str(e)}")
-        # 删种后下载器种子列表已变化，清除缓存，避免后续单元用陈旧列表匹配辅种
-        self._all_torrents_cache = None
-        self._all_torrents_cache_time = 0
+                logger.error(f"SC   删除{role}失败 {name} ({h}){dl_label}: {str(e)}")
+        # 只从索引与列表缓存中剔除已删种子，避免后续删除单元重新全量拉取种子列表
+        self._drop_torrents_from_index(index, deleted_hashes)
         return deleted
 
     @staticmethod
@@ -1938,6 +2078,13 @@ class SpaceCleaner(_PluginBase):
         if t is None:
             return ""
         return (getattr(t, "name", None) or getattr(t, "title", None) or "").strip()
+
+    @staticmethod
+    def _torrent_downloader(t) -> str:
+        """取种子所属下载器名称，删种时据此定向下发请求；无法获取时返回空串。"""
+        if t is None:
+            return ""
+        return str(getattr(t, "downloader", None) or "").strip()
 
     def _safe_delete_path(self, path: Path) -> bool:
         """删除文件或目录，返回是否确实删除成功。"""
