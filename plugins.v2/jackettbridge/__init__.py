@@ -50,7 +50,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -1203,12 +1203,9 @@ class JackettBridge(_PluginBase):
                             "variant": "tonal",
                             "density": "compact",
                             "class": "mb-2",
-                            "text": "本插件直连 Jackett，不使用代理："
-                                    "Jackett 通常与 MoviePilot 部署在同一内网，经代理访问内网只会失败。"
-                                    "Jackett 抓取各站点走不走代理由 Jackett 自身设置决定，本插件无法控制——"
-                                    "如果检索一直超时但索引器列表正常，请去 Jackett 的 Settings 里配置它自己的代理。"
-                                    "开启「检索时自动同步」后，Jackett 里新增或删除索引器会在下次检索时"
-                                    "自动补建/清理对应虚拟站点，也可用「立即同步一次」手动触发。"
+                            "text": "站点管理板块显示站点无法连通是正常现象，不用管。"
+                                    "如果日志中提示【jackettBridge】索引器列表请求无响应，请检查地址与网络，"
+                                    "请尝试将网络地址改为 MoviePilot 所在网段的地址，如：http://172.18.0.1:9117。"
                         }
                     },
                     {"component": "VDivider", "props": {"class": "my-3"}},
@@ -1240,7 +1237,7 @@ class JackettBridge(_PluginBase):
                                     "component": "VTextField",
                                     "props": {
                                         "model": "api_key",
-                                        "label": "API Key",
+                                        "label": "Jackett API Key",
                                         "placeholder": "Jackett 面板右上角 API Key"
                                     }
                                 }]
