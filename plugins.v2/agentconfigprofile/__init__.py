@@ -16,7 +16,7 @@ from app.schemas.types import ChainEventType, NotificationType
 
 class AgentConfigProfile(_PluginBase):
     """
-    智能助手配置模板插件。
+    API 聚合自动切换插件。
 
     将当前智能助手（Agent）的 LLM 供应商配置保存为命名模板，支持一键切换；
     并可定时探活当前生效配置，失效时按模板顺序自动切换到可用配置。
@@ -26,9 +26,11 @@ class AgentConfigProfile(_PluginBase):
     plugin_name = "API聚合自动切换"
     plugin_desc = "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。"
     plugin_icon = "agentresourceofficer.png"
-    plugin_version = "2.3.1"
+    plugin_version = "2.4.0"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
+    # 插件市场仓库地址，安装统计上报时一并提交
+    plugin_repo_url = "https://github.com/cudamin/MoviePilot-Plugins"
     plugin_config_prefix = "agentconfigprofile_"
     plugin_order = 46
     auth_level = 1
@@ -90,6 +92,14 @@ class AgentConfigProfile(_PluginBase):
 
     _LOG_MAX = 30
     _DEFAULT_CRON = "*/30 * * * *"
+    # 模板列表分页大小
+    _PAGE_SIZE = 15
+    # 全量探活并发数
+    _PROBE_WORKERS = 4
+    # 一次故障切换最多真实探活的候选模板数
+    _FAILOVER_MAX_TRY = 8
+    # 安装统计上报失败后的重试间隔（秒）
+    _REPORT_RETRY_INTERVAL = 3600
 
     # 支持探测的协议：provider id -> 展示名
     _DISCOVER_PROVIDERS = {
@@ -109,6 +119,7 @@ class AgentConfigProfile(_PluginBase):
     def init_plugin(self, config: dict = None):
         """初始化插件配置，并处理来自配置页的一次性动作。"""
         self._lock = threading.RLock()
+        self._stop_event = threading.Event()
         config = config or {}
         self._active_tab = str(config.get("_active_tab") or "basic")
         self._enabled = bool(config.get("enabled"))
@@ -165,15 +176,75 @@ class AgentConfigProfile(_PluginBase):
                 action_message = self._apply_global_options()
         except Exception as err:
             action_message = f"操作失败：{err}"
-            logger.error(f"智能助手配置模板：{action_message}")
+            logger.error(f"{self.plugin_name}：{action_message}")
 
         if self._apply_global and action != "apply_global":
             try:
                 self._apply_global_options(silent=True)
             except Exception as err:  # noqa: BLE001
-                logger.error(f"智能助手配置模板：应用全局参数失败 - {err}")
+                logger.error(f"{self.plugin_name}：应用全局参数失败 - {err}")
 
         self._save_persistent_config(action_message=action_message)
+        self._report_install()
+
+    # ------------------------------------------------------------------
+    # 安装统计上报
+    # ------------------------------------------------------------------
+
+    def _report_install(self):
+        """
+        上报本插件的安装统计。
+
+        MoviePilot 只在「通过插件仓库安装成功」时上报一次安装统计，本地部署、
+        手动放置文件或旧版本存量插件都不会计入，插件市场因此拿不到下载量。
+        这里在插件加载时按版本补报一次，失败后按间隔重试。
+        """
+        report = (self._runtime.get("install_report") or {}) if isinstance(self._runtime, dict) else {}
+        if report.get("version") == self.plugin_version and report.get("ok"):
+            return
+        last_try = str(report.get("last_try_at") or "")
+        if not report.get("ok") and last_try:
+            try:
+                elapsed = (datetime.now() - datetime.strptime(last_try, "%Y-%m-%d %H:%M:%S")).total_seconds()
+                if elapsed < self._REPORT_RETRY_INTERVAL and report.get("version") == self.plugin_version:
+                    return
+            except ValueError:
+                pass
+        threading.Thread(target=self._report_install_worker, daemon=True).start()
+
+    def _report_install_worker(self):
+        """后台执行安装统计上报，避免阻塞插件加载。"""
+        record: Dict[str, Any] = {
+            "version": self.plugin_version,
+            "last_try_at": self._now(),
+            "ok": False,
+            "message": "",
+        }
+        try:
+            if not getattr(settings, "PLUGIN_STATISTIC_SHARE", True):
+                record["message"] = "系统已关闭插件安装统计共享"
+                logger.info(f"{self.plugin_name}：{record['message']}，跳过安装统计上报")
+            else:
+                from app.helper.server import MoviePilotServerHelper
+
+                ok = MoviePilotServerHelper.install_plugin_reg(
+                    plugin_id=self.__class__.__name__,
+                    repo_url=self.plugin_repo_url,
+                )
+                record["ok"] = bool(ok)
+                record["message"] = "上报成功" if ok else "上报失败或服务端未接受"
+                if ok:
+                    logger.info(f"{self.plugin_name}：安装统计已上报（v{self.plugin_version}）")
+                else:
+                    logger.warn(f"{self.plugin_name}：安装统计上报未成功，稍后重试")
+        except Exception as err:  # noqa: BLE001
+            record["message"] = str(err)[:180]
+            logger.warn(f"{self.plugin_name}：安装统计上报异常 - {err}")
+        if self._stop_event.is_set():
+            return
+        with self._lock:
+            self._runtime["install_report"] = record
+            self._save_runtime()
 
     # ------------------------------------------------------------------
     # 基础
@@ -251,6 +322,7 @@ class AgentConfigProfile(_PluginBase):
             {"path": "/probe_all", "endpoint": self.api_probe_all, "methods": ["GET"], "summary": "探活全部模板"},
             {"path": "/delete", "endpoint": self.api_delete, "methods": ["GET"], "summary": "删除模板"},
             {"path": "/move", "endpoint": self.api_move, "methods": ["GET"], "summary": "调整模板顺序"},
+            {"path": "/set_page", "endpoint": self.api_set_page, "methods": ["GET"], "summary": "切换模板列表分页"},
             {"path": "/failover_now", "endpoint": self.api_failover_now, "methods": ["GET"], "summary": "立即执行故障切换检查"},
             {"path": "/clear_log", "endpoint": self.api_clear_log, "methods": ["GET"], "summary": "清空切换日志"},
             {"path": "/noop", "endpoint": self.api_noop, "methods": ["GET"], "summary": "仅刷新页面数据"},
@@ -269,7 +341,11 @@ class AgentConfigProfile(_PluginBase):
         ]
 
     def stop_service(self):
-        pass
+        """插件停用或重载时通知后台线程退出，避免旧实例覆盖新实例的数据。"""
+        try:
+            self._stop_event.set()
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     def _to_int(value: Any, default: int) -> int:
@@ -288,12 +364,45 @@ class AgentConfigProfile(_PluginBase):
             CronTrigger.from_crontab(text)
             return text
         except Exception:
-            logger.warn(f"智能助手配置模板：cron 表达式无效 [{text}]，回退 {cls._DEFAULT_CRON}")
+            logger.warn(f"{cls.plugin_name}：cron 表达式无效 [{text}]，回退 {cls._DEFAULT_CRON}")
             return cls._DEFAULT_CRON
 
     @staticmethod
     def _now() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def _provider_spec(cls, provider: Any):
+        """按 provider id 获取系统内置的供应商定义，取不到返回 None。"""
+        pid = str(provider or "").strip()
+        if not pid:
+            return None
+        try:
+            from app.agent.llm.provider import LLMProviderManager
+
+            return LLMProviderManager().get_provider(pid)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @classmethod
+    def _provider_label(cls, provider: Any) -> str:
+        """返回供应商展示名，优先用系统定义，其次用探测协议名，最后用原始 id。"""
+        pid = str(provider or "").strip()
+        if not pid:
+            return "-"
+        spec = cls._provider_spec(pid)
+        name = getattr(spec, "name", "") if spec else ""
+        return name or cls._DISCOVER_PROVIDERS.get(pid, pid)
+
+    @classmethod
+    def _provider_needs_api_key(cls, provider: Any) -> bool:
+        """判断该供应商是否必须配置 API Key（OAuth 类供应商可不填）。"""
+        spec = cls._provider_spec(provider)
+        if spec is None:
+            return str(provider or "") not in {"chatgpt", "github-copilot"}
+        if getattr(spec, "oauth_methods", ()):
+            return False
+        return bool(getattr(spec, "supports_api_key", True))
 
     # ------------------------------------------------------------------
     # 数据存取
@@ -310,12 +419,17 @@ class AgentConfigProfile(_PluginBase):
 
     def _load_runtime(self) -> Dict[str, Any]:
         data = self.get_data(self.DATA_KEY_RUNTIME)
-        if isinstance(data, dict):
-            data.setdefault("fail_count", 0)
-            data.setdefault("log", [])
-            return data
-        return {"fail_count": 0, "log": [], "last_check_at": "", "last_check_ok": None,
-                "last_check_message": "", "last_check_duration": 0, "takeover_id": ""}
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("fail_count", 0)
+        data.setdefault("log", [])
+        data.setdefault("last_check_at", "")
+        data.setdefault("last_check_ok", None)
+        data.setdefault("last_check_message", "")
+        data.setdefault("last_check_duration", 0)
+        data.setdefault("takeover_id", "")
+        data.setdefault("page", 1)
+        return data
 
     def _save_runtime(self):
         self.save_data(self.DATA_KEY_RUNTIME, self._runtime)
@@ -374,7 +488,7 @@ class AgentConfigProfile(_PluginBase):
         results = settings.update_settings(env=env_updates)
         failed = [k for k, (ok, _msg) in results.items() if ok is False]
         if failed:
-            logger.warn(f"智能助手配置模板：部分 LLM 配置写入失败 - {failed}")
+            logger.warn(f"{self.plugin_name}：部分 LLM 配置写入失败 - {failed}")
         return True
 
     @staticmethod
@@ -425,13 +539,19 @@ class AgentConfigProfile(_PluginBase):
         model = (llm or {}).get("LLM_MODEL")
         if not provider or not model:
             return False, "配置缺少供应商或模型", 0
-        if provider not in {"chatgpt", "github-copilot"} and not (llm.get("LLM_API_KEY") or "").strip():
+        api_key = str((llm or {}).get("LLM_API_KEY") or "").strip()
+        if not api_key:
+            # 模板未保存密钥（如关闭了「模板包含 API Key」）时回落到当前系统密钥
+            api_key = str(getattr(settings, "LLM_API_KEY", "") or "").strip()
+        if not api_key and self._provider_needs_api_key(provider):
             return False, "未配置 API Key", 0
 
         kwargs: Dict[str, Any] = {"prompt": self._probe_prompt, "timeout": self._test_timeout}
         for setting_key, arg_name in self._PROBE_ARG_MAP.items():
             if setting_key in llm:
                 kwargs[arg_name] = llm.get(setting_key)
+        if api_key:
+            kwargs["api_key"] = api_key
         if kwargs.get("temperature") is not None:
             try:
                 kwargs["temperature"] = float(kwargs["temperature"])
@@ -442,7 +562,6 @@ class AgentConfigProfile(_PluginBase):
             result = self._run_coro(lambda: LLMHelper.test_current_settings(**kwargs))
         except Exception as err:  # noqa: BLE001
             message = str(err) or err.__class__.__name__
-            api_key = (llm.get("LLM_API_KEY") or "").strip()
             if api_key and len(api_key) > 6:
                 message = message.replace(api_key, "***")
             return False, message[:180], 0
@@ -478,7 +597,7 @@ class AgentConfigProfile(_PluginBase):
                 self._save_profiles(profiles)
         name = (profile or {}).get("name") or profile_id
         text = f"模板 [{name}] 探活{'成功' if ok else '失败'}：{message}"
-        logger.info(f"智能助手配置模板：{text}")
+        logger.info(f"{self.plugin_name}：{text}")
         return ok, text
 
     def _probe_current(self) -> Tuple[bool, str, int]:
@@ -507,7 +626,7 @@ class AgentConfigProfile(_PluginBase):
         return ok, message, duration
 
     def _start_probe_all(self) -> str:
-        """后台逐个探活全部模板，每完成一个立即写入进度，页面刷新即可看到最新结果。"""
+        """后台并发探活全部模板，每完成一个立即写入进度，页面刷新即可看到最新结果。"""
         progress = (self._runtime.get("probe_all") or {})
         if progress.get("status") == "running":
             done = self._to_int(progress.get("done"), 0)
@@ -527,40 +646,55 @@ class AgentConfigProfile(_PluginBase):
         }
         self._save_runtime()
         threading.Thread(target=self._probe_all_worker, daemon=True).start()
-        return f"已开始探活当前配置与 {len(profiles)} 个模板，每完成一个都会更新进度"
+        return f"已开始探活当前配置与 {len(profiles)} 个模板（{self._PROBE_WORKERS} 并发），刷新页面查看进度"
 
     def _probe_all_worker(self):
-        """探活当前配置与所有模板，逐个刷新进度。"""
+        """探活当前配置与所有模板，多线程并发执行并逐个刷新进度。"""
+        from concurrent.futures import ThreadPoolExecutor
 
         def bump(ok: bool, current: str):
-            progress = self._runtime.setdefault("probe_all", {})
-            progress["done"] = self._to_int(progress.get("done"), 0) + 1
-            progress["ok" if ok else "fail"] = self._to_int(progress.get("ok" if ok else "fail"), 0) + 1
-            progress["current"] = current
-            self._save_runtime()
+            with self._lock:
+                progress = self._runtime.setdefault("probe_all", {})
+                progress["done"] = self._to_int(progress.get("done"), 0) + 1
+                progress["ok" if ok else "fail"] = self._to_int(progress.get("ok" if ok else "fail"), 0) + 1
+                progress["current"] = current
+                self._save_runtime()
 
         try:
             ok, _message, _duration = self._probe_current()
             bump(ok, "当前生效配置")
-            for profile in self._load_profiles():
-                self._runtime.setdefault("probe_all", {})["current"] = profile.get("name") or ""
+
+            profiles = [p for p in self._load_profiles() if p.get("id")]
+            if profiles and not self._stop_event.is_set():
+                def probe_one(profile: Dict[str, Any]):
+                    if self._stop_event.is_set():
+                        return
+                    name = profile.get("name") or ""
+                    result, _text = self._probe_profile(profile.get("id"))
+                    bump(result, name)
+
+                workers = max(1, min(self._PROBE_WORKERS, len(profiles)))
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    list(executor.map(probe_one, profiles))
+
+            if self._stop_event.is_set():
+                return
+            with self._lock:
+                progress = self._runtime.setdefault("probe_all", {})
+                progress["status"] = "done"
+                progress["current"] = ""
+                progress["finished_at"] = self._now()
+                self._add_log(f"全量探活完成：正常 {progress.get('ok', 0)} 个，失败 {progress.get('fail', 0)} 个")
                 self._save_runtime()
-                ok, _text = self._probe_profile(profile.get("id"))
-                bump(ok, profile.get("name") or "")
-            progress = self._runtime.setdefault("probe_all", {})
-            progress["status"] = "done"
-            progress["current"] = ""
-            progress["finished_at"] = self._now()
-            self._add_log(f"全量探活完成：正常 {progress.get('ok', 0)} 个，失败 {progress.get('fail', 0)} 个")
-            self._save_runtime()
-            logger.info(f"智能助手配置模板：全量探活完成 正常 {progress.get('ok')} 失败 {progress.get('fail')}")
+                logger.info(f"{self.plugin_name}：全量探活完成 正常 {progress.get('ok')} 失败 {progress.get('fail')}")
         except Exception as err:  # noqa: BLE001
-            progress = self._runtime.setdefault("probe_all", {})
-            progress["status"] = "error"
-            progress["message"] = str(err)[:180]
-            progress["finished_at"] = self._now()
-            self._save_runtime()
-            logger.error(f"智能助手配置模板：全量探活失败 - {err}")
+            with self._lock:
+                progress = self._runtime.setdefault("probe_all", {})
+                progress["status"] = "error"
+                progress["message"] = str(err)[:180]
+                progress["finished_at"] = self._now()
+                self._save_runtime()
+            logger.error(f"{self.plugin_name}：全量探活失败 - {err}")
 
     # ------------------------------------------------------------------
     # 动作实现
@@ -602,7 +736,7 @@ class AgentConfigProfile(_PluginBase):
             results = settings.update_settings(env=env_updates)
             failed = [k for k, (ok, _msg) in results.items() if ok is False]
             if failed:
-                logger.warn(f"智能助手配置模板：部分全局参数写入失败 - {failed}")
+                logger.warn(f"{self.plugin_name}：部分全局参数写入失败 - {failed}")
 
         touched = 0
         with self._lock:
@@ -624,7 +758,7 @@ class AgentConfigProfile(_PluginBase):
             self._add_log(text)
             self._save_runtime()
         if touched or changed_settings:
-            logger.info(f"智能助手配置模板：{text}")
+            logger.info(f"{self.plugin_name}：{text}")
         return text
 
     def _do_save(self, name: str = "") -> str:
@@ -651,7 +785,7 @@ class AgentConfigProfile(_PluginBase):
                     **snapshot,
                 })
             self._save_profiles(profiles)
-        logger.info(f"智能助手配置模板：已保存模板 [{name}]")
+        logger.info(f"{self.plugin_name}：已保存模板 [{name}]")
         return f"已保存模板 [{name}]"
 
     def _do_apply(self, profile_id: str, reason: str = "") -> str:
@@ -676,7 +810,7 @@ class AgentConfigProfile(_PluginBase):
         self._runtime["applied_at"] = self._now()
         self._add_log(f"已切换到模板 [{name}]{('（' + reason + '）') if reason else ''}")
         self._save_runtime()
-        logger.info(f"智能助手配置模板：已切换到模板 [{name}] {reason}")
+        logger.info(f"{self.plugin_name}：已切换到模板 [{name}] {reason}")
         return f"已切换到模板 [{name}]"
 
     def _do_delete(self, profile_id: str) -> str:
@@ -687,7 +821,7 @@ class AgentConfigProfile(_PluginBase):
                 return "删除失败：模板不存在"
             profiles = [item for item in profiles if item.get("id") != profile_id]
             self._save_profiles(profiles)
-        logger.info(f"智能助手配置模板：已删除模板 [{profile.get('name')}]")
+        logger.info(f"{self.plugin_name}：已删除模板 [{profile.get('name')}]")
         return f"已删除模板 [{profile.get('name')}]"
 
     def _do_move(self, profile_id: str, direction: str) -> str:
@@ -703,6 +837,24 @@ class AgentConfigProfile(_PluginBase):
             profiles[index], profiles[target] = profiles[target], profiles[index]
             self._save_profiles(profiles)
         return "顺序已调整"
+
+    def _total_pages(self, total: int) -> int:
+        """按分页大小计算总页数。"""
+        return max(1, (max(0, total) + self._PAGE_SIZE - 1) // self._PAGE_SIZE)
+
+    def _current_page(self, total: int) -> int:
+        """返回当前有效页码（自动收敛到合法范围）。"""
+        page = self._to_int((self._runtime or {}).get("page"), 1)
+        return min(max(1, page), self._total_pages(total))
+
+    def _set_page(self, page: Any) -> str:
+        """记录模板列表当前页码。"""
+        total = len(self._load_profiles())
+        target = min(max(1, self._to_int(page, 1)), self._total_pages(total))
+        with self._lock:
+            self._runtime["page"] = target
+            self._save_runtime()
+        return f"已切换到第 {target}/{self._total_pages(total)} 页"
 
     # ------------------------------------------------------------------
     # 模型探测与自动建模板
@@ -828,7 +980,7 @@ class AgentConfigProfile(_PluginBase):
                     "count": len(models),
                     "models": models,
                 }
-                logger.info(f"智能助手配置模板：探测 [{provider}] {self._host_of(base_url)} - {message}")
+                logger.info(f"{self.plugin_name}：探测 [{provider}] {self._host_of(base_url)} - {message}")
                 self._save_discovery({**result, "status": "running"})
             result["status"] = "done"
             result["finished_at"] = self._now()
@@ -856,7 +1008,7 @@ class AgentConfigProfile(_PluginBase):
             result["message"] = str(err)[:180]
             result["finished_at"] = self._now()
             self._save_discovery(result)
-            logger.error(f"智能助手配置模板：模型探测失败 - {err}")
+            logger.error(f"{self.plugin_name}：模型探测失败 - {err}")
 
     def _model_snapshot(self, provider: str, base_url: str, api_key: str,
                         model: Dict[str, Any]) -> Dict[str, Any]:
@@ -868,9 +1020,10 @@ class AgentConfigProfile(_PluginBase):
             "LLM_BASE_URL_PRESET": None,
             "LLM_USER_AGENT": None,
             "LLM_USE_PROXY": bool(getattr(settings, "LLM_USE_PROXY", False)),
-            "LLM_THINKING_LEVEL": "off",
-            "LLM_API_PROTOCOL": "auto",
-            "LLM_WEB_SEARCH_MODE": "local",
+            # 未启用全局参数时，继承当前系统设置，避免新建模板被强制回到最保守值
+            "LLM_THINKING_LEVEL": str(getattr(settings, "LLM_THINKING_LEVEL", "off") or "off"),
+            "LLM_API_PROTOCOL": str(getattr(settings, "LLM_API_PROTOCOL", "auto") or "auto"),
+            "LLM_WEB_SEARCH_MODE": str(getattr(settings, "LLM_WEB_SEARCH_MODE", "local") or "local"),
             "LLM_TEMPERATURE": float(getattr(settings, "LLM_TEMPERATURE", 0.3) or 0.3),
             "LLM_SUPPORT_IMAGE_INPUT": bool(model.get("supports_image_input")),
             "LLM_SUPPORT_AUDIO_INPUT": bool(model.get("supports_audio_input")),
@@ -1045,7 +1198,7 @@ class AgentConfigProfile(_PluginBase):
         if added:
             self._add_log(text)
             self._save_runtime()
-        logger.info(f"智能助手配置模板：{text}")
+        logger.info(f"{self.plugin_name}：{text}")
         return text
 
     def _normalize_names(self, scope: str = "discover") -> str:
@@ -1070,7 +1223,7 @@ class AgentConfigProfile(_PluginBase):
             if renamed:
                 self._save_profiles(profiles)
         text = f"已规范 {renamed} 个模板名称"
-        logger.info(f"智能助手配置模板：{text}（范围 {scope}）")
+        logger.info(f"{self.plugin_name}：{text}（范围 {scope}）")
         return text
 
     def _prune_offlist(self) -> str:
@@ -1101,7 +1254,7 @@ class AgentConfigProfile(_PluginBase):
         if removed:
             self._add_log(text)
             self._save_runtime()
-        logger.info(f"智能助手配置模板：{text}")
+        logger.info(f"{self.plugin_name}：{text}")
         return text
 
     def _add_model_profile(self, provider: str, model_id: str) -> str:
@@ -1135,7 +1288,7 @@ class AgentConfigProfile(_PluginBase):
                                        discovery.get("api_key") or self._discover_api_key, model),
             })
             self._save_profiles(profiles)
-        logger.info(f"智能助手配置模板：已添加模板 [{name}]")
+        logger.info(f"{self.plugin_name}：已添加模板 [{name}]")
         return f"已添加模板 [{name}]"
 
     # ------------------------------------------------------------------
@@ -1160,10 +1313,20 @@ class AgentConfigProfile(_PluginBase):
             text = "自动切换失败：没有可用的备用模板"
             self._add_log(text, "error")
             self._save_runtime()
-            logger.warn(f"智能助手配置模板：{text}")
+            logger.warn(f"{self.plugin_name}：{text}")
             return text
 
-        for profile in candidates:
+        # 上次探活正常的模板优先，其次未探活，最后是已知失败的，避免大量模板时长时间逐个试
+        def rank(profile: Dict[str, Any]) -> int:
+            status = (profile.get("health") or {}).get("status")
+            return {"ok": 0, "unknown": 1}.get(status, 2)
+
+        ordered = sorted(candidates, key=rank)
+        tried = 0
+        for profile in ordered:
+            if self._FAILOVER_MAX_TRY and tried >= self._FAILOVER_MAX_TRY:
+                break
+            tried += 1
             ok, _text = self._probe_profile(profile.get("id"))
             if not ok:
                 continue
@@ -1179,15 +1342,15 @@ class AgentConfigProfile(_PluginBase):
                 )
             return message
 
-        text = "自动切换失败：所有备用模板探活均失败"
+        text = f"自动切换失败：已尝试 {tried} 个备用模板，探活均失败"
         self._add_log(text, "error")
         self._save_runtime()
-        logger.warn(f"智能助手配置模板：{text}")
+        logger.warn(f"{self.plugin_name}：{text}")
         if self._notify:
             self.post_message(
                 mtype=NotificationType.Plugin,
                 title="智能助手配置自动切换失败",
-                text=f"原因：{reason}\n所有备用模板探活均失败，请检查网络或密钥。",
+                text=f"原因：{reason}\n{text}，请检查网络或密钥。",
             )
         return text
 
@@ -1217,7 +1380,7 @@ class AgentConfigProfile(_PluginBase):
             return "插件未启用"
         ok, message, duration = self._probe_current()
         if ok:
-            logger.info(f"智能助手配置模板：当前配置探活正常（{duration}ms）")
+            logger.info(f"{self.plugin_name}：当前配置探活正常（{duration}ms）")
             if self._auto_recover:
                 recovered = self._try_recover_primary(self._current_llm_config())
                 if recovered:
@@ -1228,7 +1391,7 @@ class AgentConfigProfile(_PluginBase):
         text = f"当前配置探活失败（第 {fail_count} 次）：{message}"
         self._add_log(text, "warn")
         self._save_runtime()
-        logger.warn(f"智能助手配置模板：{text}")
+        logger.warn(f"{self.plugin_name}：{text}")
 
         if not self._auto_failover:
             return text
@@ -1276,7 +1439,7 @@ class AgentConfigProfile(_PluginBase):
             self._runtime["takeover_id"] = backup.get("id")
             self._add_log(f"当前配置失效，本次调用由模板 [{backup.get('name')}] 接管")
             self._save_runtime()
-        logger.info(f"智能助手配置模板：当前配置失效，用模板 [{backup.get('name')}] 接管本次调用")
+        logger.info(f"{self.plugin_name}：当前配置失效，用模板 [{backup.get('name')}] 接管本次调用")
 
         if self._auto_failover:
             threading.Thread(
@@ -1290,7 +1453,7 @@ class AgentConfigProfile(_PluginBase):
         try:
             self._do_failover(reason=reason)
         except Exception as err:  # noqa: BLE001
-            logger.error(f"智能助手配置模板：后台自动切换失败 - {err}")
+            logger.error(f"{self.plugin_name}：后台自动切换失败 - {err}")
 
     @staticmethod
     def _event_get(event_data: Any, key: str, default: Any = None) -> Any:
@@ -1313,57 +1476,60 @@ class AgentConfigProfile(_PluginBase):
     def _auth(apikey: str) -> bool:
         return apikey == settings.API_TOKEN
 
-    def api_save_current(self, apikey: str, name: str = ""):
+    def _api_run(self, apikey: str, func, *args, **kwargs) -> schemas.Response:
+        """统一处理 API 鉴权与异常，避免任何单点异常让详情页整体报错。"""
         if not self._auth(apikey):
             return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._do_save(str(name or "").strip()))
+        try:
+            message = func(*args, **kwargs)
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"{self.plugin_name}：接口执行失败 - {err}")
+            return schemas.Response(success=False, message=f"操作失败：{str(err)[:150]}")
+        return schemas.Response(success=True, message=str(message or "已完成"))
+
+    def api_save_current(self, apikey: str, name: str = ""):
+        return self._api_run(apikey, self._do_save, str(name or "").strip())
 
     def api_apply(self, pid: str, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._do_apply(pid, reason="手动切换"))
+        return self._api_run(apikey, self._do_apply, pid, "手动切换")
 
     def api_probe(self, apikey: str, pid: str = ""):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        if pid:
-            _ok, text = self._probe_profile(pid)
-            return schemas.Response(success=True, message=text)
-        ok, message, duration = self._probe_current()
-        return schemas.Response(success=True,
-                                message=f"当前配置探活{'成功' if ok else '失败'}：{message}（{duration}ms）")
+        def run() -> str:
+            if pid:
+                _ok, text = self._probe_profile(pid)
+                return text
+            ok, message, duration = self._probe_current()
+            return f"当前配置探活{'成功' if ok else '失败'}：{message}（{duration}ms）"
+
+        return self._api_run(apikey, run)
 
     def api_probe_all(self, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._start_probe_all())
+        return self._api_run(apikey, self._start_probe_all)
 
     def api_delete(self, pid: str, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._do_delete(pid))
+        return self._api_run(apikey, self._do_delete, pid)
 
     def api_move(self, pid: str, dir: str, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._do_move(pid, dir))
+        return self._api_run(apikey, self._do_move, pid, dir)
+
+    def api_set_page(self, apikey: str, p: str = "1"):
+        """切换模板列表分页。"""
+        return self._api_run(apikey, self._set_page, p)
 
     def api_failover_now(self, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self.health_check_job())
+        return self._api_run(apikey, self.health_check_job)
 
     def api_clear_log(self, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        self._runtime["log"] = []
-        self._save_runtime()
-        return schemas.Response(success=True, message="日志已清空")
+        def run() -> str:
+            with self._lock:
+                self._runtime["log"] = []
+                self._save_runtime()
+            return "日志已清空"
+
+        return self._api_run(apikey, run)
 
     def api_apply_global(self, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._apply_global_options())
+        return self._api_run(apikey, self._apply_global_options)
 
     def api_noop(self, apikey: str):
         """不做任何变更，仅让前端重新拉取页面数据。"""
@@ -1382,35 +1548,26 @@ class AgentConfigProfile(_PluginBase):
         return schemas.Response(success=True, message="已刷新")
 
     def api_discover(self, apikey: str, base_url: str = "", api_key: str = "", pid: str = ""):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._start_discovery(base_url, api_key, pid))
+        return self._api_run(apikey, self._start_discovery, base_url, api_key, pid)
 
     def api_import_discovered(self, apikey: str, provider: str = ""):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._import_discovered(provider_filter=provider))
+        return self._api_run(apikey, self._import_discovered, provider)
 
     def api_add_model(self, provider: str, model: str, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._add_model_profile(provider, model))
+        return self._api_run(apikey, self._add_model_profile, provider, model)
 
     def api_clear_discovery(self, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        self._save_discovery({})
-        return schemas.Response(success=True, message="探测结果已清除")
+        def run() -> str:
+            self._save_discovery({})
+            return "探测结果已清除"
+
+        return self._api_run(apikey, run)
 
     def api_normalize_names(self, apikey: str, scope: str = "discover"):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._normalize_names(scope))
+        return self._api_run(apikey, self._normalize_names, scope)
 
     def api_prune_offlist(self, apikey: str):
-        if not self._auth(apikey):
-            return schemas.Response(success=False, message="认证失败")
-        return schemas.Response(success=True, message=self._prune_offlist())
+        return self._api_run(apikey, self._prune_offlist)
 
     # ------------------------------------------------------------------
     # 配置页（Vuetify）
@@ -1879,7 +2036,7 @@ class AgentConfigProfile(_PluginBase):
         status_chips = [
             {"component": "VChip",
              "props": {"size": "small", "color": "primary", "variant": "flat", "class": "me-2 mb-1"},
-             "text": f"{current.get('LLM_PROVIDER') or '-'} / {current.get('LLM_MODEL') or '-'}"},
+             "text": f"{self._provider_label(current.get('LLM_PROVIDER'))} / {current.get('LLM_MODEL') or '-'}"},
             {"component": "VChip",
              "props": {"size": "small", "variant": "tonal", "class": "me-2 mb-1"},
              "text": self._host_of(current.get("LLM_BASE_URL") or "")},
@@ -1888,8 +2045,15 @@ class AgentConfigProfile(_PluginBase):
                        "variant": "tonal", "class": "me-2 mb-1"},
              "text": "密钥已配置" if current.get("LLM_API_KEY") else "密钥未配置"},
             {"component": "VChip",
+             "props": {"size": "small", "variant": "tonal", "class": "me-2 mb-1"},
+             "text": f"思考 {current.get('LLM_THINKING_LEVEL') or 'off'}"},
+            {"component": "VChip",
              "props": {"size": "small", "color": check_color, "variant": "flat", "class": "me-2 mb-1"},
              "text": check_text},
+        ]
+
+        # 运行状态 chips 与当前配置分列展示，避免一行堆叠过长
+        runtime_chips = [
             {"component": "VChip",
              "props": {"size": "small", "color": "error" if fail_count else "secondary",
                        "variant": "tonal", "class": "me-2 mb-1"},
@@ -1899,11 +2063,42 @@ class AgentConfigProfile(_PluginBase):
                        "variant": "tonal", "class": "me-2 mb-1"},
              "text": f"自动切换{'开启' if self._auto_failover else '关闭'}"
                      f"{('｜' + self._check_cron) if self._auto_failover else ''}"},
+            {"component": "VChip",
+             "props": {"size": "small", "color": "success" if self._takeover else "secondary",
+                       "variant": "tonal", "class": "me-2 mb-1"},
+             "text": f"即时接管{'开启' if self._takeover else '关闭'}"},
+            {"component": "VChip",
+             "props": {"size": "small", "color": "primary" if self._apply_global else "secondary",
+                       "variant": "tonal", "class": "me-2 mb-1"},
+             "text": f"全局参数{'启用' if self._apply_global else '关闭'}"},
         ]
         if runtime.get("last_check_at"):
-            status_chips.append({"component": "VChip",
-                                 "props": {"size": "small", "variant": "tonal", "class": "me-2 mb-1"},
-                                 "text": f"最近检查 {runtime.get('last_check_at')}"})
+            runtime_chips.append({"component": "VChip",
+                                  "props": {"size": "small", "variant": "tonal", "class": "me-2 mb-1"},
+                                  "text": f"最近检查 {runtime.get('last_check_at')}"})
+
+        # 模板健康概览
+        healthy = sum(1 for p in profiles if (p.get("health") or {}).get("status") == "ok")
+        failed = sum(1 for p in profiles if (p.get("health") or {}).get("status") == "fail")
+        unknown = len(profiles) - healthy - failed
+        summary_items = [
+            ("模板总数", len(profiles), "primary"),
+            ("探活正常", healthy, "success"),
+            ("探活失败", failed, "error"),
+            ("未探活", unknown, "secondary"),
+        ]
+        summary_row = {
+            "component": "VRow",
+            "props": {"dense": True, "class": "mb-1"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 6, "md": 3},
+                 "content": [{"component": "div", "props": {"class": "text-center"}, "content": [
+                     {"component": "div", "props": {"class": f"text-h6 text-{color}"}, "text": str(value)},
+                     {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": label},
+                 ]}]}
+                for label, value, color in summary_items
+            ],
+        }
 
         toolbar = [
             self._api_btn("保存当前配置为模板", "save_current", {}, color="primary", variant="tonal", size="small"),
@@ -1911,22 +2106,45 @@ class AgentConfigProfile(_PluginBase):
             self._api_btn("探活全部模板", "probe_all", {}, color="info", variant="tonal", size="small"),
             self._api_btn("立即执行切换检查", "failover_now", {}, color="warning", variant="tonal", size="small"),
             self._api_btn("探测端点模型", "discover", {}, color="success", variant="tonal", size="small"),
+            self._api_btn("应用全局参数", "apply_global", {}, color="secondary", variant="tonal", size="small"),
+            self._api_btn("刷新数据", "noop", {}, color="default", variant="tonal", size="small"),
         ]
+
+        # 分页
+        total_pages = self._total_pages(len(profiles))
+        page = self._current_page(len(profiles))
+        start = (page - 1) * self._PAGE_SIZE
+        page_profiles = profiles[start:start + self._PAGE_SIZE]
+
+        pager: List[dict] = []
+        if total_pages > 1:
+            pager = [
+                self._api_btn("«", "set_page", {"p": 1}, color="default", variant="tonal"),
+                self._api_btn("上一页", "set_page", {"p": max(1, page - 1)}, color="primary", variant="tonal"),
+                {"component": "span", "props": {"class": "text-caption text-medium-emphasis mx-1"},
+                 "text": f"{page}/{total_pages}"},
+                self._api_btn("下一页", "set_page", {"p": min(total_pages, page + 1)}, color="primary",
+                              variant="tonal"),
+                self._api_btn("»", "set_page", {"p": total_pages}, color="default", variant="tonal"),
+            ]
 
         header = {
             "component": "div",
-            "props": {"class": "d-flex align-center px-3 py-2 text-caption font-weight-bold border-b"},
+            "props": {"class": "d-none d-md-flex align-center px-3 py-2 text-caption "
+                               "font-weight-bold border-b text-medium-emphasis"},
             "content": [
-                {"component": "div", "props": {"style": "width: 40px;"}, "text": "#"},
-                {"component": "div", "props": {"style": "flex: 1 1 auto; min-width: 0;"}, "text": "模板（模型 · 协议 · 站点）"},
-                {"component": "div", "props": {"style": "width: 110px;"}, "text": "协议"},
-                {"component": "div", "props": {"style": "width: 150px;"}, "text": "探活状态"},
-                {"component": "div", "props": {"style": "width: 268px;"}, "text": "操作"},
+                {"component": "div", "props": {"style": "width: 36px;"}, "text": "#"},
+                {"component": "div", "props": {"style": "flex: 1 1 220px; min-width: 0;"},
+                 "text": "模板（模型 · 协议 · 站点）"},
+                {"component": "div", "props": {"style": "flex: 0 0 120px;"}, "text": "协议"},
+                {"component": "div", "props": {"style": "flex: 0 0 140px;"}, "text": "探活状态"},
+                {"component": "div", "props": {"style": "flex: 0 0 250px; text-align: right;"}, "text": "操作"},
             ],
         }
 
         rows = [header]
-        for index, profile in enumerate(profiles):
+        for offset, profile in enumerate(page_profiles):
+            index = start + offset
             llm = self._profile_llm(profile)
             health = profile.get("health") or {}
             active = self._profile_is_active(profile, current)
@@ -1955,8 +2173,8 @@ class AgentConfigProfile(_PluginBase):
 
             ops = [
                 self._api_btn("应用", "apply", {"pid": profile.get("id")},
-                              color="secondary" if active else "primary"),
-                self._api_btn("探活", "probe", {"pid": profile.get("id")}, color="info"),
+                              color="secondary" if active else "primary", variant="tonal"),
+                self._api_btn("探活", "probe", {"pid": profile.get("id")}, color="info", variant="tonal"),
                 self._api_btn("↑", "move", {"pid": profile.get("id"), "dir": "up"}, color="default"),
                 self._api_btn("↓", "move", {"pid": profile.get("id"), "dir": "down"}, color="default"),
                 self._api_btn("覆盖", "save_current", {"name": profile.get("name")}, color="warning"),
@@ -1965,22 +2183,27 @@ class AgentConfigProfile(_PluginBase):
 
             rows.append({
                 "component": "div",
-                "props": {"class": "d-flex align-center px-3 py-2 border-t text-body-2"},
+                "props": {"class": "d-flex flex-wrap align-center px-3 py-2 border-t text-body-2",
+                          "style": "row-gap: 4px;"},
                 "content": [
-                    {"component": "div", "props": {"style": "width: 40px;"}, "text": str(index + 1)},
+                    {"component": "div", "props": {"class": "text-medium-emphasis", "style": "width: 36px;"},
+                     "text": str(index + 1)},
                     {"component": "div",
-                     "props": {"style": "flex: 1 1 auto; min-width: 0; overflow: hidden; "
-                                        "text-overflow: ellipsis; white-space: nowrap;"},
+                     "props": {"style": "flex: 1 1 220px; min-width: 0; overflow: hidden; "
+                                        "text-overflow: ellipsis; white-space: nowrap;",
+                               "title": profile.get("name") or ""},
                      "content": name_content},
-                    {"component": "div", "props": {"style": "width: 110px;"},
-                     "text": self._DISCOVER_PROVIDERS.get(llm.get("LLM_PROVIDER"), llm.get("LLM_PROVIDER") or "-")},
-                    {"component": "div", "props": {"style": "width: 150px;"},
+                    {"component": "div",
+                     "props": {"class": "text-caption text-medium-emphasis", "style": "flex: 0 0 120px;"},
+                     "text": self._provider_label(llm.get("LLM_PROVIDER"))},
+                    {"component": "div", "props": {"style": "flex: 0 0 140px;"},
                      "content": [{"component": "VChip",
-                                  "props": {"size": "x-small", "color": health_color, "variant": "tonal"},
+                                  "props": {"size": "x-small", "color": health_color, "variant": "tonal",
+                                            "title": (health.get("message") or "")[:120]},
                                   "text": health_text}]},
                     {"component": "div",
-                     "props": {"style": "width: 268px; display: flex; flex-direction: row; "
-                                        "align-items: center; gap: 2px;"},
+                     "props": {"style": "flex: 0 0 250px; display: flex; flex-direction: row; "
+                                        "align-items: center; justify-content: flex-end; gap: 2px;"},
                      "content": ops},
                 ],
             })
@@ -1989,6 +2212,11 @@ class AgentConfigProfile(_PluginBase):
             rows.append({"component": "VAlert",
                          "props": {"type": "info", "variant": "tonal", "class": "ma-3", "density": "compact",
                                    "text": "还没有模板。点击上方“保存当前配置为模板”即可创建第一个模板。"}})
+        elif total_pages > 1:
+            rows.append({"component": "div",
+                         "props": {"class": "d-flex flex-wrap align-center justify-center px-3 py-2 border-t",
+                                   "style": "gap: 4px;"},
+                         "content": pager})
 
         # 模型探测结果
         discovery = self._load_discovery()
@@ -2017,12 +2245,33 @@ class AgentConfigProfile(_PluginBase):
                 "component": "VCard",
                 "props": {"variant": "tonal", "class": "mb-4"},
                 "content": [
-                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "当前生效配置"},
-                    {"component": "VCardText", "content": [
-                        {"component": "div", "props": {"class": "d-flex flex-wrap align-center"},
-                         "content": status_chips},
+                    {"component": "VCardTitle",
+                     "props": {"class": "text-subtitle-1 d-flex flex-wrap align-center justify-space-between"},
+                     "content": [
+                         {"component": "span", "text": "当前生效配置"},
+                         {"component": "span", "props": {"class": "text-caption text-medium-emphasis"},
+                          "text": f"插件版本 v{self.plugin_version}"},
+                     ]},
+                    {"component": "VCardText", "props": {"class": "pt-2"}, "content": [
+                        summary_row,
+                        {"component": "VDivider", "props": {"class": "my-3"}},
+                        {"component": "VRow", "props": {"dense": True}, "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "div",
+                                 "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": "模型与端点"},
+                                {"component": "div", "props": {"class": "d-flex flex-wrap align-center"},
+                                 "content": status_chips},
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "div",
+                                 "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": "运行状态"},
+                                {"component": "div", "props": {"class": "d-flex flex-wrap align-center"},
+                                 "content": runtime_chips},
+                            ]},
+                        ]},
+                        {"component": "VDivider", "props": {"class": "my-3"}},
                         {"component": "div",
-                         "props": {"class": "d-flex flex-wrap align-center mt-2", "style": "gap: 8px;"},
+                         "props": {"class": "d-flex flex-wrap align-center", "style": "gap: 6px;"},
                          "content": toolbar},
                     ]},
                 ],
@@ -2031,8 +2280,26 @@ class AgentConfigProfile(_PluginBase):
                 "component": "VCard",
                 "props": {"class": "mb-4"},
                 "content": [
-                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                     "text": f"模板列表（{len(profiles)}）｜顺序即故障切换优先级"},
+                    {"component": "VCardTitle",
+                     "props": {"class": "text-subtitle-1 d-flex flex-wrap align-center justify-space-between"},
+                     "content": [
+                         {"component": "div", "props": {"class": "d-flex flex-wrap align-center"}, "content": [
+                             {"component": "span", "props": {"class": "me-2"},
+                              "text": f"模板列表（{len(profiles)}）"},
+                             {"component": "VChip",
+                              "props": {"size": "x-small", "variant": "tonal", "class": "me-2"},
+                              "text": "顺序即故障切换优先级"},
+                         ] + ([{"component": "VChip",
+                                "props": {"size": "x-small", "variant": "tonal", "color": "primary"},
+                                "text": f"第 {page}/{total_pages} 页"}] if total_pages > 1 else [])},
+                         {"component": "div", "props": {"class": "d-flex flex-wrap align-center",
+                                                        "style": "gap: 2px;"},
+                          "content": [
+                              self._api_btn("规范命名", "normalize_names", {"scope": "discover"},
+                                            color="default", variant="text"),
+                              self._api_btn("清理名单外", "prune_offlist", {}, color="warning", variant="text"),
+                          ]},
+                     ]},
                     {"component": "VCardText", "props": {"class": "pa-0"}, "content": rows},
                 ],
             },
@@ -2062,7 +2329,7 @@ class AgentConfigProfile(_PluginBase):
         """声明一个可自动刷新的进度仪表盘。"""
         if not self.get_state():
             return []
-        return [{"key": "progress", "name": "智能助手配置模板 · 任务进度"}]
+        return [{"key": "progress", "name": f"{self.plugin_name} · 任务进度"}]
 
     def get_dashboard(self, key: str = "", **kwargs) -> Optional[Tuple[Dict[str, Any], Dict[str, Any],
                                                                       Optional[List[dict]]]]:
@@ -2079,7 +2346,7 @@ class AgentConfigProfile(_PluginBase):
 
         col = {"cols": 12, "md": 6}
         global_config = {"refresh": 5, "border": True,
-                         "title": "智能助手配置模板", "subtitle": "探测与探活进度"}
+                         "title": self.plugin_name, "subtitle": "探测与探活进度"}
 
         items: List[dict] = [
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center mb-2"}, "content": [
