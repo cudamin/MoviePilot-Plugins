@@ -71,6 +71,23 @@
       "v2.5.0": "插件ID改为小写agentconfigprofile以对齐安装统计"
      }
    },
+    "AgentConfigProfile": {
+    "name": "API聚合自动切换(旧ID·请更新)",
+    "description": "旧插件ID过渡条目：点击更新即可平滑升级，配置与模板会自动迁移。升级后请卸载本条目，改用「API聚合自动切换」。",
+    "labels": "智能助手",
+    "version": "2.5.0",
+    "icon": "agentresourceofficer.png",
+    "author": "tafei",
+    "level": 1,
+    "history": {
+      "v1.0.0": "初始版本",
+      "v1.1.0": "去除冗余功能",
+      "v1.1.1": "修复bug",
+      "v2.3.1": "新增大量功能",
+      "v2.4.0": "修复bug，优化ui布局",
+      "v2.5.0": "插件ID改为小写agentconfigprofile以对齐安装统计，自动迁移旧ID的配置与模板数据"
+    }
+  },
   "JackettBridge": {
     "name": "JackettBridge",
     "description": "将 Jackett 中已配置的索引器接入 MoviePilot 搜索与订阅。",
