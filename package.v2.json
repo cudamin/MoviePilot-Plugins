@@ -58,7 +58,7 @@
     "name": "API聚合自动切换",
     "description": "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。",
     "labels": "智能助手",
-    "version": "2.4.0",
+    "version": "2.5.0",
     "icon": "agentresourceofficer.png",
     "author": "tafei",
     "level": 1,
@@ -67,7 +67,7 @@
       "v1.1.0": "去除冗余功能",
       "v1.1.1": "修复bug",
       "v2.3.1": "新增大量功能",
-      "v2.4.0": "修复bug，优化ui布局"
+      "v2.4.0": "修复bug，优化ui布局",
       "v2.5.0": "插件ID改为小写agentconfigprofile以对齐安装统计"
      }
    },
