@@ -14,23 +14,29 @@ from app.plugins import _PluginBase
 from app.schemas.types import ChainEventType, NotificationType
 
 
-class AgentConfigProfile(_PluginBase):
+class agentconfigprofile(_PluginBase):
     """
     API 聚合自动切换插件。
 
     将当前智能助手（Agent）的 LLM 供应商配置保存为命名模板，支持一键切换；
     并可定时探活当前生效配置，失效时按模板顺序自动切换到可用配置。
     采用 Vuetify（免构建）渲染模式，详情页即操作台。
+
+    注意：插件 ID 恒等于类名，这里刻意使用全小写类名，与插件市场安装统计
+    服务端已有的 `agentconfigprofile` 记录保持一致，否则市场卡片读不到下载量。
+    旧版大写 ID（AgentConfigProfile）的配置与数据会在首次加载时自动迁移。
     """
 
     plugin_name = "API聚合自动切换"
     plugin_desc = "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。"
     plugin_icon = "agentresourceofficer.png"
-    plugin_version = "2.4.0"
+    plugin_version = "2.5.0"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
     # 插件市场仓库地址，安装统计上报时一并提交
     plugin_repo_url = "https://github.com/cudamin/MoviePilot-Plugins"
+    # 旧版插件 ID（大写类名），用于配置与数据迁移
+    _LEGACY_PLUGIN_ID = "AgentConfigProfile"
     plugin_config_prefix = "agentconfigprofile_"
     plugin_order = 46
     auth_level = 1
@@ -120,7 +126,7 @@ class AgentConfigProfile(_PluginBase):
         """初始化插件配置，并处理来自配置页的一次性动作。"""
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
-        config = config or {}
+        config = self._migrate_legacy_id(config or {})
         self._active_tab = str(config.get("_active_tab") or "basic")
         self._enabled = bool(config.get("enabled"))
         self._include_credentials = bool(config.get("include_credentials", True))
@@ -186,6 +192,55 @@ class AgentConfigProfile(_PluginBase):
 
         self._save_persistent_config(action_message=action_message)
         self._report_install()
+
+    # ------------------------------------------------------------------
+    # 旧 ID 迁移
+    # ------------------------------------------------------------------
+
+    def _migrate_legacy_id(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        把旧版大写插件 ID 下的配置与数据迁移到当前小写 ID。
+
+        插件 ID 恒等于类名，改名后 MoviePilot 会按新 ID 读取配置与数据，
+        因此首次加载时需要把旧记录搬过来。迁移只执行一次（以运行数据中的
+        迁移标记为准），旧记录保留不动便于回滚。
+        """
+        legacy_id = self._LEGACY_PLUGIN_ID
+        if not legacy_id or legacy_id == self.__class__.__name__:
+            return config
+        runtime = self.get_data(self.DATA_KEY_RUNTIME)
+        if isinstance(runtime, dict) and runtime.get("legacy_migrated_at"):
+            return config
+        try:
+            # 配置迁移：旧 ID 存在配置时以旧配置为准，覆盖同名 ID 的历史残留配置
+            legacy_config = self.get_config(plugin_id=legacy_id) or {}
+            if legacy_config:
+                config = dict(legacy_config)
+                self.update_config(config)
+                logger.info(f"{self.plugin_name}：已从旧插件 ID [{legacy_id}] 迁移配置")
+
+            # 数据迁移：模板、运行状态、探测结果，仅在当前 ID 尚无数据时接管
+            migrated_keys = []
+            for key in (self.DATA_KEY_PROFILES, self.DATA_KEY_RUNTIME, self.DATA_KEY_DISCOVERY):
+                if self.get_data(key):
+                    continue
+                legacy_value = self.get_data(key, plugin_id=legacy_id)
+                if not legacy_value:
+                    continue
+                self.save_data(key, legacy_value)
+                migrated_keys.append(key)
+            if migrated_keys:
+                logger.info(f"{self.plugin_name}：已从旧插件 ID [{legacy_id}] 迁移数据 {migrated_keys}")
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"{self.plugin_name}：旧插件 ID 数据迁移失败 - {err}")
+        finally:
+            # 无论旧记录是否存在都打标记，保证迁移只执行一次
+            runtime = self.get_data(self.DATA_KEY_RUNTIME)
+            runtime = dict(runtime) if isinstance(runtime, dict) else {}
+            runtime["legacy_migrated_at"] = self._now()
+            runtime["legacy_plugin_id"] = legacy_id
+            self.save_data(self.DATA_KEY_RUNTIME, runtime)
+        return config
 
     # ------------------------------------------------------------------
     # 安装统计上报
@@ -306,7 +361,7 @@ class AgentConfigProfile(_PluginBase):
         if not self._enabled or not self._auto_failover or not self._check_cron:
             return []
         return [{
-            "id": "AgentConfigProfileHealthCheck",
+            "id": "agentconfigprofile_health_check",
             "name": "智能助手配置探活与自动切换",
             "trigger": CronTrigger.from_crontab(self._check_cron),
             "func": self.health_check_job,
