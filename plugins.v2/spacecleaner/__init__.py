@@ -1,7 +1,7 @@
 """
 SpaceCleaner: 空间清理 + 智能RSS下载，共用播放进度缓存。
 """
-import os, re, time, threading, shutil
+import asyncio, json, os, re, time, threading, shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,9 +47,9 @@ class RawTorrent:
 
 class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
-    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集。"
+    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "4.10.1"
+    plugin_version = "4.11.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -90,6 +90,9 @@ class SpaceCleaner(_PluginBase):
     _rss_th = 85
     _rss_wash_mode = False  # 洗版模式：播放进度低于阈值时触发洗版，只下载最早版本
     _rss_fname_identify = False  # 种子文件名兜底识别：报文识别失败/无集号/季号不一致时下载种子用文件名再识别
+    _rss_ai_identify = False  # 智能助手识别兜底：识别失败/无集号/季号不一致时交给 LLM 接管识别
+    _rss_ai_add_words = True  # 智能助手识别成功后自动写入自定义识别词，避免下次再失败
+    _rss_ai_max = 5  # 单轮 RSS 刷新最多调用智能助手的次数
     _rss_proxy_retry = False  # 种子下载失败时使用系统代理服务器重试一次
     _rss_save_path = ""  # RSS 下载自定义保存路径
 
@@ -126,6 +129,10 @@ class SpaceCleaner(_PluginBase):
     _api_recognize_success_cache: List[dict] = []  # TMDB API 识别成功后的独立正缓存
     _api_recognize_success_cache_max = 100
     _api_recognize_cache_lock = threading.Lock()
+    # 智能助手识别兜底的单轮状态：调用计数与本轮已失败标题（避免同一轮重复烧 token）
+    _rss_ai_calls = 0
+    _rss_ai_failed: Dict[str, str] = {}
+    _rss_ai_timeout = 90  # 单次智能助手调用超时（秒）
 
     @staticmethod
     def _to_int(value: Any, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
@@ -167,6 +174,9 @@ class SpaceCleaner(_PluginBase):
         self._rss_th = 85
         self._rss_wash_mode = False
         self._rss_fname_identify = False
+        self._rss_ai_identify = False
+        self._rss_ai_add_words = True
+        self._rss_ai_max = 5
         self._rss_proxy_retry = False
         self._rss_save_path = ""
         self._pb = self._latest_episode_records(list(self.get_data("pb") or []))
@@ -231,6 +241,9 @@ class SpaceCleaner(_PluginBase):
         self._rss_washed = dict.fromkeys(self.get_data("rss_washed") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_fname_identify = bool(config.get("rss_fname_identify"))
+        self._rss_ai_identify = bool(config.get("rss_ai_identify"))
+        self._rss_ai_add_words = bool(config.get("rss_ai_add_words", True))
+        self._rss_ai_max = self._to_int(config.get("rss_ai_max"), 5, 1, 50)
         self._rss_proxy_retry = bool(config.get("rss_proxy_retry"))
         self._rss_save_path = str(config.get("rss_save_path") or "")
 
@@ -275,6 +288,9 @@ class SpaceCleaner(_PluginBase):
             "rss_exc": self._rss_exc, "rss_once": self._rss_once, "rss_ntf": self._rss_ntf,
             "rss_th": self._rss_th, "rss_wash_mode": self._rss_wash_mode,
             "rss_fname_identify": self._rss_fname_identify,
+            "rss_ai_identify": self._rss_ai_identify,
+            "rss_ai_add_words": self._rss_ai_add_words,
+            "rss_ai_max": self._rss_ai_max,
             "rss_proxy_retry": self._rss_proxy_retry,
             "rss_save_path": self._rss_save_path,
             "clean_downloader": self._clean_downloader,
@@ -649,12 +665,24 @@ class SpaceCleaner(_PluginBase):
             "content": [
                 section("基本设置", first=True),
                 {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_on", "label": "启用"}}]},
-                    {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_ntf", "label": "通知"}}]},
-                    {"component": "VCol", "props": {"cols": 4, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_once", "label": "立即刷新RSS"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_wash_mode", "label": "洗版模式", "hint": "播放进度低于阈值或无播放缓存时触发洗版，只下载最早发布的版本", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_fname_identify", "label": "种子文件名兜底识别", "hint": "报文识别失败、无集号或季号与播放缓存不一致时，下载种子用视频文件名再识别一次", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "rss_proxy_retry", "label": "代理重试", "hint": "种子下载失败时，使用系统设置的代理服务器再重试一次", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_on", "label": "启用"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_ntf", "label": "通知"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_once", "label": "立即刷新RSS"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_wash_mode", "label": "洗版模式", "hint": "播放进度低于阈值或无播放缓存时触发洗版，只下载最早发布的版本", "persistent-hint": True}}]},
+                ]},
+                divider,
+                section("识别兜底"),
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_fname_identify", "label": "种子文件名兜底识别", "hint": "报文识别失败、无集号或季号不一致时，下载种子用视频文件名再识别", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_ai_identify", "label": "智能助手识别兜底", "hint": "以上手段仍失败或季号不一致时，交给智能助手（LLM）接管识别", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_ai_add_words", "label": "自动添加自定义识别词", "hint": "智能助手识别成功后写入识别词，下次由 MoviePilot 自行识别", "persistent-hint": True}}]},
+                ]},
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "rss_ai_max", "label": "智能助手单轮调用上限", "type": "number", "min": 1, "max": 50, "hint": "每轮刷新最多调用次数", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 9}, "content": [
+                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mb-0"},
+                         "content": [{"component": "div", "props": {"class": "text-caption"}, "text": "识别顺序：RSS报文标题 → 种子文件名 → 智能助手。智能助手使用「设定-智能助手」里配置的模型，识别成功后会按 TMDB ID 校验，并（可选）把识别词写入「设定-自定义识别词」，下次相同命名由 MoviePilot 自行识别，不再消耗智能助手额度。"}]}
+                    ]},
                 ]},
                 divider,
                 section("下载参数"),
@@ -665,8 +693,9 @@ class SpaceCleaner(_PluginBase):
                     {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSelect", "props": {"model": "rss_dl", "label": "下载器", "items": dls, "clearable": True}}]},
                 ]},
                 {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSelect", "props": {"model": "rss_rule_group", "label": "优先级规则组", "items": groups, "clearable": True, "hint": "留空不过滤；选中后仅下载符合该规则组的资源", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "rss_save_path", "label": "自定义保存路径", "placeholder": "留空使用默认路径", "hint": "支持 <storage>:<path> 格式", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSelect", "props": {"model": "rss_rule_group", "label": "优先级规则组", "items": groups, "clearable": True, "hint": "留空不过滤", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [{"component": "VTextField", "props": {"model": "rss_save_path", "label": "自定义保存路径", "placeholder": "留空使用默认路径", "hint": "支持 <storage>:<path> 格式", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_proxy_retry", "label": "代理重试", "hint": "取种失败时用系统代理重试一次", "persistent-hint": True}}]},
                 ]},
                 divider,
                 section("RSS 源与过滤"),
@@ -707,7 +736,9 @@ class SpaceCleaner(_PluginBase):
             "pb_filter_watched": True, "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
             "rss_dl": "", "rss_rule_group": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
-            "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False, "rss_fname_identify": False, "rss_proxy_retry": False, "rss_save_path": "",
+            "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False,
+            "rss_fname_identify": False, "rss_ai_identify": False, "rss_ai_add_words": True, "rss_ai_max": 5,
+            "rss_proxy_retry": False, "rss_save_path": "",
         }
 
     # ==================== 详情页（三区块平铺） ====================
@@ -2301,6 +2332,9 @@ class SpaceCleaner(_PluginBase):
                 return
             self._rss_busy = True
         logger.info("SC-RSS 开始运行...")
+        # 重置智能助手兜底的单轮预算与失败标题记录
+        self._rss_ai_calls = 0
+        self._rss_ai_failed = {}
         try:
             if self._rss_wash_mode:
                 # 洗版模式：先收集所有 URL 的条目，统一去重后再下载
@@ -2367,18 +2401,27 @@ class SpaceCleaner(_PluginBase):
                         m, meta, video_name = fb_m, fb_meta, fb_name
                         self._rss_log("文件名回退命中", getattr(m, "title", t), "改用种子文件名识别结果")
                     else:
-                        self._rss_log("识别失败", t)
-                        if self._rss_ntf:
-                            self.post_message(title="SC-RSS识别失败",
-                                              text=f"资源无法识别: {t}")
-                        continue
+                        # 报文与文件名都失败：交给智能助手接管识别（并尝试写入自定义识别词）
+                        ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "报文与种子文件名均识别失败")
+                        if ai_m and ai_meta:
+                            m, meta, video_name = ai_m, ai_meta, ai_name
+                        else:
+                            self._rss_log("识别失败", t)
+                            if self._rss_ntf:
+                                self.post_message(title="SC-RSS识别失败",
+                                                  text=f"资源无法识别: {t}")
+                            continue
                 # 跳过无 TMDB ID 的识别结果
                 if not m.tmdb_id:
-                    self._rss_log("跳过无TMDB", t, "未识别到 TMDB ID")
-                    if self._rss_ntf:
-                        self.post_message(title="SC-RSS跳过",
-                                          text=f"未识别到 TMDB ID: {t}")
-                    continue
+                    ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "TMDB API 未识别到媒体（无 TMDB ID）")
+                    if ai_m and ai_meta:
+                        m, meta, video_name = ai_m, ai_meta, ai_name
+                    else:
+                        self._rss_log("跳过无TMDB", t, "未识别到 TMDB ID")
+                        if self._rss_ntf:
+                            self.post_message(title="SC-RSS跳过",
+                                              text=f"未识别到 TMDB ID: {t}")
+                        continue
                 # 判断电视剧 / 电影，电视剧用 MP 剧集解析引擎重新提取季/集
                 is_tv = (getattr(m, "type", None) == MediaType.TV) or (m.season is not None) or (meta.begin_episode is not None)
                 if is_tv:
@@ -2391,7 +2434,12 @@ class SpaceCleaner(_PluginBase):
                             s_season, s_episode = self._rss_tv_season_episode(m, meta, video_name)
                             if s_episode is not None:
                                 self._rss_log("文件名回退命中", m.title, "改用种子文件名识别集号")
-                    # 电视剧无集号则跳过
+                    # 电视剧无集号则交给智能助手兜底，仍失败才跳过
+                    if s_episode is None:
+                        ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "电视剧未识别到集号")
+                        if ai_m and ai_meta:
+                            m, meta, video_name = ai_m, ai_meta, ai_name
+                            s_season, s_episode = self._rss_tv_season_episode(m, meta, video_name)
                     if s_episode is None:
                         self._rss_log("跳过无集号", t, "电视剧未识别到集号")
                         if self._rss_ntf:
@@ -2418,6 +2466,20 @@ class SpaceCleaner(_PluginBase):
                                 se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}"
                                 self._rss_log("文件名回退命中", m.title, f"改用文件名识别结果 {se_fmt}")
                                 fb_ok = True
+                        if not fb_ok:
+                            # 文件名兜底仍不一致：交给智能助手接管识别（并尝试写入自定义识别词）
+                            ai_m, ai_meta, ai_name = self._rss_ai_fallback(
+                                item, t, f"报文季号 {se_fmt} 与播放缓存季（{cached_text}）不一致",
+                                cached_seasons=cached_seasons)
+                            if ai_m and ai_meta:
+                                ai_season, ai_episode = self._rss_tv_season_episode(ai_m, ai_meta, ai_name)
+                                ai_cached = self._rss_cached_seasons(ai_m.tmdb_id) if ai_m.tmdb_id else []
+                                if ai_episode is not None and (not ai_cached or int(ai_season) in ai_cached):
+                                    m, meta, video_name = ai_m, ai_meta, ai_name
+                                    s_season, s_episode = ai_season, ai_episode
+                                    se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}"
+                                    self._rss_log("智能助手兜底命中", m.title, f"改用智能助手识别结果 {se_fmt}")
+                                    fb_ok = True
                         if not fb_ok:
                             self._rss_log("跳过季号不一致", m.title,
                                           f"RSS={se_fmt}，播放缓存季={cached_text}，疑似分季策略不同")
@@ -2944,6 +3006,412 @@ class SpaceCleaner(_PluginBase):
             return None, None, ""
         self._rss_log("文件名回退", rt, reason)
         return self._rss_id(item, rt, filename_only=True)
+
+    # ==================== 智能助手识别兜底 ====================
+
+    @staticmethod
+    def _run_coro(coro):
+        """在插件线程里同步执行协程；当前线程已有事件循环时另起线程执行。"""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        box: Dict[str, Any] = {}
+
+        def _worker():
+            try:
+                box["value"] = asyncio.run(coro)
+            except BaseException as exc:  # noqa: BLE001
+                box["error"] = exc
+
+        t = threading.Thread(target=_worker, daemon=True, name="SC-RSS-AI")
+        t.start()
+        t.join()
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def _rss_ai_ask(self, prompt: str) -> str:
+        """调用「设定-智能助手」中配置的 LLM，返回纯文本回复。"""
+        from app.agent.llm.helper import LLMHelper
+
+        async def _call():
+            llm = await LLMHelper.get_llm(streaming=False)
+            return await asyncio.wait_for(llm.ainvoke(prompt), timeout=self._rss_ai_timeout)
+
+        response = self._run_coro(_call())
+        return LLMHelper.extract_text_content(getattr(response, "content", response), fallback_to_string=True).strip()
+
+    @staticmethod
+    def _rss_ai_parse_json(text: str) -> Optional[dict]:
+        """从 LLM 回复中提取 JSON 对象，兼容 ```json 代码块与前后多余说明文字。"""
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        # 去掉 ``` 代码块围栏
+        fence = re.search(r"```(?:json)?\s*(.+?)\s*```", raw, re.DOTALL | re.IGNORECASE)
+        if fence:
+            raw = fence.group(1).strip()
+        if not raw.startswith("{"):
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start < 0 or end <= start:
+                return None
+            raw = raw[start:end + 1]
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _rss_ai_prompt(self, rt: str, reason: str, meta, cached_seasons: Optional[List[int]],
+                       file_names: Optional[List[str]] = None) -> str:
+        """构造智能助手识别提示词：给出原始命名、MoviePilot 解析结果与识别词格式说明。"""
+        hint_lines = []
+        if meta is not None:
+            hint_lines.append(f"解析名称: {getattr(meta, 'name', '') or '（空）'}")
+            hint_lines.append(f"解析季号: {getattr(meta, 'begin_season', None)}")
+            hint_lines.append(f"解析集号: {getattr(meta, 'begin_episode', None)}")
+            hint_lines.append(f"套用的自定义识别词: {getattr(meta, 'apply_words', None) or '无'}")
+        cached_text = "、".join(f"S{s:02d}" for s in (cached_seasons or [])) or "无"
+        files_text = "\n".join(f"- {n}" for n in (file_names or [])[:8]) or "（未获取）"
+        return (
+            "你是 MoviePilot 的媒体识别专家。下面是一条 BT/RSS 资源的原始命名，MoviePilot 未能正确识别，请你判断它到底是哪部影视作品的第几季第几集。\n\n"
+            f"【原始报文标题】\n{rt}\n\n"
+            f"【种子内视频文件名】\n{files_text}\n\n"
+            f"【MoviePilot 当前解析结果】\n" + ("\n".join(hint_lines) or "（无）") + "\n\n"
+            f"【本地媒体库/播放缓存中该剧已有的季】\n{cached_text}\n\n"
+            f"【触发原因】\n{reason}\n\n"
+            "要求：\n"
+            "1. 番剧常见的绝对集号（如 “- 91”、“- 19(91)”）需要换算成 TMDB 的季/集编号；若本地已有季信息，结果应与之保持同一分季策略。\n"
+            "2. tmdb_id 必须是你确定的真实 TMDB ID，不确定就留空（null），不要编造。\n"
+            "3. 额外给出一条 MoviePilot 自定义识别词，使下次同系列命名能被自动识别。识别词格式为 `被替换词 => 替换词`：\n"
+            "   - 被替换词是作用在原始标题上的 Python 正则，必须包含该系列的专有片段（英文/罗马字原名、季次标记等），集号用捕获组 (\\d{1,3})；\n"
+            "   - 替换词形如 `中文标题.S04E\\1 {[tmdbid=82684;type=tv;]}`，其中 \\1 引用集号捕获组，季号写死两位数；\n"
+            "   - 只针对该系列做窄匹配，绝对不要写会命中其他作品的通用规则（例如不要只匹配 `(\\d+)` 或 `\\[(\\d+)\\]`）。\n"
+            "4. 只输出 JSON，不要输出解释文字、不要用代码块。\n\n"
+            "JSON 字段：\n"
+            "{\n"
+            '  "title": "中文标题（没有中文用原名）",\n'
+            '  "year": "首播年份，如 2024，未知留空",\n'
+            '  "media_type": "tv 或 movie",\n'
+            '  "tmdb_id": 数字或 null,\n'
+            '  "season": 季号数字（电影填 null）,\n'
+            '  "episode": 集号数字（电影填 null）,\n'
+            '  "word": "被替换词 => 替换词",\n'
+            '  "reason": "一句话依据"\n'
+            "}"
+        )
+
+    @staticmethod
+    def _rss_ai_int(value: Any) -> Optional[int]:
+        """把 LLM 回复里的数字字段安全转成 int，无效返回 None。"""
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            result = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        return result if result >= 0 else None
+
+    def _rss_ai_build_word(self, rt: str, title: str, season: Optional[int], episode: Optional[int],
+                           tmdb_id: Optional[int], is_tv: bool) -> str:
+        """兜底自造自定义识别词：把标题中与集号一致的数字换成捕获组，其余原文转义。
+
+        作为 LLM 给出的识别词无效时的保底方案，只匹配该系列本次这种命名，
+        不会命中其他作品；正片集号变化时仍能复用。
+        """
+        if not title or not is_tv or episode is None:
+            return ""
+        matches = [m for m in re.finditer(r"\d{1,4}", rt) if int(m.group()) == int(episode)]
+        if not matches:
+            return ""
+        # 集号通常出现在标题靠后位置（前面可能有 "4th"、"2024" 等数字）
+        target = matches[-1]
+        prefix = rt[:target.start()]
+        if len(prefix.strip()) < 4:
+            return ""
+        digits = len(target.group())
+        pattern = re.escape(prefix) + r"(\d{%d,%d})" % (digits, max(digits, 3))
+        tag = f" {{[tmdbid={int(tmdb_id)};type=tv;]}}" if tmdb_id else ""
+        return f"{pattern} => {title}.S{int(season or 1):02d}E\\1{tag}"
+
+    @staticmethod
+    def _rss_ai_word_format_ok(word: str) -> bool:
+        """校验识别词格式：必须是替换型，且被替换词是可编译的正则、不是空泛匹配。"""
+        text = str(word or "").strip()
+        if " => " not in text or text.startswith("#"):
+            return False
+        replaced, _, replace = text.partition(" => ")
+        replaced, replace = replaced.strip(), replace.strip()
+        if not replaced or not replace:
+            return False
+        # 拒绝过短或纯数字捕获的空泛规则，避免全局误伤其他资源
+        bare = re.sub(r"\\d\{[\d,]*\}|\\d|[\\()\[\]{}?*+.^$|]", "", replaced)
+        if len(bare.strip()) < 3:
+            return False
+        try:
+            re.compile(replaced)
+        except re.error:
+            return False
+        return True
+
+    def _rss_ai_word_verify(self, word: str, rt: str, season: Optional[int], episode: Optional[int],
+                            tmdb_id: Optional[int], is_tv: bool) -> bool:
+        """用「现有识别词 + 新识别词」实际解析一次原始标题，验证新词能得到期望的季集。"""
+        if not self._rss_ai_word_format_ok(word):
+            self._rss_log("识别词校验失败", word, "格式或正则无效")
+            return False
+        try:
+            words = list(self._current_custom_words()) + [word]
+            meta = MetaInfo(title=rt, custom_words=words)
+        except Exception as exc:
+            self._rss_log("识别词校验异常", word, str(exc))
+            return False
+        applied = getattr(meta, "apply_words", None) or []
+        if word not in applied:
+            self._rss_log("识别词校验失败", word, "该识别词未命中原始标题")
+            return False
+        if is_tv:
+            got_season = getattr(meta, "begin_season", None)
+            got_episode = getattr(meta, "begin_episode", None)
+            if episode is not None and got_episode != int(episode):
+                self._rss_log("识别词校验失败", word, f"解析集号 {got_episode} != 期望 {episode}")
+                return False
+            if season is not None and (got_season or 1) != int(season):
+                self._rss_log("识别词校验失败", word, f"解析季号 {got_season} != 期望 {season}")
+                return False
+        if tmdb_id and getattr(meta, "tmdbid", None) and int(meta.tmdbid) != int(tmdb_id):
+            self._rss_log("识别词校验失败", word, f"解析 TMDB {meta.tmdbid} != 期望 {tmdb_id}")
+            return False
+        return True
+
+    @staticmethod
+    def _current_custom_words() -> List[str]:
+        """读取当前生效的自定义识别词列表。"""
+        try:
+            from app.db.systemconfig_oper import SystemConfigOper
+            from app.schemas.types import SystemConfigKey
+
+            return list(SystemConfigOper().get(SystemConfigKey.CustomIdentifiers) or [])
+        except Exception as exc:
+            logger.warning(f"SC-RSS 读取自定义识别词失败: {exc}")
+            return []
+
+    def _rss_ai_save_word(self, word: str) -> bool:
+        """把校验通过的识别词追加到「设定-自定义识别词」末尾，立即生效。"""
+        try:
+            from app.db.systemconfig_oper import SystemConfigOper
+            from app.schemas.types import SystemConfigKey
+
+            oper = SystemConfigOper()
+            words = list(oper.get(SystemConfigKey.CustomIdentifiers) or [])
+            if word in words:
+                self._rss_log("识别词已存在", word, "跳过写入")
+                return True
+            words.append(word)
+            oper.set(SystemConfigKey.CustomIdentifiers, words)
+            self._rss_log("写入自定义识别词", word, f"当前共 {len(words)} 条")
+            return True
+        except Exception as exc:
+            self._rss_log("写入自定义识别词失败", word, str(exc))
+            return False
+
+    def _drop_api_negative_cache_by_title(self, rt: str) -> None:
+        """智能助手识别成功后，清掉该标题相关的独立负缓存，避免继续被跳过。"""
+        keys = set()
+        try:
+            for cand in [rt] + list(self._rss_title_candidates(rt)):
+                meta = MetaInfo(title=cand)
+                if getattr(meta, "name", ""):
+                    keys.add(self._api_recognize_cache_key(meta))
+        except Exception:
+            return
+        if not keys:
+            return
+        with self._api_recognize_cache_lock:
+            kept = [item for item in self._api_recognize_cache if item.get("key") not in keys]
+            if len(kept) == len(self._api_recognize_cache):
+                return
+            self._api_recognize_cache = kept
+            snapshot = list(kept)
+        self.save_data("api_recognize_cache", snapshot)
+        self._rss_log("清除独立负缓存", rt, "智能助手已识别成功")
+
+    def _rss_ai_recognize_media(self, meta, guess: dict) -> Optional[MediaInfo]:
+        """按智能助手给出的 TMDB ID（或标题）查询 TMDB，拿到完整媒体信息。"""
+        tmdb_module = self.chain.modulemanager.get_running_module("TheMovieDbModule")
+        if not tmdb_module:
+            self._rss_log("智能助手识别异常", getattr(meta, "name", ""), "TMDB 官方识别模块未运行")
+            return None
+        mtype = MediaType.TV if str(guess.get("media_type") or "tv").lower() != "movie" else MediaType.MOVIE
+        tmdb_id = self._rss_ai_int(guess.get("tmdb_id")) or self._rss_ai_int(getattr(meta, "tmdbid", None))
+        try:
+            if tmdb_id:
+                return tmdb_module.recognize_media(meta=meta, mtype=mtype, tmdbid=int(tmdb_id))
+            # 未给出 TMDB ID：用智能助手判断的标题+年份重新按名称识别
+            title = str(guess.get("title") or "").strip()
+            if not title:
+                return None
+            year = str(guess.get("year") or "").strip()
+            probe = MetaInfo(title=f"{title} ({year})" if year else title)
+            probe.type = mtype
+            if mtype == MediaType.TV:
+                probe.begin_season = self._rss_ai_int(guess.get("season")) or 1
+            return tmdb_module.recognize_media(meta=probe, cache=False)
+        except Exception as exc:
+            self._rss_log("智能助手识别异常", getattr(meta, "name", ""), f"TMDB 查询失败: {exc}")
+            return None
+
+    def _rss_ai_fallback(self, item: dict, rt: str, reason: str,
+                         cached_seasons: Optional[List[int]] = None):
+        """智能助手识别兜底。
+
+        触发场景：RSS 报文与种子文件名都识别失败、未识别到 TMDB ID、电视剧无集号，
+        或识别出的季号与本地播放缓存的分季策略不一致。
+
+        流程：把原始命名、MoviePilot 解析结果、本地已有季交给「设定-智能助手」配置的
+        LLM，要求返回 JSON（标题/类型/TMDB ID/季集 + 一条自定义识别词）；随后
+        1) 校验识别词（现有识别词 + 新词实际解析一次原始标题，季集/TMDB 必须符合预期），
+           校验通过则写入「设定-自定义识别词」，下次由 MoviePilot 自行识别；
+        2) 按 TMDB ID 查询完整媒体信息，季集以识别词解析结果为准，缺失时用 LLM 结果补齐；
+        3) 清掉该标题的独立负缓存并写入独立正缓存。
+
+        返回 (media, meta, name)，失败返回 (None, None, "")。
+        """
+        if not self._rss_ai_identify:
+            return None, None, ""
+        key = self._normalize_api_media_name(rt)
+        if key and key in self._rss_ai_failed:
+            self._rss_log("智能助手跳过", rt, f"本轮已失败：{self._rss_ai_failed[key]}")
+            return None, None, ""
+        if self._rss_ai_calls >= self._rss_ai_max:
+            self._rss_log("智能助手跳过", rt, f"已达本轮调用上限 {self._rss_ai_max} 次")
+            return None, None, ""
+        self._rss_ai_calls += 1
+        self._rss_log("智能助手识别", rt, f"{reason}（第 {self._rss_ai_calls}/{self._rss_ai_max} 次调用）")
+
+        base_meta = None
+        try:
+            base_meta = MetaInfo(title=rt)
+        except Exception:
+            pass
+        file_names = []
+        if self._rss_fname_identify:
+            try:
+                file_names = self._rss_fnames(item.get("enclosure", "") or item.get("link", ""))
+            except Exception:
+                file_names = []
+
+        try:
+            reply = self._rss_ai_ask(self._rss_ai_prompt(rt, reason, base_meta, cached_seasons, file_names))
+        except Exception as exc:
+            self._rss_log("智能助手调用失败", rt, str(exc))
+            if key:
+                self._rss_ai_failed[key] = "调用失败"
+            return None, None, ""
+        guess = self._rss_ai_parse_json(reply)
+        if not guess:
+            self._rss_log("智能助手回复无效", rt, (reply or "")[:200])
+            if key:
+                self._rss_ai_failed[key] = "回复无法解析"
+            return None, None, ""
+
+        title = str(guess.get("title") or "").strip()
+        tmdb_id = self._rss_ai_int(guess.get("tmdb_id"))
+        is_tv = str(guess.get("media_type") or "tv").lower() != "movie"
+        season = self._rss_ai_int(guess.get("season")) if is_tv else None
+        episode = self._rss_ai_int(guess.get("episode")) if is_tv else None
+        if is_tv and season is None:
+            season = 1
+        self._rss_log("智能助手结果", rt,
+                      f"《{title}》 TMDB={tmdb_id or '无'} "
+                      f"{'S%02d' % season if season is not None else ''}"
+                      f"{'E%02d' % episode if episode is not None else ''} "
+                      f"依据={str(guess.get('reason') or '')[:80]}")
+        if not title and not tmdb_id:
+            self._rss_log("智能助手识别失败", rt, "未给出标题与 TMDB ID")
+            if key:
+                self._rss_ai_failed[key] = "结果不完整"
+            return None, None, ""
+        if is_tv and episode is None:
+            self._rss_log("智能助手识别失败", rt, "电视剧未给出集号")
+            if key:
+                self._rss_ai_failed[key] = "缺少集号"
+            return None, None, ""
+        if cached_seasons and is_tv and season is not None and int(season) not in cached_seasons:
+            cached_text = "、".join(f"S{s:02d}" for s in cached_seasons)
+            self._rss_log("智能助手结果不采用", rt,
+                          f"S{int(season):02d} 仍与播放缓存季（{cached_text}）不一致")
+            if key:
+                self._rss_ai_failed[key] = "季号仍不一致"
+            return None, None, ""
+
+        # 生成并校验自定义识别词：优先用智能助手给出的，无效时自造窄匹配规则
+        word_saved = ""
+        if self._rss_ai_add_words:
+            candidates = [str(guess.get("word") or "").strip(),
+                          self._rss_ai_build_word(rt, title, season, episode, tmdb_id, is_tv)]
+            for cand in candidates:
+                if not cand:
+                    continue
+                if self._rss_ai_word_verify(cand, rt, season, episode, tmdb_id, is_tv):
+                    if self._rss_ai_save_word(cand):
+                        word_saved = cand
+                    break
+
+        # 识别词生效后重新解析原始标题；未写入识别词时直接用智能助手给出的季集
+        meta = None
+        if word_saved:
+            try:
+                meta = MetaInfo(title=rt)
+                self._rss_log_meta("识别词生效后重解析", rt, meta)
+            except Exception:
+                meta = None
+        if meta is None:
+            try:
+                meta = MetaInfo(title=rt)
+            except Exception:
+                self._rss_log("智能助手识别失败", rt, "标题解析异常")
+                if key:
+                    self._rss_ai_failed[key] = "标题解析异常"
+                return None, None, ""
+        if is_tv:
+            if getattr(meta, "begin_season", None) is None or int(meta.begin_season) != int(season):
+                meta.begin_season = int(season)
+            if getattr(meta, "begin_episode", None) is None or int(meta.begin_episode) != int(episode):
+                meta.begin_episode = int(episode)
+            if not getattr(meta, "episode_list", None):
+                meta.episode_list = [int(episode)]
+
+        media = self._rss_ai_recognize_media(meta, guess)
+        if not media or not getattr(media, "tmdb_id", None):
+            self._rss_log("智能助手识别失败", rt, "TMDB 未查到对应媒体")
+            if key:
+                self._rss_ai_failed[key] = "TMDB 查询失败"
+            return None, None, ""
+        # TMDB 详情查询可能重置季集（按 ID 查询会重建 meta 的季信息），这里再兜一次
+        if is_tv:
+            if getattr(meta, "begin_episode", None) is None:
+                meta.begin_episode = int(episode)
+            if getattr(meta, "begin_season", None) is None:
+                meta.begin_season = int(season)
+        self._drop_api_negative_cache_by_title(rt)
+        try:
+            self._save_api_success_cache(self._api_recognize_cache_key(meta), getattr(meta, "name", "") or title, media)
+        except Exception:
+            pass
+        se_text = f"S{int(meta.begin_season or 1):02d}E{int(meta.begin_episode):02d}" if is_tv else "电影"
+        self._rss_log("智能助手识别成功", media.title,
+                      f"TMDB={media.tmdb_id} {se_text}"
+                      + (f"，已写入识别词：{word_saved}" if word_saved else "，未写入识别词"))
+        if self._rss_ntf:
+            self.post_message(
+                title="SC-RSS 智能助手识别成功",
+                text=f"资源: {rt}\n识别: {media.title} {se_text}\nTMDB: {media.tmdb_id}\n"
+                     + (f"已添加识别词: {word_saved}" if word_saved else "未添加识别词（校验未通过）")
+            )
+        return media, meta, rt
 
     def _rss_id(self, item: dict, rt: str, filename_only: bool = False):
         """洗版模式：优先识别 RSS 报文，必要时用种子文件名回退识别。
