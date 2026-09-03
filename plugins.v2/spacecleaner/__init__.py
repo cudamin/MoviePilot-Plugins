@@ -49,7 +49,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理器"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "4.11.0"
+    plugin_version = "5.0.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -68,11 +68,7 @@ class SpaceCleaner(_PluginBase):
     _delete_other_versions = True  # 删种时检索整理记录，删除同一集/同一部电影的其他版本
     _delete_by_record = False  # 按媒体整理记录删除：优先删除整理记录中最早入库的已看资源
     _notify = True
-    _pb_page = 1
-    _pb_sort_by = "time"  # 播放缓存排序：time / title / status
-    _pb_sort_desc = True  # 播放缓存排序方向：True 降序 / False 升序
-    _pb_filter_watched = True  # 播放缓存默认只显示已看完
-    _pb_search = ""  # 播放缓存搜索关键字
+    _pb_filter_watched = True  # 播放缓存默认筛选（详情页首次打开时生效，之后跟随页面视图状态）
     _watched_threshold = 85  # 标记已看播放进度阈值（%）
     _clean_downloader = []  # 空间清理扫描的下载器，空列表扫描全部
 
@@ -116,6 +112,7 @@ class SpaceCleaner(_PluginBase):
     _unit_delete_interval = 1.0
     _pb: List[dict] = []
     _pb_lock = threading.Lock()
+    _HISTORY_MAX = 50  # 删除记录保留条数（只记录真实删除/失败，不记录试运行）
     _rss_s: Optional[BackgroundScheduler] = None
     _rss_busy = False
     # 去重容器用 dict 充当「有序集合」：保留插入顺序，裁剪时才能真正丢弃最早记录
@@ -158,11 +155,7 @@ class SpaceCleaner(_PluginBase):
         self._delete_by_target = self._dry_run = self._notify = False
         self._delete_other_versions = True
         self._delete_by_record = False
-        self._pb_page = 1
-        self._pb_sort_by = "time"
-        self._pb_sort_desc = True
         self._pb_filter_watched = True
-        self._pb_search = ""
         self._watched_threshold = 85
         self._delete_count = 1
         self._check_cron = "0 */6 * * *"
@@ -181,6 +174,8 @@ class SpaceCleaner(_PluginBase):
         self._rss_save_path = ""
         self._pb = self._latest_episode_records(list(self.get_data("pb") or []))
         self.save_data("pb", self._pb)
+        # 删除记录只保留真实删除/失败结果，历史遗留的试运行条目在这里一次性清掉
+        self._migrate_delete_history()
         self._rss_seen = {}
         self._rss_washed = {}
         self._api_recognize_cache = self._load_api_recognize_cache()
@@ -209,12 +204,8 @@ class SpaceCleaner(_PluginBase):
         self._delete_other_versions = bool(config.get("delete_other_versions", True))
         self._delete_by_record = bool(config.get("delete_by_record"))
         self._notify = bool(config.get("notify", True))
-        # 播放缓存视图状态不持久化：每次加载插件默认按时间从近到远排序，并清空搜索
-        self._pb_page = 1
-        self._pb_sort_by = "time"
-        self._pb_sort_desc = True  # 时间降序（从近到远）
+        # 详情页视图状态（页签/分页/排序/筛选/搜索）持久化在插件数据 pb_view_state 中，这里只取默认筛选
         self._pb_filter_watched = bool(config.get("pb_filter_watched", True))
-        self._pb_search = ""
         self._watched_threshold = self._to_int(config.get("watched_threshold"), 85, 1, 100)
         raw = config.get("clean_downloader") or []
         if isinstance(raw, list):
@@ -410,120 +401,175 @@ class SpaceCleaner(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
+            # ---- 对外接口 ----
             {"path": "/dry_run", "endpoint": self.api_dry_run, "methods": ["GET"], "summary": "试运行"},
             {"path": "/run_now", "endpoint": self.api_run_now, "methods": ["GET"], "summary": "立即清理"},
             {"path": "/delete_history", "endpoint": self.api_delete_history, "methods": ["GET"], "summary": "删除历史"},
             {"path": "/space_info", "endpoint": self.api_space_info, "methods": ["GET"], "summary": "空间信息"},
-            {"path": "/del_pb_item", "endpoint": self.del_pb_item, "methods": ["GET"], "summary": "删除单条播放缓存"},
-            {"path": "/clear_pb", "endpoint": self.clear_pb, "methods": ["GET"], "summary": "清除所有播放缓存"},
+            # ---- 详情页视图 ----
+            {"path": "/refresh", "endpoint": self.page_refresh, "methods": ["GET"], "summary": "刷新详情页数据"},
+            {"path": "/dt_tab", "endpoint": self.set_data_tab, "methods": ["GET"], "summary": "切换详情页页签"},
+            {"path": "/notice_clear", "endpoint": self.clear_notice, "methods": ["GET"], "summary": "关闭详情页提示"},
+            # ---- 播放缓存 ----
             {"path": "/pb_page", "endpoint": self.set_pb_page, "methods": ["GET"], "summary": "设置播放缓存页码"},
+            {"path": "/pb_size", "endpoint": self.set_pb_size, "methods": ["GET"], "summary": "设置播放缓存每页条数"},
             {"path": "/pb_sort", "endpoint": self.set_pb_sort, "methods": ["GET"], "summary": "设置播放缓存排序"},
+            {"path": "/pb_filter", "endpoint": self.set_pb_filter, "methods": ["GET"], "summary": "设置播放缓存筛选"},
             {"path": "/pb_filter_toggle", "endpoint": self.toggle_pb_filter, "methods": ["GET"], "summary": "切换已看完筛选"},
             {"path": "/pb_search", "endpoint": self.set_pb_search, "methods": ["GET"], "summary": "设置播放缓存搜索关键字"},
             {"path": "/pb_mark_watched", "endpoint": self.pb_mark_watched, "methods": ["GET"], "summary": "将单条播放记录标记为已看"},
             {"path": "/pb_mark_all_watched", "endpoint": self.pb_mark_all_watched, "methods": ["GET"], "summary": "将所有未看完记录标记为已看"},
             {"path": "/pb_toggle_prio", "endpoint": self.pb_toggle_prio, "methods": ["GET"], "summary": "切换播放记录优先删除标记"},
-            {"path": "/rss_ca", "endpoint": self.rss_ca, "methods": ["GET"], "summary": "清除RSS数据"},
+            {"path": "/del_pb_item", "endpoint": self.del_pb_item, "methods": ["GET"], "summary": "删除单条播放缓存"},
+            {"path": "/clear_pb", "endpoint": self.clear_pb, "methods": ["GET"], "summary": "清除所有播放缓存"},
+            # ---- 删除记录 ----
+            {"path": "/dh_filter", "endpoint": self.set_dh_filter, "methods": ["GET"], "summary": "设置删除记录筛选"},
+            {"path": "/dh_clear", "endpoint": self.clear_delete_history, "methods": ["GET"], "summary": "清空删除记录"},
+            # ---- 快捷操作 ----
+            {"path": "/quick_clean", "endpoint": self.quick_clean, "methods": ["GET"], "summary": "详情页立即清理"},
+            # ---- RSS ----
+            {"path": "/rss_run_once", "endpoint": self.rss_run_once, "methods": ["GET"], "summary": "立即刷新RSS"},
+            {"path": "/rss_ca", "endpoint": self.rss_ca, "methods": ["GET"], "summary": "清除RSS已处理报文"},
+            {"path": "/rss_wash_clear", "endpoint": self.rss_wash_clear, "methods": ["GET"], "summary": "清除洗版记录"},
+            # ---- 识别缓存 ----
+            {"path": "/cache_clear", "endpoint": self.cache_clear, "methods": ["GET"], "summary": "清空识别缓存"},
         ]
 
-    def rss_ca(self, apikey: str):
-        if apikey != settings.API_TOKEN:
-            return schemas.Response(success=False)
-        self.save_data("rss_seen", [])
-        self._rss_seen = {}
-        return schemas.Response(success=True)
+    # ---------- 详情页视图状态 ----------
 
-    def del_pb_item(self, k: str, apikey: str):
+    def page_refresh(self, apikey: str = ""):
+        """刷新详情页：丢弃内部缓存，由前端重新拉取页面数据。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        with self._pb_lock:
-            before = len(self._pb)
-            self._pb = [r for r in self._pb if r.get("k") != k]
-        if len(self._pb) != before:
-            self.save_data("pb", self._pb)
-            self._pb_cache = None
-            logger.info(f"SC 删除单条缓存: {k}")
-        return schemas.Response(success=True)
-
-    def clear_pb(self, apikey: str):
-        if apikey != settings.API_TOKEN:
-            return schemas.Response(success=False)
-        with self._pb_lock:
-            self._pb.clear()
-        self.save_data("pb", [])
         self._invalidate_caches()
-        logger.info("SC 播放缓存已清除")
         return schemas.Response(success=True)
 
-    def set_pb_page(self, page: int, apikey: str):
-        """设置并持久化播放缓存当前页码。"""
+    def set_data_tab(self, tab: str = "", apikey: str = ""):
+        """切换详情页页签。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        try:
-            self._pb_page = max(1, int(page or 1))
-        except (ValueError, TypeError):
-            self._pb_page = 1
-        self._save_pb_view_state()
+        if tab not in [t for t, _ in self._DATA_TABS]:
+            return schemas.Response(success=False, message="无效页签")
+        self._patch_view(tab=tab, arm=None)
         return schemas.Response(success=True)
 
-    def set_pb_sort(self, sort_by: str, apikey: str):
-        """设置并持久化播放缓存排序方式。"""
+    def clear_notice(self, apikey: str = ""):
+        """关闭详情页顶部提示，同时取消待确认的危险操作。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        if sort_by not in ("time", "title", "status"):
+        self._patch_view(notice=None, arm=None)
+        return schemas.Response(success=True)
+
+    def set_pb_page(self, page: int = 1, apikey: str = ""):
+        """设置播放缓存当前页码。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        self._patch_view(page=self._to_int(page, 1, 1))
+        return schemas.Response(success=True)
+
+    def set_pb_size(self, size: int = 20, apikey: str = ""):
+        """设置播放缓存每页条数。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        value = self._to_int(size, self._VIEW_DEFAULTS["size"])
+        if value not in self._PB_SIZES:
+            value = self._VIEW_DEFAULTS["size"]
+        self._patch_view(size=value, page=1)
+        return schemas.Response(success=True)
+
+    def set_pb_sort(self, sort_by: str = "time", apikey: str = ""):
+        """设置播放缓存排序字段；同字段再次点击切换升降序。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        if sort_by not in self._PB_SORTS:
             return schemas.Response(success=False, message="无效排序字段")
-        if self._pb_sort_by == sort_by:
-            # 同字段切换排序方向
-            self._pb_sort_desc = not self._pb_sort_desc
+        view = self._get_view()
+        if view["sort_by"] == sort_by:
+            self._patch_view(sort_desc=not view["sort_desc"], page=1)
         else:
-            self._pb_sort_by = sort_by
-            self._pb_sort_desc = True  # 默认降序
-        self._pb_page = 1
-        self._save_pb_view_state()
+            self._patch_view(sort_by=sort_by, sort_desc=True, page=1)
         return schemas.Response(success=True)
 
-    def _save_pb_view_state(self) -> None:
-        """持久化分页和排序状态，兼容 API 与页面渲染使用不同插件实例。"""
-        self.save_data("pb_view_state", {
-            "page": self._pb_page,
-            "sort_by": self._pb_sort_by,
-            "sort_desc": self._pb_sort_desc,
-        })
-
-    def _load_pb_view_state(self) -> None:
-        """读取分页和排序状态，确保操作后的页面刷新展示最新状态。"""
-        state = self.get_data("pb_view_state") or {}
-        try:
-            self._pb_page = max(1, int(state.get("page") or 1))
-        except (ValueError, TypeError):
-            self._pb_page = 1
-        sort_by = state.get("sort_by")
-        if sort_by in ("time", "title", "status"):
-            self._pb_sort_by = sort_by
-        if "sort_desc" in state:
-            self._pb_sort_desc = bool(state.get("sort_desc"))
-
-    def toggle_pb_filter(self, apikey: str):
-        """切换播放缓存已看完筛选。"""
+    def set_pb_filter(self, mode: str = "all", apikey: str = ""):
+        """设置播放缓存筛选：全部 / 已看完 / 未看完 / 优先删除。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        self._pb_filter_watched = not self._pb_filter_watched
-        self._pb_page = 1
-        self._update_config()
+        if mode not in [f for f, _ in self._PB_FILTERS]:
+            return schemas.Response(success=False, message="无效筛选条件")
+        self._patch_view(filter=mode, page=1)
+        return schemas.Response(success=True)
+
+    def toggle_pb_filter(self, apikey: str = ""):
+        """兼容旧入口：在「已看完」与「全部」之间切换。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        view = self._get_view()
+        self._patch_view(filter="all" if view["filter"] == "watched" else "watched", page=1)
         return schemas.Response(success=True)
 
     def set_pb_search(self, q: str = "", apikey: str = ""):
         """设置播放缓存搜索关键字（空串表示清除搜索）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        self._pb_search = (q or "").strip()
-        self._pb_page = 1
+        self._patch_view(search=(q or "").strip(), page=1)
         return schemas.Response(success=True)
 
-    def pb_mark_watched(self, k: str, apikey: str):
+    def set_dh_filter(self, mode: str = "all", apikey: str = ""):
+        """设置删除记录筛选：全部 / 已删除 / 失败。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        if mode not in [f for f, _ in self._HISTORY_FILTERS]:
+            return schemas.Response(success=False, message="无效筛选条件")
+        self._patch_view(dh_filter=mode)
+        return schemas.Response(success=True)
+
+    # ---------- 播放缓存操作 ----------
+
+    def _sync_pb_from_data(self) -> None:
+        """把内存播放缓存与插件数据对齐，避免不同插件实例互相覆盖。"""
+        stored = self.get_data("pb")
+        if not isinstance(stored, list):
+            return
+        with self._pb_lock:
+            if stored != self._pb:
+                self._pb = stored
+                self._pb_cache = None
+
+    def del_pb_item(self, k: str, apikey: str = ""):
+        """删除单条播放缓存记录（不动媒体库文件）。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        self._sync_pb_from_data()
+        with self._pb_lock:
+            before = len(self._pb)
+            self._pb = [r for r in self._pb if r.get("k") != k]
+            changed = len(self._pb) != before
+            snapshot = list(self._pb)
+        if changed:
+            self.save_data("pb", snapshot)
+            self._pb_cache = None
+            logger.info(f"SC 删除单条缓存: {k}")
+        return schemas.Response(success=True)
+
+    def clear_pb(self, confirm: Any = None, apikey: str = ""):
+        """清除所有播放缓存（需二次确认）。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        if self._need_confirm("clear_pb", confirm, "再次点击「确认清空缓存」将清除全部播放缓存"):
+            return schemas.Response(success=True, message="等待确认")
+        with self._pb_lock:
+            self._pb = []
+        self.save_data("pb", [])
+        self._invalidate_caches()
+        self._set_notice("已清除全部播放缓存", "success")
+        logger.info("SC 播放缓存已清除")
+        return schemas.Response(success=True)
+
+    def pb_mark_watched(self, k: str, apikey: str = ""):
         """将单条未看完的播放记录标记为已看（进度置为100%）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._sync_pb_from_data()
         marked = False
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._pb_lock:
@@ -533,16 +579,18 @@ class SpaceCleaner(_PluginBase):
                     r["t"] = ts
                     marked = True
                     break
+            snapshot = list(self._pb)
         if marked:
-            self.save_data("pb", self._pb)
+            self.save_data("pb", snapshot)
             self._pb_cache = None
             logger.info(f"SC 标记已看: {k}")
         return schemas.Response(success=True)
 
-    def pb_toggle_prio(self, k: str, apikey: str):
+    def pb_toggle_prio(self, k: str, apikey: str = ""):
         """切换单条播放记录的优先删除标记。被标记的资源在空间清理时优先删除。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._sync_pb_from_data()
         new_state = None
         with self._pb_lock:
             for r in self._pb:
@@ -550,16 +598,18 @@ class SpaceCleaner(_PluginBase):
                     new_state = not bool(r.get("prio"))
                     r["prio"] = new_state
                     break
+            snapshot = list(self._pb)
         if new_state is not None:
-            self.save_data("pb", self._pb)
+            self.save_data("pb", snapshot)
             self._pb_cache = None
             logger.info(f"SC 优先删除标记 {'开启' if new_state else '取消'}: {k}")
         return schemas.Response(success=True)
 
-    def pb_mark_all_watched(self, apikey: str):
+    def pb_mark_all_watched(self, apikey: str = ""):
         """将所有未看完的播放记录批量标记为已看（进度置为100%）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
+        self._sync_pb_from_data()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cnt = 0
         with self._pb_lock:
@@ -568,10 +618,103 @@ class SpaceCleaner(_PluginBase):
                     r["p"] = 100.0
                     r["t"] = ts
                     cnt += 1
+            snapshot = list(self._pb)
         if cnt:
-            self.save_data("pb", self._pb)
+            self.save_data("pb", snapshot)
             self._pb_cache = None
+        self._set_notice(f"已把 {cnt} 条未看完记录标记为已看", "success" if cnt else "info")
         logger.info(f"SC 批量标记已看 {cnt} 条")
+        return schemas.Response(success=True)
+
+    # ---------- 删除记录 / 快捷操作 ----------
+
+    def clear_delete_history(self, confirm: Any = None, apikey: str = ""):
+        """清空删除记录（需二次确认，只删记录不影响已删除的文件）。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        if self._need_confirm("clear_history", confirm, "再次点击「确认清空记录」将清空全部删除记录"):
+            return schemas.Response(success=True, message="等待确认")
+        self.save_data("delete_history", [])
+        self._set_notice("已清空删除记录", "success")
+        return schemas.Response(success=True)
+
+    def quick_clean(self, confirm: Any = None, apikey: str = ""):
+        """详情页立即清理：需二次确认，后台线程执行，避免阻塞请求。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        if self._need_confirm("clean", confirm,
+                              "再次点击「确认立即清理」将按当前策略删除已看资源（含种子与媒体库文件）"):
+            return schemas.Response(success=True, message="等待确认")
+        with self._run_lock:
+            busy = self._running
+        if busy:
+            self._set_notice("清理任务正在运行中，稍后刷新查看结果", "warning")
+            return schemas.Response(success=True)
+        threading.Thread(target=self._run_now_task, daemon=True, name="SC-PageClean").start()
+        self._set_notice("已触发清理任务，稍后点击「刷新数据」查看删除记录", "success")
+        return schemas.Response(success=True)
+
+    # ---------- RSS 操作 ----------
+
+    def rss_run_once(self, apikey: str = ""):
+        """立即刷新一次 RSS。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        if not (self._rss_on and self._rss_urls):
+            self._set_notice("RSS 未启用或未配置链接", "warning")
+            return schemas.Response(success=True)
+        with self._run_lock:
+            busy = self._rss_busy
+        if busy:
+            self._set_notice("上一轮 RSS 刷新仍在进行，稍后再试", "warning")
+            return schemas.Response(success=True)
+        threading.Thread(target=self._rss_run, daemon=True, name="SC-PageRss").start()
+        self._set_notice("已触发 RSS 刷新，稍后点击「刷新数据」查看结果", "success")
+        return schemas.Response(success=True)
+
+    def rss_ca(self, confirm: Any = None, apikey: str = ""):
+        """清除 RSS 已处理报文记录（需二次确认，清除后同一批报文会被重新处理）。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        if self._need_confirm("clear_seen", confirm,
+                              "再次点击「确认清除已处理报文」将清空 RSS 去重记录，旧报文可能被重新下载"):
+            return schemas.Response(success=True, message="等待确认")
+        self.save_data("rss_seen", [])
+        with self._rss_lk:
+            self._rss_seen = {}
+        self._set_notice("已清除 RSS 已处理报文记录", "success")
+        return schemas.Response(success=True)
+
+    def rss_wash_clear(self, confirm: Any = None, apikey: str = ""):
+        """清除洗版记录（需二次确认，清除后同一集会被重新洗版下载）。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        if self._need_confirm("clear_washed", confirm,
+                              "再次点击「确认清除洗版记录」后，已洗版的剧集会被重新下载"):
+            return schemas.Response(success=True, message="等待确认")
+        self.save_data("rss_washed", [])
+        with self._rss_lk:
+            self._rss_washed = {}
+        self._set_notice("已清除洗版记录", "success")
+        return schemas.Response(success=True)
+
+    def cache_clear(self, kind: str = "all", apikey: str = ""):
+        """清空识别缓存：success 正缓存 / negative 负缓存 / all 全部。"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        kind = (kind or "all").strip().lower()
+        labels = {"success": "识别成功缓存", "negative": "识别失败缓存", "all": "识别缓存"}
+        if kind not in labels:
+            return schemas.Response(success=False, message="无效缓存类型")
+        with self._api_recognize_cache_lock:
+            if kind in ("success", "all"):
+                self._api_recognize_success_cache = []
+                self.save_data("api_recognize_success_cache", [])
+            if kind in ("negative", "all"):
+                self._api_recognize_cache = []
+                self.save_data("api_recognize_cache", [])
+        self._set_notice(f"已清空{labels[kind]}", "success")
+        logger.info(f"SC 已清空{labels[kind]}")
         return schemas.Response(success=True)
 
     @staticmethod
@@ -741,234 +884,719 @@ class SpaceCleaner(_PluginBase):
             "rss_proxy_retry": False, "rss_save_path": "",
         }
 
-    # ==================== 详情页（三区块平铺） ====================
+    # ==================== 详情页 ====================
+
+    _DATA_TABS = (("pb", "播放缓存"), ("history", "删除记录"), ("rss", "RSS 记录"), ("cache", "识别缓存"))
+    _PB_SIZES = (10, 20, 50)
+    _PB_FILTERS = (("all", "全部"), ("watched", "已看完"), ("unwatched", "未看完"), ("prio", "优先"))
+    _PB_SORTS = ("time", "title", "progress", "status")
+    _HISTORY_FILTERS = (("all", "全部"), ("deleted", "已删除"), ("failed", "失败"))
+    _TABLE_HEIGHT = "26rem"
+    _ARM_TTL = 60  # 危险操作二次确认有效期（秒）
+    _VIEW_DEFAULTS = {
+        "tab": "pb",
+        "page": 1,
+        "size": 20,
+        "sort_by": "time",
+        "sort_desc": True,
+        "filter": "",
+        "search": "",
+        "dh_filter": "all",
+        "notice": None,
+        "arm": None,
+    }
+
+    # ---------- 视图状态 ----------
+
+    def _get_view(self) -> dict:
+        """读取详情页视图状态。API 与页面渲染可能落在不同插件实例，状态一律存插件数据。"""
+        raw = self.get_data("pb_view_state") or {}
+        view = dict(self._VIEW_DEFAULTS)
+        if isinstance(raw, dict):
+            for key in view:
+                if key in raw:
+                    view[key] = raw[key]
+        if view.get("tab") not in [t for t, _ in self._DATA_TABS]:
+            view["tab"] = self._DATA_TABS[0][0]
+        view["page"] = self._to_int(view.get("page"), 1, 1)
+        view["size"] = view["size"] if view.get("size") in self._PB_SIZES else self._VIEW_DEFAULTS["size"]
+        if view.get("sort_by") not in self._PB_SORTS:
+            view["sort_by"] = "time"
+        view["sort_desc"] = bool(view.get("sort_desc", True))
+        if view.get("filter") not in [f for f, _ in self._PB_FILTERS]:
+            # 从未手动切换过筛选时沿用配置里的默认值
+            view["filter"] = "watched" if self._pb_filter_watched else "all"
+        if view.get("dh_filter") not in [f for f, _ in self._HISTORY_FILTERS]:
+            view["dh_filter"] = "all"
+        view["search"] = str(view.get("search") or "").strip()
+        return view
+
+    def _patch_view(self, **kwargs) -> dict:
+        """更新并持久化详情页视图状态。"""
+        view = self._get_view()
+        view.update(kwargs)
+        self.save_data("pb_view_state", view)
+        return view
+
+    def _set_notice(self, text: str, level: str = "info") -> None:
+        """在详情页顶部显示一条操作结果提示。"""
+        self._patch_view(notice={"type": level, "text": text,
+                                 "time": datetime.now().strftime("%H:%M:%S")})
+
+    def _arm_pending(self, view: dict, action: str) -> bool:
+        """该危险操作是否处于「等待二次确认」状态。"""
+        arm = view.get("arm")
+        if not isinstance(arm, dict) or arm.get("action") != action:
+            return False
+        try:
+            return (time.time() - float(arm.get("ts") or 0)) <= self._ARM_TTL
+        except (TypeError, ValueError):
+            return False
+
+    def _need_confirm(self, action: str, confirm: Any, text: str) -> bool:
+        """危险操作二次确认：返回 True 表示本次只置位待确认状态，不执行动作。"""
+        if str(confirm or "") == "1":
+            self._patch_view(arm=None)
+            return False
+        self._patch_view(arm={"action": action, "ts": time.time()},
+                         notice={"type": "warning", "text": f"{text}（{self._ARM_TTL} 秒内有效）",
+                                 "time": datetime.now().strftime("%H:%M:%S")})
+        return True
+
+    # ---------- 渲染小工具 ----------
+
+    def _page_api(self, path: str, **params) -> dict:
+        """构造详情页点击事件；前端调用插件 API 后会自动重新拉取页面数据。"""
+        query = {k: v for k, v in params.items() if v is not None}
+        query["apikey"] = settings.API_TOKEN
+        return {"click": {"api": f"plugin/{self.__class__.__name__}/{path}", "method": "get", "params": query}}
+
+    @staticmethod
+    def _fmt_gb(size_gb: Any) -> str:
+        """按体积自动选择 GB / TB 单位。"""
+        try:
+            value = float(size_gb)
+        except (TypeError, ValueError):
+            return "-"
+        return f"{value / 1024:.2f} TB" if value >= 1024 else f"{value:.1f} GB"
+
+    @staticmethod
+    def _next_run_text(cron: str) -> str:
+        """按 cron 表达式计算下一次执行时间，供详情页显示。"""
+        cron = (cron or "").strip()
+        if not cron:
+            return "未设置"
+        try:
+            trigger = CronTrigger.from_crontab(cron, timezone=settings.TZ)
+            nxt = trigger.get_next_fire_time(None, datetime.now(trigger.timezone))
+            return nxt.strftime("%m-%d %H:%M") if nxt else "未知"
+        except Exception:
+            return "表达式无效"
+
+    @staticmethod
+    def _chip(text: str, color: str = "default", icon: Optional[str] = None, variant: str = "tonal") -> dict:
+        props = {"size": "small", "variant": variant, "color": color}
+        if icon:
+            props["prepend-icon"] = icon
+        return {"component": "VChip", "props": props, "text": text}
+
+    def _btn(self, text: str, path: str, color: str = "default", icon: Optional[str] = None,
+             variant: str = "tonal", disabled: bool = False, **params) -> dict:
+        props = {"size": "small", "variant": variant, "color": color, "class": "text-none"}
+        if icon:
+            props["prepend-icon"] = icon
+        if disabled:
+            props["disabled"] = True
+        return {"component": "VBtn", "props": props, "text": text, "events": self._page_api(path, **params)}
+
+    def _danger_btn(self, view: dict, action: str, path: str, text: str, icon: str) -> dict:
+        """危险操作按钮：首次点击进入待确认状态，再次点击才真正执行。"""
+        if self._arm_pending(view, action):
+            return {"component": "VBtn",
+                    "props": {"size": "small", "variant": "flat", "color": "error",
+                              "prepend-icon": "mdi-alert-circle", "class": "text-none"},
+                    "text": f"确认{text}", "events": self._page_api(path, confirm=1)}
+        return {"component": "VBtn",
+                "props": {"size": "small", "variant": "tonal", "color": "error",
+                          "prepend-icon": icon, "class": "text-none"},
+                "text": text, "events": self._page_api(path)}
+
+    # 图标按钮：详情页渲染器总会给组件传入默认插槽，Vuetify 的 VBtn 只在「没有默认插槽」
+    # 时才渲染 icon 属性，独立 VIcon 节点也会把插槽里的空文本当成图标名，两者都会渲染成空白。
+    # 唯一可靠的方式是用 VBtn 自己生成的 prepend-icon（内部 VIcon 不带插槽），
+    # 再用内联样式压掉 min-width/padding，避免图标按钮撑开表格列。
+    _ICON_BTN_STYLE = "min-width: 0; padding: 0 5px;"
+
+    def _icon_btn(self, icon: str, title: str, path: str, color: str = "default",
+                  disabled: bool = False, **params) -> dict:
+        props = {"size": "small", "variant": "text", "color": color, "title": title,
+                 "prepend-icon": icon, "class": "text-none", "style": self._ICON_BTN_STYLE}
+        if disabled:
+            props["disabled"] = True
+        return {"component": "VBtn", "props": props, "events": self._page_api(path, **params)}
+
+    def _icon_link(self, icon: str, title: str, href: str) -> dict:
+        """图标外链按钮（新窗口打开，不触发插件 API）。"""
+        return {"component": "VBtn",
+                "props": {"size": "small", "variant": "text", "title": title, "prepend-icon": icon,
+                          "class": "text-none", "style": self._ICON_BTN_STYLE,
+                          "href": href, "target": "_blank"}}
+
+    @staticmethod
+    def _caption(text: str, cls: str = "") -> dict:
+        return {"component": "div", "props": {"class": ("text-caption text-medium-emphasis " + cls).strip()},
+                "text": text}
+
+    @staticmethod
+    def _tile(label: str, value: str, sub: str = "", color: str = "") -> dict:
+        """概览小卡片。"""
+        value_cls = "text-subtitle-1 font-weight-bold"
+        if color:
+            value_cls += f" text-{color}"
+        content = [{"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": label},
+                   {"component": "div", "props": {"class": value_cls}, "text": value}]
+        if sub:
+            content.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": sub})
+        return {"component": "VCol", "props": {"cols": 6, "md": 3},
+                "content": [{"component": "VCard", "props": {"variant": "tonal", "class": "pa-2 h-100"},
+                             "content": content}]}
+
+    def _table(self, headers: List[dict], items: List[dict], empty: str) -> dict:
+        """只读表格。
+
+        详情页渲染器总会传入默认插槽，VDataTable 的表体会被这个空插槽顶掉，
+        因此这里统一用 VDataTableVirtual（内部走 wrapper 插槽），并保留表头排序。
+        """
+        props = {"headers": headers, "items": items, "density": "compact", "fixed-header": True,
+                 "hover": True, "class": "text-body-2", "no-data-text": empty}
+        if len(items) > 10:
+            props["height"] = self._TABLE_HEIGHT
+        return {"component": "VDataTableVirtual", "props": props}
+
+    # ---------- 数据源 ----------
+
+    def _page_pb_items(self) -> List[dict]:
+        """详情页播放缓存数据源：以插件数据为准，避免渲染到过期的内存副本。"""
+        stored = self.get_data("pb")
+        raw = stored if isinstance(stored, list) else self._get_playback_pb()
+        items = []
+        for record in raw or []:
+            if not isinstance(record, dict):
+                continue
+            try:
+                progress = float(record.get("p", 0) or 0)
+            except (TypeError, ValueError):
+                progress = 0.0
+            season = self._to_int(record.get("s"), 0, 0)
+            episode = self._to_int(record.get("e"), 0, 0)
+            name = self._normalize_cached_name(str(record.get("n") or ""), season, episode)
+            title = re.sub(r"\s+S\d{2}E\d{2}\s*.*$", "", name).strip() or name
+            key = str(record.get("k") or "")
+            tmdb_id = key.split(":")[0] if ":" in key else ""
+            is_episode = season > 0 and episode > 0
+            items.append({
+                "k": key,
+                "title": title,
+                "se": f"S{season:02d}E{episode:02d}" if is_episode else "电影",
+                "is_movie": not is_episode,
+                "tmdb_id": tmdb_id if tmdb_id.isdigit() else "",
+                "progress": progress,
+                "watched": progress >= self._watched_threshold,
+                "time": str(record.get("t") or ""),
+                "prio": bool(record.get("prio")),
+            })
+        return items
+
+    def _page_history_items(self) -> List[dict]:
+        """删除记录，最新的排在前面。"""
+        items = []
+        for record in self._get_delete_history() or []:
+            if not isinstance(record, dict):
+                continue
+            items.append({"time": str(record.get("time") or ""),
+                          "title": str(record.get("title") or ""),
+                          "action": str(record.get("action") or "")})
+        items.reverse()
+        return items
+
+    @staticmethod
+    def _page_titles(pb_items: List[dict], success_cache: List[dict]) -> Dict[str, str]:
+        """tmdbid -> 标题，用于把洗版记录里的纯 ID 显示成可读标题。"""
+        titles: Dict[str, str] = {}
+        for item in success_cache or []:
+            tmdb_id = str(item.get("tmdb_id") or "")
+            title = str(item.get("title") or "").strip()
+            if tmdb_id and title:
+                titles[tmdb_id] = title
+        for item in pb_items or []:
+            if item.get("tmdb_id") and item.get("title"):
+                titles.setdefault(item["tmdb_id"], item["title"])
+        return titles
+
+    def _page_washed_items(self, titles: Dict[str, str]) -> List[dict]:
+        """洗版记录，最新的排在前面。"""
+        items = []
+        for key in reversed(list(self.get_data("rss_washed") or [])):
+            raw = str(key or "")
+            if not raw:
+                continue
+            tmdb_id, _, se = raw.partition(":")
+            items.append({"title": titles.get(tmdb_id) or f"TMDB {tmdb_id}",
+                          "se": "电影" if se.upper() == "M" else (se or "-"),
+                          "tmdb": tmdb_id})
+        return items
+
+    # ---------- 页面 ----------
 
     def get_page(self) -> Optional[List[dict]]:
-        # API 操作与页面渲染可能落到不同插件实例，渲染前从插件数据恢复视图状态。
-        self._load_pb_view_state()
-        space_info = self._get_space_info()
-        pb = self._get_playback_pb()
+        view = self._get_view()
+        pb_items = self._page_pb_items()
+        history = self._page_history_items()
+        success_cache = self._load_api_recognize_success_cache()
+        negative_cache = self._load_api_recognize_cache()
+        washed = self._page_washed_items(self._page_titles(pb_items, success_cache))
+        seen_count = len(self.get_data("rss_seen") or [])
+        counts = {"pb": len(pb_items), "history": len(history), "rss": len(washed),
+                  "cache": len(success_cache) + len(negative_cache)}
+
+        if view["tab"] == "history":
+            body = self._page_tab_history(view, history)
+        elif view["tab"] == "rss":
+            body = self._page_tab_rss(view, washed, seen_count)
+        elif view["tab"] == "cache":
+            body = self._page_tab_cache(view, success_cache, negative_cache)
+        else:
+            body = self._page_tab_pb(view, pb_items)
+
         cards = []
+        notice = self._page_notice(view)
+        if notice:
+            cards.append(notice)
+        cards.append(self._page_overview(view))
+        cards.append({"component": "VCard", "props": {"variant": "flat", "class": "mt-2"},
+                      "content": [self._page_tabs(view, counts),
+                                  {"component": "VDivider"},
+                                  {"component": "VCardText", "props": {"class": "pa-0"}, "content": body}]})
+        return cards
 
-        # 使用提示（紧凑模式）
-        cards.append({
-            "component": "VAlert",
-            "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mb-2"},
-            "text": "使用前需配置Webhooks，详见 https://github.com/cudamin/MoviePilot-Plugins",
-        })
+    def _page_notice(self, view: dict) -> Optional[dict]:
+        """顶部操作结果提示。"""
+        notice = view.get("notice")
+        if not isinstance(notice, dict) or not notice.get("text"):
+            return None
+        level = notice.get("type") if notice.get("type") in ("success", "info", "warning", "error") else "info"
+        stamp = str(notice.get("time") or "")
+        return {"component": "VAlert",
+                "props": {"type": level, "variant": "tonal", "density": "compact", "class": "mb-2"},
+                "content": [{"component": "div",
+                             "props": {"class": "d-flex align-center justify-space-between ga-2"},
+                             "content": [
+                                 {"component": "div",
+                                  "props": {"class": "text-body-2", "style": "white-space: pre-wrap;"},
+                                  "text": f"{stamp} {notice.get('text')}".strip()},
+                                 {"component": "VBtn",
+                                  "props": {"variant": "text", "size": "x-small", "class": "text-none"},
+                                  "text": "关闭", "events": self._page_api("notice_clear")},
+                             ]}]}
 
-        # 区块1：磁盘空间
-        if space_info:
-            total_gb = space_info["total_gb"]
-            free_gb = space_info["free_gb"]
-            used_gb = space_info["used_gb"]
-            free_pct = space_info["free_percent"]
-            bar_color = "error" if free_pct < self._min_free_percent else "warning" if free_pct < self._target_free_percent else "success"
-            cards.append({
-                "component": "VCard", "props": {"variant": "flat"},
-                "content": [
-                    {"component": "VCardTitle", "props": {"class": "d-flex align-center justify-space-between pa-3"}, "content": [
-                        {"component": "div", "content": [
-                            {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"}, "text": "磁盘空间"},
-                            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"剩余 {free_gb:.1f} GB / 总计 {total_gb:.1f} GB"},
-                        ]},
-                        {"component": "VChip", "props": {"color": bar_color, "variant": "tonal", "size": "small"}, "text": f"剩余 {free_pct:.1f}%"},
-                    ]},
-                    {"component": "VCardText", "props": {"class": "pt-0"}, "content": [
-                        {"component": "VProgressLinear", "props": {"modelValue": 100 - free_pct, "color": bar_color, "height": 12, "rounded": True, "class": "mb-4"}},
-                        {"component": "VRow", "props": {"class": "ga-0"}, "content": [
-                            {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 h-100"}, "content": [
-                                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": "总空间"},
-                                {"component": "div", "props": {"class": "text-h6 font-weight-bold"}, "text": f"{total_gb:.1f}"},
-                                {"component": "div", "props": {"class": "text-caption"}, "text": "GB"},
-                            ]}]},
-                            {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 h-100"}, "content": [
-                                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": "已用空间"},
-                                {"component": "div", "props": {"class": "text-h6 font-weight-bold"}, "text": f"{used_gb:.1f}"},
-                                {"component": "div", "props": {"class": "text-caption"}, "text": "GB"},
-                            ]}]},
-                            {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 h-100"}, "content": [
-                                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": "剩余空间"},
-                                {"component": "div", "props": {"class": "text-h6 font-weight-bold text-success"}, "text": f"{free_gb:.1f}"},
-                                {"component": "div", "props": {"class": "text-caption"}, "text": "GB"},
-                            ]}]},
-                            {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 h-100"}, "content": [
-                                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": "剩余百分比"},
-                                {"component": "div", "props": {"class": "text-h6 font-weight-bold"}, "text": f"{free_pct:.1f}%"},
-                                {"component": "div", "props": {"class": "text-caption"}, "text": f"已用 {100-free_pct:.1f}%"},
-                            ]}]},
-                        ]},
-                    ]},
-                ],
-            })
-
-        # 区块3：播放记录 + 缓存管理
-        all_items = []
-        for r in pb:
-            progress = r.get("p", 0) or 0
-            watched = progress >= self._watched_threshold
-            sn, en = r.get("s", 0) or 0, r.get("e", 0) or 0
-            se_display = f"S{sn:02d}E{en:02d}" if sn > 0 and en > 0 else "电影"
-            name = self._normalize_cached_name(r.get("n", ""), sn, en)
-            title_clean = re.sub(r'\s+S\d{2}E\d{2}\s*.*$', '', name).strip() or name
-            all_items.append({
-                "k": r.get("k", ""),
-                "title": title_clean,
-                "se": se_display,
-                "progress": progress,
-                "watched": watched,
-                "time": r.get("t", ""),
-                "prio": bool(r.get("prio")),
-            })
-        # 默认筛选已看完
-        if self._pb_filter_watched:
-            filtered_items = [x for x in all_items if x.get("watched")]
+    def _page_overview(self, view: dict) -> dict:
+        """顶部概览：空间水位 + 运行状态 + 快捷操作。"""
+        content: List[dict] = []
+        space = self._get_space_info()
+        if space:
+            free_pct = space["free_percent"]
+            color = ("error" if free_pct < self._min_free_percent
+                     else "warning" if free_pct < self._target_free_percent else "success")
+            content.append({"component": "div",
+                            "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2 mb-2"},
+                            "content": [
+                                {"component": "div", "content": [
+                                    self._caption("磁盘剩余空间"),
+                                    {"component": "div", "props": {"class": "d-flex align-baseline ga-2"}, "content": [
+                                        {"component": "span", "props": {"class": "text-h5 font-weight-bold"},
+                                         "text": self._fmt_gb(space["free_gb"])},
+                                        self._caption(f"/ 总计 {self._fmt_gb(space['total_gb'])}"
+                                                      f" · 已用 {self._fmt_gb(space['used_gb'])}"),
+                                    ]},
+                                ]},
+                                {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2"}, "content": [
+                                    self._chip(f"剩余 {free_pct:.1f}%", color=color, variant="flat"),
+                                    self._chip(f"触发 {self._min_free_percent}%"),
+                                    self._chip(f"目标 {self._target_free_percent}%"),
+                                ]},
+                            ]})
+            content.append({"component": "VProgressLinear",
+                            "props": {"modelValue": max(0.0, min(100.0, 100 - free_pct)), "color": color,
+                                      "height": 10, "rounded": True, "class": "mb-3"}})
         else:
-            filtered_items = list(all_items)
-        # 搜索过滤（匹配标题 / 季集）
-        if self._pb_search:
-            qs = self._pb_search.lower()
-            filtered_items = [x for x in filtered_items
-                              if qs in (x.get("title", "") or "").lower()
-                              or qs in (x.get("se", "") or "").lower()]
-        # 排序
-        if self._pb_sort_by == "title":
-            filtered_items.sort(key=lambda x: x.get("title", ""), reverse=not self._pb_sort_desc)
-        elif self._pb_sort_by == "status":
-            filtered_items.sort(key=lambda x: (not x.get("watched"), x.get("title", "")), reverse=not self._pb_sort_desc)
-        else:  # time
-            filtered_items.sort(key=lambda x: x.get("time", ""), reverse=self._pb_sort_desc)
-        watched_count = sum(1 for r in all_items if r.get("watched"))
-        page_size = 10
-        total_pages = max(1, (len(filtered_items) + page_size - 1) // page_size)
-        page = min(max(1, self._pb_page), total_pages)
-        if page != self._pb_page:
-            self._pb_page = page
-            self._save_pb_view_state()
-        page_items = filtered_items[(page - 1) * page_size: page * page_size]
-        # 表头排序箭头
-        def sort_arrow(field):
-            if self._pb_sort_by == field:
-                return " ↓" if self._pb_sort_desc else " ↑"
-            return ""
-        table_rows = [
-            {"component": "div", "props": {"class": "d-flex align-center px-3 py-2 text-caption font-weight-bold bg-grey-lighten-4"}, "content": [
-                {"component": "VBtn", "props": {"variant": "text", "size": "x-small", "color": "default", "class": "px-1 font-weight-bold", "style": "flex: 1 1 auto; min-width: 0; justify-content: flex-start; text-transform: none; letter-spacing: 0; font-size: inherit;"}, "text": "标题" + sort_arrow("title"),
-                 "events": {"click": {"api": "plugin/SpaceCleaner/pb_sort", "method": "get", "params": {"sort_by": "title", "apikey": settings.API_TOKEN}}}},
-                {"component": "div", "props": {"style": "width: 92px;"}, "text": "季集"},
-                {"component": "div", "props": {"style": "width: 76px;"}, "text": "进度"},
-                {"component": "VBtn", "props": {"variant": "text", "size": "x-small", "color": "default", "class": "px-1 font-weight-bold", "style": "width: 76px; justify-content: flex-start; text-transform: none; letter-spacing: 0; font-size: inherit;"}, "text": "状态" + sort_arrow("status"),
-                 "events": {"click": {"api": "plugin/SpaceCleaner/pb_sort", "method": "get", "params": {"sort_by": "status", "apikey": settings.API_TOKEN}}}},
-                {"component": "VBtn", "props": {"variant": "text", "size": "x-small", "color": "default", "class": "px-1 font-weight-bold", "style": "width: 150px; justify-content: flex-start; text-transform: none; letter-spacing: 0; font-size: inherit;"}, "text": "时间" + sort_arrow("time"),
-                 "events": {"click": {"api": "plugin/SpaceCleaner/pb_sort", "method": "get", "params": {"sort_by": "time", "apikey": settings.API_TOKEN}}}},
-                {"component": "div", "props": {"style": "width: 200px;"}, "text": "操作"},
-            ]}
+            content.append({"component": "VAlert",
+                            "props": {"type": "warning", "variant": "tonal", "density": "compact", "class": "mb-3"},
+                            "text": "无法获取磁盘空间信息，请检查媒体库目录配置"})
+
+        clean_next = self._next_run_text(self._check_cron) if self._enabled else "已停用"
+        rss_next = self._next_run_text(self._rss_cron) if self._rss_on else "已停用"
+        status_chips = [
+            self._chip(f"清理 {'启用' if self._enabled else '停用'} · 下次 {clean_next}",
+                       color="success" if self._enabled else "default", icon="mdi-broom"),
+            self._chip(f"RSS {'启用' if self._rss_on else '停用'} · 下次 {rss_next}",
+                       color="primary" if self._rss_on else "default", icon="mdi-rss"),
+            self._chip(f"{'洗版模式' if self._rss_wash_mode else '普通模式'}"
+                       f"{' · 文件名兜底' if self._rss_fname_identify else ''}"
+                       f"{' · 智能助手' if self._rss_ai_identify else ''}", icon="mdi-magnify-scan"),
+            self._chip(f"扫描下载器 {'、'.join(self._clean_downloader) if self._clean_downloader else '全部'}",
+                       icon="mdi-harddisk"),
+            self._chip(f"单次删除 {self._delete_count} 个 · 已看阈值 {self._watched_threshold}%", icon="mdi-tune"),
         ]
-        if page_items:
-            for item in page_items:
-                op_buttons = [
-                    {"component": "VBtn", "props": {"color": "error", "variant": "text", "size": "x-small", "class": "px-1"},
-                     "text": "删除",
-                     "events": {"click": {"api": "plugin/SpaceCleaner/del_pb_item", "method": "get",
-                                          "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}},
-                    {"component": "VBtn", "props": {"color": "success", "variant": "text", "size": "x-small", "class": "px-1"},
-                     "text": "已看",
-                     "events": {"click": {"api": "plugin/SpaceCleaner/pb_mark_watched", "method": "get",
-                                          "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}},
-                    {"component": "VBtn", "props": {"color": "warning" if item["prio"] else "default", "variant": "text", "size": "x-small", "class": "px-1"},
-                     "text": "取消优先" if item["prio"] else "优先删除",
-                     "events": {"click": {"api": "plugin/SpaceCleaner/pb_toggle_prio", "method": "get",
-                                          "params": {"k": item["k"], "apikey": settings.API_TOKEN}}}},
-                ]
-                title_cell = ("⭐ " + item["title"]) if item["prio"] else item["title"]
-                table_rows.append({"component": "div", "props": {"class": "d-flex align-center px-3 py-2 border-t text-body-2"}, "content": [
-                    {"component": "div", "props": {"style": "flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"}, "text": title_cell},
-                    {"component": "div", "props": {"style": "width: 92px;"}, "text": item["se"]},
-                    {"component": "div", "props": {"style": "width: 76px;"}, "text": f"{item['progress']:.1f}%"},
-                    {"component": "div", "props": {"style": "width: 76px;"}, "text": "已看完" if item["watched"] else "未看完"},
-                    {"component": "div", "props": {"style": "width: 150px;"}, "text": item["time"]},
-                    {"component": "div", "props": {"style": "width: 200px; display: flex; flex-direction: row; align-items: center; gap: 4px;"}, "content": op_buttons},
-                ]})
+        if self._delete_by_target:
+            status_chips.append(self._chip(f"删至剩余 {self._target_free_percent}%", color="info",
+                                           icon="mdi-target"))
+        if self._dry_run:
+            status_chips.append(self._chip("试运行模式（不实际删除）", color="warning", icon="mdi-flask-outline"))
+        content.append({"component": "div", "props": {"class": "d-flex flex-wrap ga-2"}, "content": status_chips})
+        content.append({"component": "VDivider", "props": {"class": "my-3"}})
+        content.append({"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2"}, "content": [
+            self._btn("刷新数据", "refresh", icon="mdi-refresh"),
+            self._danger_btn(view, "clean", "quick_clean", "立即清理", "mdi-delete-sweep"),
+            self._btn("刷新RSS", "rss_run_once", color="primary", icon="mdi-rss",
+                      disabled=not (self._rss_on and bool(self._rss_urls))),
+        ]})
+        content.append(self._caption("播放进度依赖媒体服务器 Webhook，配置方法见 "
+                                     "github.com/cudamin/MoviePilot-Plugins", cls="mt-3"))
+        return {"component": "VCard", "props": {"variant": "flat"},
+                "content": [{"component": "VCardText", "props": {"class": "pa-4"}, "content": content}]}
+
+    def _page_tabs(self, view: dict, counts: Dict[str, int]) -> dict:
+        tabs = []
+        for key, label in self._DATA_TABS:
+            count = counts.get(key) or 0
+            tabs.append({"component": "VTab", "props": {"value": key, "class": "text-none"},
+                         "text": f"{label} {count}" if count else label,
+                         "events": self._page_api("dt_tab", tab=key)})
+        return {"component": "VTabs",
+                "props": {"modelValue": view["tab"], "color": "primary", "density": "comfortable", "grow": True},
+                "content": tabs}
+
+    # ---------- 播放缓存 ----------
+
+    def _page_tab_pb(self, view: dict, records: List[dict]) -> List[dict]:
+        watched_total = sum(1 for r in records if r["watched"])
+        prio_total = sum(1 for r in records if r["prio"])
+        counts = {"all": len(records), "watched": watched_total,
+                  "unwatched": len(records) - watched_total, "prio": prio_total}
+
+        mode = view["filter"]
+        items = list(records)
+        if mode == "watched":
+            items = [r for r in items if r["watched"]]
+        elif mode == "unwatched":
+            items = [r for r in items if not r["watched"]]
+        elif mode == "prio":
+            items = [r for r in items if r["prio"]]
+        search = view["search"]
+        if search:
+            keyword = search.lower()
+            items = [r for r in items
+                     if keyword in r["title"].lower() or keyword in r["se"].lower()]
+
+        sort_by, desc = view["sort_by"], view["sort_desc"]
+        if sort_by == "title":
+            items.sort(key=lambda x: x["title"], reverse=desc)
+        elif sort_by == "progress":
+            items.sort(key=lambda x: x["progress"], reverse=desc)
+        elif sort_by == "status":
+            items.sort(key=lambda x: (x["watched"], x["title"]), reverse=desc)
         else:
-            table_rows.append({"component": "div", "props": {"class": "pa-4 text-center text-body-2 text-medium-emphasis"}, "text": "暂无播放缓存"})
-        page_controls = [
-            {"component": "VBtn", "props": {"variant": "tonal", "size": "small", "disabled": page <= 1}, "text": "上一页",
-             "events": {"click": {"api": "plugin/SpaceCleaner/pb_page", "method": "get",
-                                  "params": {"page": page - 1, "apikey": settings.API_TOKEN}}}},
-            {"component": "VChip", "props": {"variant": "tonal", "size": "small", "class": "mx-2"}, "text": f"第 {page}/{total_pages} 页"},
-            {"component": "VBtn", "props": {"variant": "tonal", "size": "small", "disabled": page >= total_pages}, "text": "下一页",
-             "events": {"click": {"api": "plugin/SpaceCleaner/pb_page", "method": "get",
-                                  "params": {"page": page + 1, "apikey": settings.API_TOKEN}}}},
+            items.sort(key=lambda x: x["time"], reverse=desc)
+
+        size = view["size"]
+        total_pages = max(1, (len(items) + size - 1) // size)
+        page = min(max(1, view["page"]), total_pages)
+        page_items = items[(page - 1) * size: page * size]
+
+        # 工具栏：筛选 / 每页条数 / 搜索 / 批量操作
+        filter_chips = []
+        for key, label in self._PB_FILTERS:
+            active = mode == key
+            filter_chips.append({"component": "VChip",
+                                 "props": {"size": "small", "variant": "flat" if active else "tonal",
+                                           "color": "primary" if active else "default"},
+                                 "text": f"{label} {counts.get(key, 0)}",
+                                 "events": self._page_api("pb_filter", mode=key)})
+        size_chips = [self._caption("每页", cls="mr-1")]
+        for value in self._PB_SIZES:
+            active = size == value
+            size_chips.append({"component": "VChip",
+                               "props": {"size": "small", "variant": "flat" if active else "text",
+                                         "color": "primary" if active else "default"},
+                               "text": str(value),
+                               "events": self._page_api("pb_size", size=value)})
+        toolbar = [
+            {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2 px-3 pt-3"}, "content": [
+                {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2"}, "content": filter_chips},
+                {"component": "div", "props": {"style": "flex: 1 1 auto;"}},
+                {"component": "div", "props": {"class": "d-flex align-center ga-1"}, "content": size_chips},
+            ]},
+            {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2 px-3 py-2"}, "content": [
+                {"component": "div", "props": {"style": "flex: 1 1 220px; min-width: 180px;"},
+                 "html": self._page_search_html(search)},
+                {"component": "VBtn", "props": {"id": "sc-pb-refresh", "style": "display:none;",
+                                                "variant": "text", "size": "x-small"},
+                 "text": "刷新", "events": self._page_api("refresh")},
+                self._btn("全部标记已看", "pb_mark_all_watched", color="success", icon="mdi-check-all",
+                          disabled=(len(records) - watched_total) <= 0),
+                self._danger_btn(view, "clear_pb", "clear_pb", "清空缓存", "mdi-delete-outline"),
+            ]},
         ]
-        # 搜索框（数据页事件仅支持静态参数，输入值通过内嵌HTML提交到搜索API，再触发隐藏按钮刷新页面）
-        q_escaped = (self._pb_search or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-        _token = settings.API_TOKEN
-        _search_js = (
+
+        def head(field: str, label: str, style: str) -> dict:
+            active = view["sort_by"] == field
+            arrow = (" ↓" if desc else " ↑") if active else ""
+            return {"component": "VBtn",
+                    "props": {"variant": "text", "size": "x-small",
+                              "color": "primary" if active else "default",
+                              "class": "px-1 text-none font-weight-medium",
+                              "style": f"{style} justify-content: flex-start; letter-spacing: 0; font-size: inherit;"},
+                    "text": label + arrow, "events": self._page_api("pb_sort", sort_by=field)}
+
+        rows = [{"component": "div",
+                 "props": {"class": "d-flex align-center px-3 py-1 text-caption text-medium-emphasis border-b"},
+                 "content": [
+                     head("title", "标题", "flex: 1 1 auto; min-width: 0;"),
+                     {"component": "div", "props": {"style": "width: 84px;"}, "text": "季集"},
+                     head("progress", "进度", "width: 120px;"),
+                     head("status", "状态", "width: 78px;"),
+                     head("time", "时间", "width: 110px;"),
+                     {"component": "div", "props": {"style": "width: 150px;"}, "text": "操作"},
+                 ]}]
+        for item in page_items:
+            rows.append(self._page_pb_row(item))
+        if not page_items:
+            rows.append({"component": "div",
+                         "props": {"class": "pa-8 text-center text-body-2 text-medium-emphasis"},
+                         "text": "没有符合条件的播放缓存" if records else
+                                 "暂无播放缓存，媒体服务器上报播放进度后会自动出现"})
+
+        summary = f"筛选后 {len(items)} 条 / 全部 {len(records)} 条"
+        if search:
+            summary += f" · 搜索「{search}」"
+        pager = [
+            self._icon_btn("mdi-page-first", "首页", "pb_page", disabled=page <= 1, page=1),
+            self._icon_btn("mdi-chevron-left", "上一页", "pb_page", disabled=page <= 1,
+                           page=max(1, page - 1)),
+            {"component": "VChip", "props": {"size": "small", "variant": "tonal"}, "text": f"{page}/{total_pages}"},
+            self._icon_btn("mdi-chevron-right", "下一页", "pb_page", disabled=page >= total_pages,
+                           page=min(total_pages, page + 1)),
+            self._icon_btn("mdi-page-last", "末页", "pb_page", disabled=page >= total_pages,
+                           page=total_pages),
+        ]
+        footer = {"component": "div",
+                  "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2 px-3 py-2 border-t"},
+                  "content": [self._caption(summary),
+                              {"component": "div", "props": {"class": "d-flex align-center ga-1"}, "content": pager}]}
+        return toolbar + [{"component": "div", "content": rows}, footer]
+
+    def _page_pb_row(self, item: dict) -> dict:
+        """单条播放缓存行：标题 / 季集 / 进度 / 状态 / 时间 / 操作。"""
+        progress = item["progress"]
+        bar_color = "success" if item["watched"] else "primary" if progress > 0 else "grey"
+        title_content = []
+        if item["prio"]:
+            title_content.append({"component": "span",
+                                  "props": {"class": "text-warning mr-1", "title": "已标记优先删除"},
+                                  "text": "★"})
+        title_content.append({"component": "span", "props": {"class": "text-truncate"}, "text": item["title"]})
+        ops = [
+            self._icon_btn("mdi-check-circle-outline", "标记为已看", "pb_mark_watched",
+                           color="success", disabled=item["watched"], k=item["k"]),
+            self._icon_btn("mdi-star" if item["prio"] else "mdi-star-outline",
+                           "取消优先删除" if item["prio"] else "标记优先删除", "pb_toggle_prio",
+                           color="warning" if item["prio"] else "default", k=item["k"]),
+            self._icon_btn("mdi-close-circle-outline", "删除这条播放缓存", "del_pb_item",
+                           color="error", k=item["k"]),
+        ]
+        if item["tmdb_id"]:
+            media_path = "movie" if item["is_movie"] else "tv"
+            ops.append(self._icon_link("mdi-open-in-new", "在 TMDB 中查看",
+                                       f"https://www.themoviedb.org/{media_path}/{item['tmdb_id']}"))
+        stamp = item["time"]
+        return {"component": "div", "props": {"class": "d-flex align-center px-3 py-1 border-t text-body-2"}, "content": [
+            {"component": "div",
+             "props": {"class": "d-flex align-center", "title": item["title"],
+                       "style": "flex: 1 1 auto; min-width: 0; overflow: hidden;"},
+             "content": title_content},
+            {"component": "div", "props": {"style": "width: 84px;", "class": "text-caption"}, "text": item["se"]},
+            {"component": "div", "props": {"style": "width: 120px;", "class": "d-flex align-center ga-2 pr-2"},
+             "content": [
+                 {"component": "VProgressLinear",
+                  "props": {"modelValue": max(0.0, min(100.0, progress)), "color": bar_color, "height": 6,
+                            "rounded": True, "style": "min-width: 40px;"}},
+                 {"component": "span", "props": {"class": "text-caption text-medium-emphasis"},
+                  "text": f"{progress:.0f}%"},
+             ]},
+            {"component": "div", "props": {"style": "width: 78px;"}, "content": [
+                {"component": "VChip",
+                 "props": {"size": "x-small", "variant": "tonal", "color": "success" if item["watched"] else "default"},
+                 "text": "已看完" if item["watched"] else "未看完"}]},
+            {"component": "div",
+             "props": {"style": "width: 110px;", "class": "text-caption text-medium-emphasis", "title": stamp},
+             "text": stamp[5:16] if len(stamp) >= 16 else stamp},
+            {"component": "div", "props": {"style": "width: 150px;", "class": "d-flex align-center"}, "content": ops},
+        ]}
+
+    def _page_search_html(self, search: str) -> str:
+        """搜索框：详情页事件只支持静态参数，输入值先提交到搜索 API，再触发隐藏按钮刷新页面。"""
+        escaped = (search or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+        token = settings.API_TOKEN
+        plugin_id = self.__class__.__name__
+        submit_js = (
             "var i=document.getElementById('sc-pb-q');"
-            "fetch('/api/v1/plugin/SpaceCleaner/pb_search?q='+encodeURIComponent(i?i.value:'')+'&apikey=" + _token + "')"
+            f"fetch('/api/v1/plugin/{plugin_id}/pb_search?q='+encodeURIComponent(i?i.value:'')+'&apikey={token}')"
             ".finally(function(){var b=document.getElementById('sc-pb-refresh');if(b){b.click();}});"
         )
-        _clear_js = (
+        clear_js = (
             "var i=document.getElementById('sc-pb-q');if(i){i.value='';}"
-            "fetch('/api/v1/plugin/SpaceCleaner/pb_search?q=&apikey=" + _token + "')"
+            f"fetch('/api/v1/plugin/{plugin_id}/pb_search?q=&apikey={token}')"
             ".finally(function(){var b=document.getElementById('sc-pb-refresh');if(b){b.click();}});"
         )
-        search_html = (
+        return (
             '<div style="display:flex;align-items:center;gap:8px;width:100%;">'
-            f'<input id="sc-pb-q" type="text" placeholder="搜索标题关键字，回车确认" value="{q_escaped}" '
+            f'<input id="sc-pb-q" type="text" placeholder="搜索标题或季集，回车确认" value="{escaped}" '
             'style="flex:1 1 auto;min-width:100px;padding:5px 10px;border:1px solid rgba(128,128,128,.45);'
             'border-radius:6px;font-size:12px;background:transparent;color:inherit;outline:none;" '
-            f'onkeydown="if(event.key===\'Enter\'){{event.preventDefault();{_search_js}}}">'
+            f'onkeydown="if(event.key===\'Enter\'){{event.preventDefault();{submit_js}}}">'
             '<button type="button" style="padding:5px 14px;border-radius:6px;font-size:12px;border:none;cursor:pointer;'
             'background:rgb(var(--v-theme-primary));color:#fff;white-space:nowrap;" '
-            f'onclick="{_search_js}">搜索</button>'
-            '<button type="button" style="padding:5px 14px;border-radius:6px;font-size:12px;cursor:pointer;'
+            f'onclick="{submit_js}">搜索</button>'
+            '<button type="button" style="padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;'
             'border:1px solid rgba(128,128,128,.45);background:transparent;color:inherit;white-space:nowrap;" '
-            f'onclick="{_clear_js}">清除</button>'
+            f'onclick="{clear_js}">清除</button>'
             '</div>'
         )
-        # 统计副标题
-        pb_subtitle = f"共 {len(all_items)} 条，已看完 {watched_count} 条，未看完 {len(all_items)-watched_count} 条（当前显示 {len(filtered_items)} 条）"
-        if self._pb_search:
-            pb_subtitle += f"，搜索：{self._pb_search}"
-        cards.append({
-            "component": "VCard", "props": {"variant": "flat", "class": "mt-2"},
-            "content": [
-                {"component": "VCardTitle", "props": {"class": "d-flex align-center justify-space-between pa-3"}, "content": [
-                    {"component": "div", "content": [
-                        {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"}, "text": "播放缓存"},
-                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
-                         "text": pb_subtitle},
-                    ]},
-                    {"component": "div", "props": {"class": "d-flex align-center"}, "content": [
-                        {"component": "VBtn", "props": {"variant": self._pb_filter_watched and "flat" or "text", "size": "x-small", "color": self._pb_filter_watched and "primary" or "default", "class": "mr-2"},
-                         "text": "仅已看完",
-                         "events": {"click": {"api": "plugin/SpaceCleaner/pb_filter_toggle", "method": "get", "params": {"apikey": settings.API_TOKEN}}}},
-                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "size": "small", "class": "mr-2",
-                                                        "disabled": (len(all_items) - watched_count) <= 0},
-                         "text": "全部标记已看",
-                         "events": {"click": {"api": "plugin/SpaceCleaner/pb_mark_all_watched", "method": "get",
-                                              "params": {"apikey": settings.API_TOKEN}}}},
-                        {"component": "VBtn", "props": {"color": "error", "variant": "tonal", "size": "small", "disabled": not bool(pb)},
-                         "text": "清除全部",
-                         "events": {"click": {"api": "plugin/SpaceCleaner/clear_pb", "method": "get",
-                                              "params": {"apikey": settings.API_TOKEN}}}},
-                    ]},
-                ]},
-                {"component": "VCardText", "props": {"class": "pa-0"}, "content": [
-                    {"component": "div", "props": {"class": "d-flex align-center px-3 pt-3 pb-1"}, "content": [
-                        {"component": "div", "props": {"style": "flex: 1 1 auto; min-width: 0;"}, "html": search_html},
-                        {"component": "VBtn", "props": {"id": "sc-pb-refresh", "style": "display:none;", "variant": "text", "size": "x-small"},
-                         "text": "刷新",
-                         "events": {"click": {"api": "plugin/SpaceCleaner/pb_page", "method": "get",
-                                              "params": {"page": page, "apikey": settings.API_TOKEN}}}},
-                    ]},
-                    {"component": "div", "props": {"class": "overflow-x-auto"}, "content": table_rows},
-                    {"component": "div", "props": {"class": "d-flex align-center justify-end pa-3 pr-10", "style": "padding-right: 56px !important;"}, "content": page_controls},
-                ]},
-            ],
-        })
-        return cards
+
+    # ---------- 删除记录 ----------
+
+    def _page_tab_history(self, view: dict, history: List[dict]) -> List[dict]:
+        failed_total = sum(1 for h in history if "失败" in h["action"])
+        counts = {"all": len(history), "deleted": len(history) - failed_total, "failed": failed_total}
+        mode = view["dh_filter"]
+        if mode == "deleted":
+            items = [h for h in history if "失败" not in h["action"]]
+        elif mode == "failed":
+            items = [h for h in history if "失败" in h["action"]]
+        else:
+            items = list(history)
+
+        chips = []
+        for key, label in self._HISTORY_FILTERS:
+            active = mode == key
+            chips.append({"component": "VChip",
+                          "props": {"size": "small", "variant": "flat" if active else "tonal",
+                                    "color": "primary" if active else "default"},
+                          "text": f"{label} {counts.get(key, 0)}",
+                          "events": self._page_api("dh_filter", mode=key)})
+        latest = history[0]["time"] if history else "-"
+        toolbar = {"component": "div",
+                   "props": {"class": "d-flex flex-wrap align-center ga-2 px-3 py-3"},
+                   "content": [
+                       {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2"}, "content": chips},
+                       {"component": "div", "props": {"style": "flex: 1 1 auto;"}},
+                       self._caption(f"最近 {latest} · 最多保留 {self._HISTORY_MAX} 条 · 试运行不写入记录", cls="mr-2"),
+                       self._danger_btn(view, "clear_history", "dh_clear", "清空记录", "mdi-notification-clear-all"),
+                   ]}
+        headers = [{"title": "时间", "key": "time", "width": 170},
+                   {"title": "标题", "key": "title"},
+                   {"title": "动作", "key": "action", "width": 150}]
+        return [toolbar, {"component": "VDivider"},
+                self._table(headers, items, "暂无删除记录")]
+
+    # ---------- RSS 记录 ----------
+
+    def _page_tab_rss(self, view: dict, washed: List[dict], seen_count: int) -> List[dict]:
+        tiles = [
+            self._tile("已处理报文", str(seen_count), f"上限 {self._rss_seen_max} 条"),
+            self._tile("已洗版集数", str(len(washed)), f"上限 {self._rss_washed_max} 条"),
+            self._tile("执行周期", self._rss_cron or "未设置",
+                       f"下次 {self._next_run_text(self._rss_cron)}" if self._rss_on else "未启用"),
+            self._tile("下载器", self._rss_dl or "默认",
+                       f"规则组 {self._rss_rule_group or '不过滤'}"),
+        ]
+        url_count = len([u for u in (self._rss_urls or "").split("\n") if u.strip()])
+        info_chips = [
+            self._chip(f"RSS 链接 {url_count} 个", icon="mdi-link-variant"),
+            self._chip(f"保存路径 {self._rss_save_path or '默认'}", icon="mdi-folder-outline"),
+            self._chip(f"体积过滤 {self._rss_sz or '不限'} GB", icon="mdi-scale"),
+            self._chip(f"洗版阈值 {self._rss_th}%", icon="mdi-percent-outline"),
+        ]
+        if self._rss_ai_identify:
+            info_chips.append(self._chip(f"智能助手单轮上限 {self._rss_ai_max} 次", color="info",
+                                         icon="mdi-robot-outline"))
+        toolbar = {"component": "div",
+                   "props": {"class": "d-flex flex-wrap align-center ga-2 px-3 py-2"},
+                   "content": [
+                       self._btn("立即刷新RSS", "rss_run_once", color="primary", icon="mdi-rss",
+                                 disabled=not (self._rss_on and bool(self._rss_urls))),
+                       self._danger_btn(view, "clear_seen", "rss_ca", "清除已处理报文", "mdi-broom"),
+                       self._danger_btn(view, "clear_washed", "rss_wash_clear", "清除洗版记录",
+                                        "mdi-playlist-remove"),
+                   ]}
+        headers = [{"title": "媒体", "key": "title"},
+                   {"title": "季集", "key": "se", "width": 110},
+                   {"title": "TMDB ID", "key": "tmdb", "width": 120}]
+        return [
+            {"component": "VRow", "props": {"dense": True, "class": "ma-0 pa-2"}, "content": tiles},
+            {"component": "div", "props": {"class": "d-flex flex-wrap ga-2 px-3 pb-2"}, "content": info_chips},
+            toolbar,
+            {"component": "VDivider"},
+            {"component": "div", "props": {"class": "px-3 pt-2"},
+             "content": [self._caption("洗版记录：已按「一集一个槽位」下载过的剧集，清除后同一集会被重新洗版下载")]},
+            self._table(headers, washed, "暂无洗版记录"),
+        ]
+
+    # ---------- 识别缓存 ----------
+
+    def _page_tab_cache(self, view: dict, success_cache: List[dict], negative_cache: List[dict]) -> List[dict]:
+        success_items = []
+        for item in reversed(success_cache or []):
+            success_items.append({"key": str(item.get("key") or ""),
+                                  "title": str(item.get("title") or ""),
+                                  "year": str(item.get("year") or "") or "-",
+                                  "media_type": str(item.get("media_type") or "") or "-",
+                                  "tmdb_id": str(item.get("tmdb_id") or "")})
+        negative_items = []
+        for item in reversed(negative_cache or []):
+            negative_items.append({"key": str(item.get("key") or ""),
+                                   "name": str(item.get("name") or "")})
+        blocks = [
+            {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2 px-3 pt-3 pb-2"}, "content": [
+                {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"}, "text": "识别成功缓存"},
+                self._chip(f"{len(success_items)} / {self._api_recognize_success_cache_max}", color="success"),
+                {"component": "div", "props": {"style": "flex: 1 1 auto;"}},
+                self._btn("清空", "cache_clear", color="error", icon="mdi-delete-outline", kind="success"),
+            ]},
+            self._table([{"title": "解析名称", "key": "key"},
+                         {"title": "标题", "key": "title"},
+                         {"title": "年份", "key": "year", "width": 90},
+                         {"title": "类型", "key": "media_type", "width": 90},
+                         {"title": "TMDB ID", "key": "tmdb_id", "width": 110}],
+                        success_items, "暂无识别成功缓存"),
+            {"component": "VDivider", "props": {"class": "my-2"}},
+            {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2 px-3 pt-2 pb-2"}, "content": [
+                {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"}, "text": "识别失败缓存"},
+                self._chip(f"{len(negative_items)} / {self._api_recognize_cache_max}", color="warning"),
+                {"component": "div", "props": {"style": "flex: 1 1 auto;"}},
+                self._btn("清空", "cache_clear", color="error", icon="mdi-delete-outline", kind="negative"),
+            ]},
+            self._table([{"title": "解析名称", "key": "key"},
+                         {"title": "原始名称", "key": "name"}],
+                        negative_items, "暂无识别失败缓存"),
+            {"component": "div", "props": {"class": "pa-3"}, "content": [
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact"},
+                 "content": [self._caption("识别顺序：MoviePilot 本地缓存 → 识别成功缓存 → 识别失败缓存（命中则跳过）→ "
+                                           "TMDB API → 种子文件名兜底 → 智能助手。新增自定义识别词后建议清空识别失败缓存，"
+                                           "让对应报文重新识别。")]},
+            ]},
+        ]
+        return blocks
 
     # ==================== 缓存管理 ====================
 
@@ -1154,70 +1782,6 @@ class SpaceCleaner(_PluginBase):
         self._pb_cache_time = now
         return pb_copy
 
-    def _is_watched_pb(self, tmdbid: int, season: Optional[int] = None, episode: Optional[int] = None) -> bool:
-        """判断指定剧集是否已看完（播放进度 >= 标记已看阈值）。"""
-        pb = self._get_playback_pb()
-        if not pb:
-            return False
-        # 用 is not None 判断，季 0（Specials）与集 0 也要能正常匹配
-        if season is not None and episode is not None:
-            k = f"{tmdbid}:S{int(season):02d}E{int(episode):02d}"
-            for r in pb:
-                if r.get("k") == k:
-                    return (r.get("p", 0) or 0) >= self._watched_threshold
-        return False
-
-    def _is_watched_pb_by_record(self, record: TransferHistory) -> bool:
-        """根据转移记录判断是否已看完（播放进度 >= 标记已看阈值）。"""
-        if not record.tmdbid:
-            return False
-        tmdb = record.tmdbid
-        pb = self._get_playback_pb()
-        # 电影：查 {tmdbid}:M
-        if record.type != "电视剧":
-            k = f"{tmdb}:M"
-            for r in pb:
-                if r.get("k") == k:
-                    return (r.get("p", 0) or 0) >= self._watched_threshold
-            return False
-        season_num = None
-        if record.seasons:
-            s = record.seasons.strip().upper().replace("S", "")
-            if s.isdigit():
-                season_num = int(s)
-        episodes_str = (record.episodes or "").strip().upper().replace("E", "")
-        if not season_num:
-            return False
-
-        # 单集
-        if episodes_str.isdigit():
-            return self._is_watched_pb(tmdb, season_num, int(episodes_str))
-
-        # 多集范围
-        eps = []
-        if "-" in episodes_str or "~" in episodes_str:
-            sep = "-" if "-" in episodes_str else "~"
-            parts = episodes_str.split(sep)
-            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                eps = list(range(int(parts[0]), int(parts[1]) + 1))
-        elif "," in episodes_str:
-            eps = [int(p) for p in episodes_str.split(",") if p.strip().isdigit()]
-        if eps:
-            return self._is_watched_pb(tmdb, season_num, max(eps))
-
-        # 整季包（无具体集号）：查该季最大缓存集号
-        pb = self._get_playback_pb()
-        max_ep = 0
-        prefix = f"{tmdb}:S{season_num:02d}E"
-        for r in pb:
-            if r.get("k", "").startswith(prefix):
-                ep = r.get("e", 0) or 0
-                if ep > max_ep:
-                    max_ep = ep
-        if max_ep > 0:
-            return self._is_watched_pb(tmdb, season_num, max_ep)
-        return False
-
     def _configured_dirs(self) -> List[Path]:
         """读取系统「目录配置」中的下载目录与媒体库目录。
 
@@ -1277,10 +1841,98 @@ class SpaceCleaner(_PluginBase):
         dc = 0
         # 试运行不会真正释放空间，若按目标百分比删除会遍历全部单元，因此仍按单次数量限制
         md = self._delete_count if (not self._delete_by_target or self._dry_run) else 0
+        fr = ""
+        # 删除单元的收集与排序逻辑与详情页「试运行」预览共用，保证预览顺序与真实清理一致
+        delete_units = self._collect_delete_units()
+        if not delete_units:
+            return
+
+        # 一轮清理只拉取一次下载器种子列表并建索引：种子名解析（MetaInfo + 自定义识别词）
+        # 是 CPU 密集操作，每个删除单元重复全量拉取会造成明显的 CPU 峰值。
+        # 删种后由 _delete_downloader_torrents 从索引与缓存中剔除已删 hash，保持数据新鲜。
+        torrent_index = self._build_torrent_index(self._get_cached_torrents(chain))
+        for unit in delete_units:
+            if md and dc >= md:
+                fr = "limit"
+                break
+            # 完全删除上一个资源后强制刷新空间信息，再检查是否达到目标，避免缓存旧值导致多删
+            cs = self._get_cached_space_info()
+            # 试运行不会真正释放空间，跳过空间达标判断，否则首轮就会误判为已达标
+            if cs and not self._dry_run:
+                if self._delete_by_target and cs["free_percent"] >= self._target_free_percent:
+                    logger.info(f"SC 空间已达到目标阈值 {self._target_free_percent}% (当前 {cs['free_percent']:.1f}%)，停止清理")
+                    fr = "space_ok"
+                    break
+                if not self._delete_by_target and cs["free_percent"] >= self._min_free_percent:
+                    logger.info(f"SC 空间已恢复至触发阈值 {self._min_free_percent}% (当前 {cs['free_percent']:.1f}%)，停止清理")
+                    fr = "space_ok"
+                    break
+            # 完整删除一个资源（种子+文件+记录），删除完成后立即使空间缓存失效，
+            # 下一次循环重新查询真实剩余空间，达标即停，否则继续删除下一个
+            self._delete_unit(unit, chain, cs or space_info, torrent_index)
+            dc += 1
+            self._cached_space_info = None
+            # 单元之间稍作停顿，把删种/删文件/清目录带来的瞬时占用摊平
+            if not self._dry_run and self._unit_delete_interval > 0:
+                time.sleep(self._unit_delete_interval)
+        reason = {"limit": "达到单次删除数量上限", "space_ok": "空间已达标"}.get(fr, "已处理全部候选资源")
+        logger.info(f"SC 清理完成，删除 {dc} 个资源（{reason}）")
+
+    def _dry_run_preview(self, limit: int = 10) -> dict:
+        """试运行预览：按真实清理顺序列出将被删除的资源，全程只读、不删除任何东西。
+
+        与定时清理共用 _collect_delete_units，因此预览结果就是真实清理会处理的资源；
+        与空间阈值无关，空间充足时同样给出候选列表，方便随时确认删除顺序是否符合预期。
+        """
+        space = self._get_space_info() or {}
+        try:
+            free_pct = float(space.get("free_percent"))
+        except (TypeError, ValueError):
+            free_pct = None
+        units = self._collect_delete_units(log_skipped=False)
+        items: List[dict] = []
+        if units:
+            chain = self._get_chain()
+            torrent_index = self._build_torrent_index(self._get_cached_torrents(chain))
+            for unit in units[:max(1, limit)]:
+                records = unit.get("records") or []
+                others = self._find_other_version_records(records) if self._delete_other_versions else []
+                counted = set()
+                for dh in self._collect_record_torrent_hashes(records + others, torrent_index):
+                    for torrent_hash, _name, _cross, _dl in self._collect_torrents_to_delete(dh, torrent_index):
+                        counted.add(torrent_hash)
+                items.append({
+                    "title": unit.get("display") or "未知",
+                    "records": len(records),
+                    "others": len(others),
+                    "torrents": len(counted),
+                    "prio": bool(unit.get("prio")),
+                    "time": str((unit.get("lib_time") if self._delete_by_record else unit.get("sort_time")) or ""),
+                })
+        return {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "free_percent": free_pct,
+            "free_gb": space.get("free_gb"),
+            "threshold": self._min_free_percent,
+            "target": self._target_free_percent,
+            "delete_by_target": self._delete_by_target,
+            "delete_count": self._delete_count,
+            "sort_by": "整理记录最早入库时间" if self._delete_by_record else "播放缓存最早标记时间",
+            "needs_cleanup": bool(free_pct is not None and free_pct < self._min_free_percent),
+            "space_unknown": free_pct is None,
+            "total": len(units),
+            "items": items,
+        }
+
+    def _collect_delete_units(self, log_skipped: bool = True) -> List[dict]:
+        """收集本轮满足删除条件的删除单元，按「优先标记 + 时间」排序后返回。
+
+        只读操作：不删除任何种子、文件或记录。真实清理与详情页试运行预览共用，
+        保证预览列出的资源与顺序就是真实清理会处理的资源与顺序。
+        """
         from app.db import ScopedSession
         from sqlalchemy import asc
         sess = ScopedSession()
-        fr = ""
         try:
             pb = self._get_playback_pb()
             # 播放缓存一次遍历建好索引，避免后续每个删除单元都重新线性扫描整份缓存：
@@ -1526,7 +2178,7 @@ class SpaceCleaner(_PluginBase):
                 _add_movie_unit(recs)
 
             # 输出因未看完/无播放记录而跳过的电视剧季，按最早标记时间排序，每行 5 个
-            if skip_logs:
+            if skip_logs and log_skipped:
                 skip_logs.sort(key=lambda x: x[0])
                 reasons = [s for _, s in skip_logs]
                 logger.info(f"SC 以下 {len(reasons)} 个电视剧季不满足删除条件，已跳过（按最早标记时间排序）：")
@@ -1535,46 +2187,16 @@ class SpaceCleaner(_PluginBase):
 
             if not delete_units:
                 logger.info("SC 未发现满足删除条件的资源（已看完且在转移历史中）")
-                return
+                return []
 
             # 排序：优先删除被标记的资源；按媒体整理记录删除开启时按整理记录最早入库时间（升序），否则按播放缓存最早标记时间（升序）
             sort_key = "lib_time" if self._delete_by_record else "sort_time"
             sort_label = "整理记录最早入库时间" if self._delete_by_record else "最早标记时间"
-            logger.info(f"SC 共 {len(delete_units)} 个删除单元满足条件，按优先标记与{sort_label}排序后开始清理")
+            logger.info(f"SC 共 {len(delete_units)} 个删除单元满足条件，按优先标记与{sort_label}排序")
             delete_units.sort(key=lambda u: (not u["prio"], u.get(sort_key) or "9999"))
         finally:
             sess.close()
-
-        # 一轮清理只拉取一次下载器种子列表并建索引：种子名解析（MetaInfo + 自定义识别词）
-        # 是 CPU 密集操作，每个删除单元重复全量拉取会造成明显的 CPU 峰值。
-        # 删种后由 _delete_downloader_torrents 从索引与缓存中剔除已删 hash，保持数据新鲜。
-        torrent_index = self._build_torrent_index(self._get_cached_torrents(chain))
-        for unit in delete_units:
-            if md and dc >= md:
-                fr = "limit"
-                break
-            # 完全删除上一个资源后强制刷新空间信息，再检查是否达到目标，避免缓存旧值导致多删
-            cs = self._get_cached_space_info()
-            # 试运行不会真正释放空间，跳过空间达标判断，否则首轮就会误判为已达标
-            if cs and not self._dry_run:
-                if self._delete_by_target and cs["free_percent"] >= self._target_free_percent:
-                    logger.info(f"SC 空间已达到目标阈值 {self._target_free_percent}% (当前 {cs['free_percent']:.1f}%)，停止清理")
-                    fr = "space_ok"
-                    break
-                if not self._delete_by_target and cs["free_percent"] >= self._min_free_percent:
-                    logger.info(f"SC 空间已恢复至触发阈值 {self._min_free_percent}% (当前 {cs['free_percent']:.1f}%)，停止清理")
-                    fr = "space_ok"
-                    break
-            # 完整删除一个资源（种子+文件+记录），删除完成后立即使空间缓存失效，
-            # 下一次循环重新查询真实剩余空间，达标即停，否则继续删除下一个
-            self._delete_unit(unit, chain, cs or space_info, torrent_index)
-            dc += 1
-            self._cached_space_info = None
-            # 单元之间稍作停顿，把删种/删文件/清目录带来的瞬时占用摊平
-            if not self._dry_run and self._unit_delete_interval > 0:
-                time.sleep(self._unit_delete_interval)
-        reason = {"limit": "达到单次删除数量上限", "space_ok": "空间已达标"}.get(fr, "已处理全部候选资源")
-        logger.info(f"SC 清理完成，删除 {dc} 个资源（{reason}）")
+        return delete_units
 
     def _delete_unit(self, unit, chain, space_info, torrent_index=None):
         """删除一个删除单元（合集的所有集一起删除）。
@@ -1617,11 +2239,7 @@ class SpaceCleaner(_PluginBase):
                 + f"，种子 {main_cnt} 个"
                 + (f"（含辅种 {cross_cnt} 个）" if cross_cnt else "")
             )
-            detail = (f"将删除：整理记录 {len(records)} 条"
-                      + (f"，不同版本 {len(other_versions)} 条" if other_versions else "")
-                      + f"，种子 {main_cnt} 个"
-                      + (f"（含辅种 {cross_cnt} 个）" if cross_cnt else ""))
-            self._add_delete_history(display_name, "试运行 - " + detail)
+            # 试运行只是预演，不写入删除记录（删除记录只保留真实删除与失败结果）
             return
         try:
             unit_type = "电视剧整季" if is_tv else "电影"
@@ -2269,38 +2887,52 @@ class SpaceCleaner(_PluginBase):
         return sorted(residual, key=str)
 
     def _add_delete_history(self, title: str, action: str):
-        h = self.get_data("delete_history") or []
+        h = self._sanitize_history(self.get_data("delete_history"))
         h.append({"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "title": title, "action": action})
-        # 只保留最近 500 条，避免插件数据无限增长
-        if len(h) > 500:
-            h = h[-500:]
+        if len(h) > self._HISTORY_MAX:
+            h = h[-self._HISTORY_MAX:]
         self.save_data("delete_history", h)
 
+    def _sanitize_history(self, raw: Any) -> List[Dict[str, str]]:
+        """规范化删除记录：丢弃历史遗留的试运行条目，并裁剪到上限条数。"""
+        items = []
+        for record in raw or []:
+            if not isinstance(record, dict):
+                continue
+            if "试运行" in str(record.get("action") or ""):
+                continue
+            items.append(record)
+        return items[-self._HISTORY_MAX:]
+
+    def _migrate_delete_history(self) -> None:
+        """一次性清理旧数据：删除记录不再缓存试运行，上限收敛到 _HISTORY_MAX 条。"""
+        raw = self.get_data("delete_history")
+        if not isinstance(raw, list) or not raw:
+            return
+        items = self._sanitize_history(raw)
+        if len(items) != len(raw):
+            self.save_data("delete_history", items)
+            logger.info(f"SC 删除记录已清理：{len(raw)} 条 -> {len(items)} 条（移除试运行记录并限制为 {self._HISTORY_MAX} 条）")
+
     def _get_delete_history(self) -> List[Dict[str, str]]:
-        return self.get_data("delete_history") or []
+        return self._sanitize_history(self.get_data("delete_history"))
 
     # ==================== API ====================
 
     def api_dry_run(self):
-        si = self._get_space_info()
-        if not si:
+        """对外试运行接口：与详情页「试运行」共用同一套删除单元收集逻辑。"""
+        preview = self._dry_run_preview()
+        if preview["space_unknown"]:
             return {"success": False, "message": "无法获取磁盘空间"}
-        if si["free_percent"] >= self._min_free_percent:
-            return {"success": True, "space_info": {**si, "threshold_percent": self._min_free_percent, "needs_cleanup": False}, "would_delete": [], "message": "空间充足"}
-        from app.db import ScopedSession
-        from sqlalchemy import asc
-        sess = ScopedSession()
-        try:
-            recs = sess.query(TransferHistory).filter(TransferHistory.status == True).order_by(asc(TransferHistory.id)).limit(200).all()
-            wd = []
-            for r in recs:
-                if len(wd) >= self._delete_count:
-                    break
-                if r.type == "电视剧" and self._is_watched_pb_by_record(r):
-                    wd.append({"id": r.id, "title": r.title or "", "type": r.type or "", "seasons": r.seasons or "", "episodes": r.episodes or "", "date": r.date or ""})
-        finally:
-            sess.close()
-        return {"success": True, "space_info": {**si, "threshold_percent": self._min_free_percent, "needs_cleanup": True}, "would_delete": wd, "message": f"试运行完成，将删除 {len(wd)} 个资源"}
+        space_info = {"total_gb": None, "free_gb": preview["free_gb"], "used_gb": None,
+                      "free_percent": preview["free_percent"],
+                      "threshold_percent": preview["threshold"],
+                      "needs_cleanup": preview["needs_cleanup"]}
+        si = self._get_space_info() or {}
+        space_info.update({k: v for k, v in si.items() if k in ("total_gb", "free_gb", "used_gb", "free_percent")})
+        return {"success": True, "space_info": space_info, "would_delete": preview["items"],
+                "total": preview["total"],
+                "message": f"试运行完成，共 {preview['total']} 个候选资源"}
 
     def api_run_now(self):
         try:
