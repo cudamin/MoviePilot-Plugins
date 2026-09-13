@@ -44,7 +44,7 @@ class RawTorrent:
 
 
 class SpaceCleaner(_PluginBase):
-    plugin_name = "空间清理器"
+    plugin_name = "清理订阅助手"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
     plugin_version = "5.1.0"
