@@ -47,5 +47,61 @@
       "v3.1.1": "修复bug",
       "v3.1.0": "修复bug"
     }
+  },
+  "agentconfigprofile": {
+    "name": "API聚合自动切换",
+    "description": "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。",
+    "labels": "智能助手",
+    "version": "2.6.0",
+    "icon": "agentresourceofficer.png",
+    "author": "tafei",
+    "author_url": "https://github.com/cudamin",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.1",
+    "history": {
+      "v2.6.0": "适配 MoviePilot V3：迁移配置、事件、日志与服务端上报接口路径。",
+      "v2.5.0": "插件ID改为小写agentconfigprofile以对齐安装统计",
+      "v2.4.0": "修复bug，优化ui布局",
+      "v2.3.1": "新增大量功能",
+      "v1.1.1": "修复bug",
+      "v1.1.0": "去除冗余功能",
+      "v1.0.0": "初始版本"
+    }
+  },
+  "JackettBridge": {
+    "name": "JackettBridge",
+    "description": "将 Jackett 中已配置的索引器接入 MoviePilot 搜索与订阅。",
+    "labels": "站点",
+    "version": "1.3.0",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Jackett_A.png",
+    "author": "tafei",
+    "author_url": "https://github.com/cudamin",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.1",
+    "history": {
+      "v1.3.0": "适配 MoviePilot V3：迁移公共依赖至 app.sdk，并改用当前站点数据操作接口。",
+      "v1.2.2": "修改插件的文本说明",
+      "v1.2.0": "修复bug",
+      "v1.0.0": "test"
+    }
+  },
+  "SubscribeNoAutoSearch": {
+    "name": "新增订阅不自动搜索",
+    "description": "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。",
+    "labels": "订阅管理",
+    "version": "1.4.0",
+    "icon": "pause.png",
+    "author": "tafei",
+    "author_url": "https://github.com/cudamin",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.1",
+    "history": {
+      "v1.4.0": "适配 MoviePilot V3：迁移订阅数据、事件与日志接口路径。",
+      "v1.3.0": "可用版本",
+      "v1.0.0": "测试版"
+    }
   }
 }
