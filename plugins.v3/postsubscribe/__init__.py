@@ -11,7 +11,7 @@ from app.sdk.logging import logger
 class PostSubscribe(_PluginBase):
     """新增订阅不自动搜索插件。"""
 
-    plugin_name = "新增订阅不自动搜索"
+    plugin_name = "新订阅不自动搜索"
     plugin_desc = "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。"
     plugin_icon = "pause.png"
     plugin_version = "1.4.0"
