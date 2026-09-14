@@ -8,7 +8,7 @@ from app.sdk.events import eventmanager
 from app.sdk.logging import logger
 
 
-class SubscribeNoAutoSearch(_PluginBase):
+class PostSubscribe(_PluginBase):
     """新增订阅不自动搜索插件。"""
 
     plugin_name = "新增订阅不自动搜索"
@@ -18,7 +18,7 @@ class SubscribeNoAutoSearch(_PluginBase):
     plugin_label = "订阅管理"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
-    plugin_config_prefix = "subscribenoautosearch_"
+    plugin_config_prefix = "postsubscribe_"
     plugin_order = 19
     auth_level = 1
 
