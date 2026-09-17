@@ -82,6 +82,7 @@
     "release": true,
     "system_version": ">=3.0.1",
     "history": {
+      "v1.3.1": "适配 MoviePilot V3版本，修复搜索插件无法使用的问题",
       "v1.3.0": "适配 MoviePilot V3：迁移公共依赖至 app.sdk，并改用当前站点数据操作接口。",
       "v1.2.2": "修改插件的文本说明",
       "v1.2.0": "修复bug",
