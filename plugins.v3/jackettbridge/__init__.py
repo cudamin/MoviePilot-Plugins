@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,7 +21,7 @@ from app.sdk.logging import logger
 from app.sdk.media import TorrentInfo
 from app.sdk.network import RequestUtils, SitesHelper
 from app.plugins import _PluginBase
-from app.schemas.types import EventType, MediaType
+from app.schemas.types import EventType, MediaSource, MediaType
 
 # Torznab 命名空间
 TORZNAB_NS = "http://torznab.com/schemas/2015/feed"
@@ -30,6 +31,8 @@ DEFAULT_CRON = "0 0 * * *"
 DEFAULT_SEARCH_TIMEOUT = 30
 # 默认单个索引器返回条数
 DEFAULT_RESULT_NUM = 100
+# 插件资源源并发检索的索引器数量上限
+DEFAULT_PARALLEL_INDEXERS = 4
 
 
 class JackettBridge(_PluginBase):
@@ -47,7 +50,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -539,8 +542,10 @@ class JackettBridge(_PluginBase):
         """
         privacy = str(indexer_type or "").strip().lower() or "unknown"
         domain = self.__build_domain(indexer_id)
-        # parser/plugin 标记用于识别本插件托管的虚拟站点；空 search.paths 让系统蜘蛛尽早放弃，
-        # 避免对虚拟域名做 DNS/HTTP 重试。
+        # parser/plugin 标记用于识别本插件托管的虚拟站点。MoviePilot V3 的按站点搜索只走宿主
+        # 蜘蛛、不再回调插件，而蜘蛛只要 search 字段为真值就会去抓虚拟域名（jackett-*.extend）；
+        # 因此这里保持 search 为空字典，让宿主模块直接跳过虚拟站点，资源统一由「插件资源源」
+        # 通道（search_torrents / refresh_torrents 收到空 site）返回。
         return {
             "id": f"{self.plugin_name}-{indexer_id}",
             "name": f"{self.plugin_name}-{indexer_name}",
@@ -556,7 +561,7 @@ class JackettBridge(_PluginBase):
             "timeout": 5,
             "parser": self.plugin_name,
             "plugin": self.plugin_name,
-            "search": {"paths": []},
+            "search": {},
             "browse": {"path": ""},
             "torrents": {"list": {"selector": ""}, "fields": {}},
         }
@@ -653,6 +658,10 @@ class JackettBridge(_PluginBase):
                     "parser", "plugin", "result_num", "timeout"):
             if exists.get(key) != indexer.get(key):
                 return False
+        # search 只比较「是否可搜索」的真值形态：已注册条目可能被宿主补充额外键，
+        # 逐键比较会导致每次同步都重新注册。
+        if bool(exists.get("search")) != bool(indexer.get("search")):
+            return False
         return True
 
     def __get_managed_site_records(self) -> List[Any]:
@@ -767,18 +776,44 @@ class JackettBridge(_PluginBase):
     @staticmethod
     def get_cat(mtype: Optional[MediaType] = None) -> List[int]:
         """
-        获取 Torznab 分类，电影 2000、剧集 5000。
+        获取 Torznab 分类：电影 2000、剧集 5000、音乐 3000。
         """
         if mtype == MediaType.MOVIE:
             return [2000]
         if mtype == MediaType.TV:
             return [5000]
+        if mtype == MediaType.MUSIC:
+            return [3000]
         return [2000, 5000]
 
-    def search_torrents(self, site: dict, keyword: str = None, mtype: Optional[MediaType] = None,
+    def search_torrents(self, site: Optional[dict] = None, keyword: str = None,
+                        mtype: Optional[MediaType] = None,
                         page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
         """
-        通过 Jackett Torznab 接口检索单个索引器。
+        检索资源。
+
+        MoviePilot V3 只在「插件资源源」通道调用本方法一次，且固定传入空的 site；此时需要
+        自行遍历全部已桥接索引器并合并结果。site 非空时保留按站点检索的旧行为。
+
+        :param site: 站点信息，插件资源源调用时为空
+        :param keyword: 搜索关键词
+        :param mtype: 媒体类型
+        :param page: 页码
+        :return: 资源列表
+        """
+        if not self.get_state():
+            return []
+
+        if site:
+            return self.__search_managed_site(site=site, keyword=keyword, mtype=mtype, page=page)
+
+        return self.__search_bridged_indexers(keyword=keyword, mtype=mtype, page=page)
+
+    def __search_managed_site(self, site: dict, keyword: str = None,
+                              mtype: Optional[MediaType] = None,
+                              page: Optional[int] = 0) -> List[TorrentInfo]:
+        """
+        按指定站点检索单个索引器，站点不属于本插件托管时返回空列表。
 
         :param site: 站点信息
         :param keyword: 搜索关键词
@@ -786,11 +821,8 @@ class JackettBridge(_PluginBase):
         :param page: 页码
         :return: 资源列表
         """
-        results: List[TorrentInfo] = []
-        if not self.get_state():
-            return results
-        if not site or not self.__is_managed_site(site):
-            return results
+        if not self.__is_managed_site(site):
+            return []
 
         indexer_id = self.__get_indexer_id(site)
         if not indexer_id:
@@ -798,7 +830,7 @@ class JackettBridge(_PluginBase):
                 f"【{self.plugin_name}】无法解析索引器 ID，跳过站点：{site.get('name')}"
                 f"（domain={site.get('domain')}）"
             )
-            return results
+            return []
 
         # 已不在当前桥接列表中的残留站点直接跳过
         if self._indexers:
@@ -807,9 +839,118 @@ class JackettBridge(_PluginBase):
                 logger.warn(
                     f"【{self.plugin_name}】索引器 {indexer_id} 已不在桥接列表，跳过残留站点：{site.get('name')}"
                 )
-                return results
+                return []
 
-        site_name = str(site.get("name") or "").replace(f"{self.plugin_name}-", "", 1)
+        return self.__query_jackett(
+            indexer_id=indexer_id,
+            site=site,
+            keyword=keyword,
+            mtype=mtype,
+            page=page,
+        )
+
+    def __search_bridged_indexers(self, keyword: str = None,
+                                  mtype: Optional[MediaType] = None,
+                                  page: Optional[int] = 0) -> List[TorrentInfo]:
+        """
+        插件资源源入口：并发检索全部已桥接索引器并合并结果。
+
+        :param keyword: 搜索关键词
+        :param mtype: 媒体类型
+        :param page: 页码
+        :return: 合并后的资源列表
+        """
+        if not self._indexers:
+            logger.warn(f"【{self.plugin_name}】插件资源源检索失败：尚未同步到任何索引器")
+            return []
+
+        indexers = [item for item in self._indexers if item.get("indexer_id")]
+        if not indexers:
+            logger.warn(f"【{self.plugin_name}】插件资源源检索失败：索引器快照缺少索引器 ID")
+            return []
+
+        started = time.monotonic()
+        results: List[TorrentInfo] = []
+        details: List[str] = []
+        max_workers = max(1, min(len(indexers), DEFAULT_PARALLEL_INDEXERS))
+        logger.info(
+            f"【{self.plugin_name}】插件资源源开始检索 {len(indexers)} 个索引器，关键词：{keyword}"
+        )
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="JackettBridgeSearch",
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self.__query_jackett,
+                    indexer_id=str(item.get("indexer_id")),
+                    site=self.__resolve_indexer_site(item),
+                    keyword=keyword,
+                    mtype=mtype,
+                    page=page,
+                ): item
+                for item in indexers
+            }
+            for future in as_completed(futures):
+                item = futures[future]
+                label = str(item.get("origin_name") or item.get("name") or item.get("indexer_id"))
+                try:
+                    items = future.result() or []
+                except Exception as e:
+                    logger.error(
+                        f"【{self.plugin_name}】{label} 检索异常：{str(e)}\n{traceback.format_exc()}"
+                    )
+                    details.append(f"{label} 异常")
+                    continue
+                results.extend(items)
+                details.append(f"{label} {len(items)} 条")
+
+        elapsed = int((time.monotonic() - started) * 1000)
+        detail_text = "，".join(details)
+        logger.info(
+            f"【{self.plugin_name}】插件资源源检索完成：合计 {len(results)} 条，"
+            f"耗时 {elapsed}ms；{detail_text}"
+        )
+        return results
+
+    def __resolve_indexer_site(self, indexer: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        取索引器对应的运行时站点信息，用于标注检索结果的归属站点。
+
+        优先使用已注册到站点索引助手的条目，保证 site、site_name 等字段与站点体系一致；
+        未注册或读取失败时回退到索引器快照本身。
+
+        :param indexer: 索引器快照
+        :return: 站点信息字典
+        """
+        domain = indexer.get("domain")
+        if domain:
+            try:
+                registered = self.sites_helper.get_indexer(domain)
+            except Exception as e:
+                registered = None
+                logger.warn(f"【{self.plugin_name}】读取站点索引 {domain} 失败：{str(e)}")
+            if isinstance(registered, dict) and registered:
+                site = dict(registered)
+                site["indexer_id"] = indexer.get("indexer_id")
+                site.setdefault("name", indexer.get("name"))
+                site.setdefault("domain", domain)
+                return site
+        return dict(indexer)
+
+    def __query_jackett(self, indexer_id: str, site: dict, keyword: str = None,
+                        mtype: Optional[MediaType] = None,
+                        page: Optional[int] = 0) -> List[TorrentInfo]:
+        """
+        请求单个 Jackett 索引器的 Torznab 接口并解析为资源列表。
+
+        :param indexer_id: Jackett 索引器 ID
+        :param site: 用于标注检索结果的站点信息
+        :param keyword: 搜索关键词
+        :param mtype: 媒体类型
+        :param page: 页码
+        :return: 资源列表，失败时返回空列表
+        """
         # 系统站点分类（cat）与 Torznab 分类体系不同，这里只按媒体类型映射
         params = [
             ("apikey", self._api_key),
@@ -821,11 +962,12 @@ class JackettBridge(_PluginBase):
         ]
         api_url = f"{self._host}/api/v2.0/indexers/{indexer_id}/results/torznab/api?" \
                   f"{urlencode(params, quote_via=quote_plus)}"
+        site_label = str(site.get("name") or indexer_id).replace(f"{self.plugin_name}-", "", 1)
 
         started = time.monotonic()
         try:
             logger.info(
-                f"【{self.plugin_name}】开始检索索引器：{site.get('name')}，关键词：{keyword}，"
+                f"【{self.plugin_name}】开始检索索引器：{site_label}，关键词：{keyword}，"
                 f"timeout={self._search_timeout}s"
             )
             res = RequestUtils(
@@ -834,18 +976,21 @@ class JackettBridge(_PluginBase):
             ).get_res(api_url)
             elapsed = int((time.monotonic() - started) * 1000)
             if not res:
-                logger.warn(f"【{self.plugin_name}】{site.get('name')} 检索无响应，耗时 {elapsed}ms")
-                return results
+                logger.warn(f"【{self.plugin_name}】{site_label} 检索无响应，耗时 {elapsed}ms")
+                return []
             if res.status_code >= 400:
-                logger.error(f"【{self.plugin_name}】{site.get('name')} 检索失败：HTTP {res.status_code}")
-                return results
-            results = self.__parse_torznab(res.text, site=site, site_name=site_name)
+                logger.error(f"【{self.plugin_name}】{site_label} 检索失败：HTTP {res.status_code}")
+                return []
+            results = self.__parse_torznab(res.text, site=site, site_name=site_label)
             logger.info(
-                f"【{self.plugin_name}】{site.get('name')} 检索完成：{len(results)} 条，耗时 {elapsed}ms"
+                f"【{self.plugin_name}】{site_label} 检索完成：{len(results)} 条，耗时 {elapsed}ms"
             )
+            return results
         except Exception as e:
-            logger.error(f"【{self.plugin_name}】{site.get('name')} 检索出错：{str(e)}\n{traceback.format_exc()}")
-        return results
+            logger.error(
+                f"【{self.plugin_name}】{site_label} 检索出错：{str(e)}\n{traceback.format_exc()}"
+            )
+            return []
 
     async def async_search_torrents(self, site: dict, keyword: str = None, mtype: Optional[MediaType] = None,
                                    page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
@@ -861,24 +1006,31 @@ class JackettBridge(_PluginBase):
             **kwargs,
         )
 
-    def refresh_torrents(self, site: dict, keyword: str = None, cat: str = None,
+    def refresh_torrents(self, site: Optional[dict] = None, keyword: str = None,
+                         cat: str = None,
                          page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
         """
         获取索引器最新种子，供订阅刷新（spider 模式）与站点资源浏览使用。
 
         Torznab 不分页浏览首页，这里只在第 0 页返回数据，避免订阅刷新重复请求。
+        与检索一致，site 为空时按「插件资源源」合并全部已桥接索引器。
 
-        :param site: 站点信息
+        :param site: 站点信息，插件资源源刷新时为空
         :param keyword: 关键词，订阅刷新时为空表示取最新
         :param cat: 系统站点分类，Torznab 分类体系不同，忽略
         :param page: 页码
         :return: 资源列表
         """
-        if not site or not self.__is_managed_site(site):
+        if not self.get_state():
+            return []
+        if not site:
+            # 插件资源源刷新：合并全部已桥接索引器的最新种子
+            return self.__search_bridged_indexers(keyword=keyword, mtype=None, page=0)
+        if not self.__is_managed_site(site):
             return []
         if (page or 0) > 0:
             return []
-        return self.search_torrents(site=site, keyword=keyword, mtype=None, page=0)
+        return self.__search_managed_site(site=site, keyword=keyword, mtype=None, page=0)
 
     async def async_refresh_torrents(self, site: dict, keyword: str = None, cat: str = None,
                                      page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
@@ -930,6 +1082,8 @@ class JackettBridge(_PluginBase):
                 leechers = max(0, total_peers - seeders) if total_peers else 0
             categories = [text.strip() for text in
                           (item.findtext("category") or "").split(",") if text.strip()]
+            # MoviePilot V3 的 TorrentInfo 用 media_source/media_id 取代了 V2 的 imdbid 字段
+            imdb_id = self.__parse_imdbid(attrs.get("imdb") or attrs.get("imdbid"))
             results.append(TorrentInfo(
                 site=site.get("id"),
                 site_name=site_name,
@@ -947,7 +1101,8 @@ class JackettBridge(_PluginBase):
                 peers=leechers,
                 grabs=self.__to_number(attrs.get("grabs"), 0),
                 pubdate=self.__parse_pubdate(item.findtext("pubDate")),
-                imdbid=self.__parse_imdbid(attrs.get("imdb") or attrs.get("imdbid")),
+                media_source=MediaSource.IMDb if imdb_id else None,
+                media_id=imdb_id,
                 labels=categories,
                 category=self.__infer_category(categories),
                 downloadvolumefactor=self.__to_number(attrs.get("downloadvolumefactor"), 1.0),
