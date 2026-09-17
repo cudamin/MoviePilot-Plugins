@@ -20,7 +20,7 @@ from app.sdk.media import Context, MediaInfo, MetaInfo, TorrentInfo
 from app.sdk.network import RequestUtils, RssHelper
 from app.sdk.services import DownloaderHelper, RuleHelper
 from app.sdk.utilities import SystemUtils
-from app.schemas.types import EventType, MediaType
+from app.schemas.types import EventType, MediaSource, MediaType
 
 
 class RawTorrent:
@@ -47,7 +47,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理＆RSS过滤"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "5.1.0"
+    plugin_version = "5.1.1"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -87,7 +87,7 @@ class SpaceCleaner(_PluginBase):
     _rss_ai_identify = False  # 智能助手识别兜底：识别失败/无集号/季号不一致时交给 LLM 接管识别
     _rss_ai_add_words = True  # 智能助手识别成功后自动写入自定义识别词，避免下次再失败
     _rss_ai_max = 5  # 单轮 RSS 刷新最多调用智能助手的次数
-    _rss_proxy_retry = False  # 种子下载失败时使用系统代理服务器重试一次
+    _rss_proxy_retry = True  # 优先使用代理：RSS 刷新与种子获取优先走系统代理，失败自动回退直连
     _rss_save_path = ""  # RSS 下载自定义保存路径
 
     # === 内部状态 ===
@@ -168,7 +168,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_ai_identify = False
         self._rss_ai_add_words = True
         self._rss_ai_max = 5
-        self._rss_proxy_retry = False
+        self._rss_proxy_retry = True
         self._rss_save_path = ""
         self._pb = self._latest_episode_records(list(self.get_data("pb") or []))
         self.save_data("pb", self._pb)
@@ -233,7 +233,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_ai_identify = bool(config.get("rss_ai_identify"))
         self._rss_ai_add_words = bool(config.get("rss_ai_add_words", True))
         self._rss_ai_max = self._to_int(config.get("rss_ai_max"), 5, 1, 50)
-        self._rss_proxy_retry = bool(config.get("rss_proxy_retry"))
+        self._rss_proxy_retry = bool(config.get("rss_proxy_retry", True))
         self._rss_save_path = str(config.get("rss_save_path") or "")
 
         if self._enabled:
@@ -835,7 +835,7 @@ class SpaceCleaner(_PluginBase):
                 {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSelect", "props": {"model": "rss_rule_group", "label": "优先级规则组", "items": groups, "clearable": True, "hint": "留空不过滤", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [{"component": "VTextField", "props": {"model": "rss_save_path", "label": "自定义保存路径", "placeholder": "留空使用默认路径", "hint": "支持 <storage>:<path> 格式", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_proxy_retry", "label": "代理重试", "hint": "取种失败时用系统代理重试一次", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_proxy_retry", "label": "优先使用代理", "hint": "RSS 刷新与种子获取优先走系统代理，失败自动回退直连（需配置系统代理）", "persistent-hint": True}}]},
                 ]},
                 divider,
                 section("RSS 源与过滤"),
@@ -878,7 +878,7 @@ class SpaceCleaner(_PluginBase):
             "rss_dl": "", "rss_rule_group": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
             "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False,
             "rss_fname_identify": False, "rss_ai_identify": False, "rss_ai_add_words": True, "rss_ai_max": 5,
-            "rss_proxy_retry": False, "rss_save_path": "",
+            "rss_proxy_retry": True, "rss_save_path": "",
         }
 
     # ==================== 详情页 ====================
@@ -1920,6 +1920,26 @@ class SpaceCleaner(_PluginBase):
             "items": items,
         }
 
+    @staticmethod
+    def _tmdbid_of(identity) -> Optional[int]:
+        """从带 media_source/media_id 的媒体身份对象解析 TMDB ID。
+
+        MoviePilot v3 起不再使用 tmdbid 字段：TMDB 媒体身份统一为
+        media_source='themoviedb' + 数字字符串 media_id 成对存储（整理记录与
+        MetaInfo 同理）。非 TMDB 来源（如豆瓣）或身份缺失时返回 None。
+        """
+        media_id = getattr(identity, "media_id", None)
+        if not media_id:
+            return None
+        source = getattr(identity, "media_source", None)
+        source_value = getattr(source, "value", source)
+        if str(source_value or "").strip().lower() != "themoviedb":
+            return None
+        try:
+            return int(str(media_id).strip())
+        except (TypeError, ValueError):
+            return None
+
     def _collect_delete_units(self, log_skipped: bool = True) -> List[dict]:
         """收集本轮满足删除条件的删除单元，按「优先标记 + 时间」排序后返回。
 
@@ -1965,13 +1985,14 @@ class SpaceCleaner(_PluginBase):
                     break
                 for r in recs:
                     # 无播放缓存记录的资源直接跳过，节省后续处理
-                    if not r.tmdbid or r.tmdbid not in pb_tmdbids:
+                    tid = self._tmdbid_of(r)
+                    if not tid or tid not in pb_tmdbids:
                         continue
                     if r.download_hash:
                         hash_groups.setdefault(r.download_hash, []).append(r)
                     elif r.type == "电视剧":
                         no_hash_records.append(r)
-                    elif r.type != "电视剧" and r.tmdbid:
+                    elif tid:
                         # 电影无 hash：直接检查 pb 中的 {tmdbid}:M
                         no_hash_records.append(r)
                 offset += len(recs)
@@ -1979,7 +2000,7 @@ class SpaceCleaner(_PluginBase):
             def _snap(r):
                 return {"id": r.id, "title": r.title or "未知", "type": r.type or "",
                         "seasons": r.seasons or "", "episodes": r.episodes or "",
-                        "src": r.src or "", "dest": r.dest or "", "tmdbid": r.tmdbid,
+                        "src": r.src or "", "dest": r.dest or "", "tmdbid": self._tmdbid_of(r),
                         "download_hash": r.download_hash or "",
                         "downloader": r.downloader or "",
                         "src_fileitem": r.src_fileitem or {},
@@ -1991,7 +2012,10 @@ class SpaceCleaner(_PluginBase):
 
             def _movie_watched_time(rec):
                 """电影：pb 中 {tmdbid}:M 已看完才返回其缓存时间，否则 None。"""
-                p = pb_by_key.get(f"{rec.tmdbid}:M")
+                tid = self._tmdbid_of(rec)
+                if not tid:
+                    return None
+                p = pb_by_key.get(f"{tid}:M")
                 if not p:
                     return None
                 if (p.get("p", 0) or 0) >= self._watched_threshold:
@@ -2024,7 +2048,7 @@ class SpaceCleaner(_PluginBase):
                 """电视剧整季判断：以整理记录中该季出现的最后一集为准，
                 只有最后一集已看完才返回 (缓存时间, None)，否则返回 (None, 跳过原因)。
                 例：记录含 S01E01~S01E13，则需 S01E13 看完才删除整季。"""
-                tmdbid = recs[0].tmdbid
+                tmdbid = self._tmdbid_of(recs[0])
                 title = recs[0].title or "未知"
                 season = None
                 max_ep = 0
@@ -2054,7 +2078,7 @@ class SpaceCleaner(_PluginBase):
             def _add_tv_season_unit(recs):
                 """一个 (tmdbid, season) 的所有整理记录构成一个删除单元。"""
                 t, skip_reason = _season_last_watched_time(recs)
-                tmdbid = recs[0].tmdbid
+                tmdbid = self._tmdbid_of(recs[0])
                 season = self._norm_season(recs[0].seasons or "")
                 # 排序键：该季在播放缓存中最早的标记时间（越早越先处理）
                 mark_time = _unit_earliest_mark_time(tmdbid, season)
@@ -2063,7 +2087,7 @@ class SpaceCleaner(_PluginBase):
                         skip_logs.append((mark_time, skip_reason))
                     return
                 rep = max(recs, key=_ep_max)
-                tmdbid = rep.tmdbid
+                tmdbid = self._tmdbid_of(rep)
                 season = self._norm_season(rep.seasons or "")
                 dh = ""
                 for rr in recs:
@@ -2090,7 +2114,7 @@ class SpaceCleaner(_PluginBase):
                 if t is None:
                     return
                 rep = recs[0]
-                tmdbid = rep.tmdbid
+                tmdbid = self._tmdbid_of(rep)
                 dh = ""
                 for rr in recs:
                     if rr.download_hash:
@@ -2119,24 +2143,26 @@ class SpaceCleaner(_PluginBase):
             # 电影：按 tmdbid 归并（跨种子/跨版本），同一部电影的所有版本只生成一个删除单元
             movie_tmdb_groups: Dict[int, List[TransferHistory]] = {}
             for r in all_records:
-                if not r.tmdbid:
+                tid = self._tmdbid_of(r)
+                if not tid:
                     continue
                 if (r.type or "") == "电视剧":
                     season = self._norm_season(r.seasons or "")
                     if season is None:
                         continue  # 无法判定季，跳过
-                    key = f"{r.tmdbid}:S{season:02d}"
+                    key = f"{tid}:S{season:02d}"
                     tv_season_groups.setdefault(key, []).append(r)
                 else:
-                    movie_tmdb_groups.setdefault(r.tmdbid, []).append(r)
+                    movie_tmdb_groups.setdefault(tid, []).append(r)
 
             # 电视剧：同一 TMDB 存在多个季度时，升级为整剧删除单元。
             # 规则：必须等待整理记录中最后一季的最后一集播放完成后，才删除所有季度；
             # 若最后一季最后一集未看完，则跳过该剧所有季度，让其他已看资源优先删除。
             tv_show_groups: Dict[int, List[TransferHistory]] = {}
             for recs in tv_season_groups.values():
-                if recs and recs[0].tmdbid:
-                    tv_show_groups.setdefault(recs[0].tmdbid, []).extend(recs)
+                tid = self._tmdbid_of(recs[0]) if recs else None
+                if tid:
+                    tv_show_groups.setdefault(tid, []).extend(recs)
 
             def _unit_earliest_show_mark_time(tmdbid, seasons):
                 """取整剧全部季在播放缓存中最早的标记时间（排序用）。
@@ -2161,25 +2187,26 @@ class SpaceCleaner(_PluginBase):
                 last_season = seasons[-1]
                 last_season_records = [r for r in recs if self._norm_season(r.seasons or "") == last_season]
                 t, reason = _season_last_watched_time(last_season_records)
-                mark_time = _unit_earliest_show_mark_time(recs[0].tmdbid, seasons)
+                mark_time = _unit_earliest_show_mark_time(self._tmdbid_of(recs[0]), seasons)
                 if t is None:
                     title = recs[0].title or "未知"
                     skip_logs.append((mark_time, f"{title}: 多季度整剧最后一季 S{last_season:02d} 最后一集未看完，跳过全部季度"))
                     return
 
                 rep = max(recs, key=_ep_max)
+                tmdbid = self._tmdbid_of(rep)
                 dh = next((r.download_hash for r in recs if r.download_hash), "")
                 ep_count = len({e for r in recs for e in self._episode_set(r.episodes or "")})
                 delete_units.append({
                     "records": [_snap(r) for r in recs],
                     "hash": dh,
-                    "tmdbid": rep.tmdbid,
+                    "tmdbid": tmdbid,
                     "season": None,
                     "is_tv": True,
                     "display": f"{rep.title or '未知'}（整剧 {len(seasons)} 季 {ep_count} 集）",
                     "sort_time": mark_time,
                     "lib_time": _unit_earliest_lib_time(recs),
-                    "prio": str(rep.tmdbid) in prio_tmdbids,
+                    "prio": str(tmdbid) in prio_tmdbids,
                 })
 
             for recs in tv_show_groups.values():
@@ -2415,13 +2442,17 @@ class SpaceCleaner(_PluginBase):
             sess = ScopedSession()
             try:
                 recs = sess.query(TransferHistory).filter(
-                    TransferHistory.tmdbid.in_(list(tmdbids)),
+                    # v3 媒体身份为 media_source + media_id 成对字段，不再有 tmdbid 列
+                    TransferHistory.media_source == "themoviedb",
+                    TransferHistory.media_id.in_([str(t) for t in tmdbids]),
                     TransferHistory.status == True
                 ).all()
                 for r in recs:
                     if r.id in unit_ids or r.id in found:
                         continue
-                    tid = r.tmdbid
+                    tid = self._tmdbid_of(r)
+                    if not tid:
+                        continue
                     if (r.type or "") == "电视剧":
                         season = self._norm_season(r.seasons or "")
                         if season is None or (tid, season) not in tv_seasons:
@@ -2509,11 +2540,13 @@ class SpaceCleaner(_PluginBase):
             sess = ScopedSession()
             try:
                 recs = sess.query(TransferHistory).filter(
-                    TransferHistory.tmdbid.in_(list(tmdbids)),
+                    # v3 媒体身份为 media_source + media_id 成对字段，不再有 tmdbid 列
+                    TransferHistory.media_source == "themoviedb",
+                    TransferHistory.media_id.in_([str(t) for t in tmdbids]),
                     TransferHistory.status == True
                 ).all()
                 for r in recs:
-                    tid = r.tmdbid
+                    tid = self._tmdbid_of(r)
                     if not tid:
                         continue
                     if (r.type or "") == "电视剧":
@@ -3056,6 +3089,29 @@ class SpaceCleaner(_PluginBase):
             self._rss_busy = False
         logger.info("SC-RSS 运行完成")
 
+    def _rss_parse(self, url: str):
+        """拉取并解析 RSS 源，返回 RssHelper.parse 的结果（列表 / False / None）。
+
+        优先使用代理：开启且配置了系统代理时先走系统代理——容器直连受限的站点
+        （如 mikanani）不再等待 15 秒超时后空跑并刷出「获取RSS失败」错误日志；
+        代理刷新失败则关闭代理、回退直连。
+        """
+        if self._rss_proxy_retry and settings.PROXY:
+            try:
+                items = RssHelper().parse(url, proxy=True)
+            except Exception as e:
+                logger.warning(f"SC-RSS 解析 RSS 异常（代理）[{url}]: {e}")
+                items = False
+            # False 表示请求失败：关闭代理回退直连；None/空列表是有效结果（RSS 过期或无条目），直接返回。
+            if items is not False:
+                return items
+            logger.info(f"SC-RSS 代理刷新失败，回退直连: {url}")
+        try:
+            return RssHelper().parse(url)
+        except Exception as e:
+            logger.warning(f"SC-RSS 解析 RSS 异常（直连）[{url}]: {e}")
+            return False
+
     def _rss_run_dedup(self, urls: List[str]):
         """洗版模式（一集一个槽位）：收集所有 URL 的 RSS 条目，播放进度低于阈值时触发洗版；
         同一集有多个版本时只下载最早发布的版本，已洗版下载过的集在后续刷新中不再重复下载。"""
@@ -3063,11 +3119,7 @@ class SpaceCleaner(_PluginBase):
         all_candidates = OrderedDict()  # dedup_key -> (item, m, meta, s_season, se_fmt, ts)
         total_items = 0
         for url in urls:
-            try:
-                items = RssHelper().parse(url)
-            except Exception as e:
-                logger.error(f"SC-RSS 解析 RSS 失败 [{url}]: {e}")
-                continue
+            items = self._rss_parse(url)
             if not items:
                 logger.info(f"SC-RSS 未获取到新报文: {url}")
                 continue
@@ -3328,11 +3380,7 @@ class SpaceCleaner(_PluginBase):
     def _rss_proc(self, url: str):
         """普通模式（未开启洗版）：不做 TMDB 识别，直接添加种子到下载器。
         去重由 _rss_seen（enclosure 有序集合，持久化）保证，避免重复添加同一个种子。"""
-        try:
-            items = RssHelper().parse(url)
-        except Exception as e:
-            logger.error(f"SC-RSS 解析 RSS 失败 [{url}]: {e}")
-            return
+        items = self._rss_parse(url)
         if not items:
             logger.info(f"SC-RSS 未获取到新报文: {url}")
             return
@@ -3581,7 +3629,8 @@ class SpaceCleaner(_PluginBase):
                 except (TypeError, ValueError):
                     media_type = MediaType.UNKNOWN
             media = MediaInfo(
-                source="themoviedb",
+                media_source=MediaSource.TMDB,
+                media_id=str(int(entry.get("tmdb_id"))),
                 type=media_type or MediaType.UNKNOWN,
                 title=entry.get("title") or getattr(meta, "name", ""),
                 year=entry.get("year") or None,
@@ -3617,7 +3666,8 @@ class SpaceCleaner(_PluginBase):
                     except (TypeError, ValueError):
                         cached_type = media_type
                 media = MediaInfo(
-                    source="themoviedb",
+                    media_source=MediaSource.TMDB,
+                    media_id=str(int(cached.get("id"))),
                     type=cached_type,
                     title=cached.get("title") or getattr(meta, "name", ""),
                     year=str(cached.get("year") or "") or None,
@@ -3656,8 +3706,10 @@ class SpaceCleaner(_PluginBase):
             if not tmdb_module:
                 return media
             before = (meta.begin_season, meta.begin_episode)
+            # v3 按 ID 查询：原 tmdbid 参数已移除，改为 media_source + media_id 成对传入
             full = tmdb_module.recognize_media(meta=meta, mtype=MediaType.TV,
-                                               tmdbid=int(media.tmdb_id))
+                                               media_source=MediaSource.TMDB,
+                                               media_id=str(int(media.tmdb_id)))
             if not full:
                 self._rss_log("详情补全失败", getattr(media, "title", ""),
                               f"TMDB={media.tmdb_id} 未取到详情，沿用缓存精简信息")
@@ -3887,8 +3939,9 @@ class SpaceCleaner(_PluginBase):
             if season is not None and (got_season or 1) != int(season):
                 self._rss_log("识别词校验失败", word, f"解析季号 {got_season} != 期望 {season}")
                 return False
-        if tmdb_id and getattr(meta, "tmdbid", None) and int(meta.tmdbid) != int(tmdb_id):
-            self._rss_log("识别词校验失败", word, f"解析 TMDB {meta.tmdbid} != 期望 {tmdb_id}")
+        parsed_tmdbid = self._tmdbid_of(meta)
+        if tmdb_id and parsed_tmdbid and parsed_tmdbid != int(tmdb_id):
+            self._rss_log("识别词校验失败", word, f"解析 TMDB {parsed_tmdbid} != 期望 {tmdb_id}")
             return False
         return True
 
@@ -3951,10 +4004,13 @@ class SpaceCleaner(_PluginBase):
             self._rss_log("智能助手识别异常", getattr(meta, "name", ""), "TMDB 官方识别模块未运行")
             return None
         mtype = MediaType.TV if str(guess.get("media_type") or "tv").lower() != "movie" else MediaType.MOVIE
-        tmdb_id = self._rss_ai_int(guess.get("tmdb_id")) or self._rss_ai_int(getattr(meta, "tmdbid", None))
+        tmdb_id = self._rss_ai_int(guess.get("tmdb_id")) or self._tmdbid_of(meta)
         try:
             if tmdb_id:
-                return tmdb_module.recognize_media(meta=meta, mtype=mtype, tmdbid=int(tmdb_id))
+                # v3 按 ID 查询：原 tmdbid 参数已移除，改为 media_source + media_id 成对传入
+                return tmdb_module.recognize_media(meta=meta, mtype=mtype,
+                                                   media_source=MediaSource.TMDB,
+                                                   media_id=str(int(tmdb_id)))
             # 未给出 TMDB ID：用智能助手判断的标题+年份重新按名称识别
             title = str(guess.get("title") or "").strip()
             if not title:
@@ -4087,8 +4143,8 @@ class SpaceCleaner(_PluginBase):
                 meta.begin_season = int(season)
             if getattr(meta, "begin_episode", None) is None or int(meta.begin_episode) != int(episode):
                 meta.begin_episode = int(episode)
-            if not getattr(meta, "episode_list", None):
-                meta.episode_list = [int(episode)]
+            # v3 的 episode_list 为只读派生属性（由 begin_episode/end_episode 生成），
+            # 集号已写入 begin_episode，无需（也无法）再单独赋值。
 
         media = self._rss_ai_recognize_media(meta, guess)
         if not media or not getattr(media, "tmdb_id", None):
@@ -4319,24 +4375,22 @@ class SpaceCleaner(_PluginBase):
         return r.content, ""
 
     def _rss_fetch_torrent(self, enc: str, tag: str = "") -> Optional[bytes]:
-        """下载 .torrent 文件内容；失败且开启「代理重试」时，用系统代理服务器再重试一次。"""
+        """下载 .torrent 文件内容。
+
+        优先使用代理：开启且配置了系统代理时先走系统代理（容器直连受限的站点
+        不再等待超时）；代理获取失败则关闭代理、回退直连。
+        """
         if not enc:
             return None
+        if self._rss_proxy_retry and settings.PROXY:
+            content, perr = self._rss_http_torrent(enc, proxies=settings.PROXY)
+            if content is not None:
+                return content
+            logger.info(f"SC-RSS 代理获取种子文件失败{tag}: {enc} {perr}，回退直连")
         content, err = self._rss_http_torrent(enc)
         if content is not None:
             return content
-        if not self._rss_proxy_retry:
-            logger.warning(f"SC-RSS 下载种子文件失败{tag}: {enc} {err}")
-            return None
-        if not settings.PROXY:
-            logger.warning(f"SC-RSS 下载种子文件失败{tag}: {enc} {err}，未配置代理服务器，无法重试")
-            return None
-        logger.info(f"SC-RSS 下载种子文件失败{tag}: {err}，使用代理服务器重试")
-        content, perr = self._rss_http_torrent(enc, proxies=settings.PROXY)
-        if content is not None:
-            logger.info(f"SC-RSS 代理重试下载种子文件成功{tag}: {enc}")
-            return content
-        logger.warning(f"SC-RSS 代理重试下载种子文件仍失败{tag}: {enc} {perr}")
+        logger.warning(f"SC-RSS 下载种子文件失败{tag}: {enc} {err}")
         return None
 
     def _rss_fnames(self, enc: str) -> List[str]:
@@ -4398,9 +4452,8 @@ class SpaceCleaner(_PluginBase):
                           f"从原始标题提取 S{fallback.begin_season or 1:02d}E{fallback.begin_episode:02d}")
             meta.begin_season = fallback.begin_season if fallback.begin_season is not None else (meta.begin_season or 1)
             meta.begin_episode = fallback.begin_episode
-            # 同时更新 episode_list 供 MP 下载链使用
-            if not hasattr(meta, "episode_list") or meta.episode_list is None:
-                meta.episode_list = [fallback.begin_episode]
+            # 同时更新集号供 MP 下载链使用：v3 的 episode_list 为只读派生属性，
+            # 随 begin_episode 自动生成，无需手动赋值。
         return meta
 
     def _rss_log_meta(self, stage: str, raw: str, meta) -> None:
@@ -4487,24 +4540,24 @@ class SpaceCleaner(_PluginBase):
                     return result
                 return result, None
 
-            h, err = _do_download()
-            if h:
-                return True
-            # 代理重试：自行用系统代理下载种子内容后再交给下载链
-            if self._rss_proxy_retry and not enc.lower().startswith("magnet:"):
-                if not settings.PROXY:
-                    logger.warning(f"SC-RSS 下载失败: {m.title} {err}，未配置代理服务器，无法重试")
-                    return False
-                logger.info(f"SC-RSS 下载失败: {m.title} {err}，使用代理服务器重试")
+            # 优先使用代理：开启且已配置系统代理时，先用代理取种子文件内容再交下载链；
+            # 失败则关闭代理，回退直连（由下载链自行获取种子）再试一次。
+            content: Optional[bytes] = None
+            if self._rss_proxy_retry and settings.PROXY and not enc.lower().startswith("magnet:"):
                 content, perr = self._rss_http_torrent(enc, proxies=settings.PROXY)
                 if content is None:
-                    logger.warning(f"SC-RSS 代理重试下载种子文件失败: {m.title} {perr}")
-                    return False
-                h2, err2 = _do_download(content)
+                    logger.warning(f"SC-RSS 代理获取种子文件失败: {m.title} {perr}，回退直连")
+            h, err = _do_download(content)
+            if h:
+                return True
+            if content is not None:
+                # 代理路径失败：关闭代理回退直连再试一次
+                logger.warning(f"SC-RSS 下载失败: {m.title} {err}，关闭代理回退直连重试")
+                h2, err2 = _do_download()
                 if h2:
-                    logger.info(f"SC-RSS 代理重试下载成功: {m.title}")
+                    logger.info(f"SC-RSS 直连重试下载成功: {m.title}")
                     return True
-                logger.warning(f"SC-RSS 代理重试下载仍失败: {m.title} {err2}")
+                logger.warning(f"SC-RSS 直连重试下载仍失败: {m.title} {err2}")
                 return False
             if err:
                 logger.warning(f"SC-RSS 下载失败: {m.title} {err}")
