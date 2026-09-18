@@ -50,7 +50,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -129,6 +129,11 @@ class JackettBridge(_PluginBase):
         self._indexer_catalog = self.__normalize_catalog(
             config.get("indexer_catalog")
         ) or self.__normalize_catalog(saved_config.get("indexer_catalog"))
+
+        if not self._enabled:
+            # 插件关闭：清理站点管理中的虚拟站点，保留索引器快照以便重新开启后自动恢复
+            self.__cleanup_managed_sites()
+            return
 
         if self._onlyonce:
             self._onlyonce = False
@@ -674,6 +679,34 @@ class JackettBridge(_PluginBase):
             logger.warn(f"【{self.plugin_name}】读取站点列表失败，跳过旧站点清理：{str(e)}")
             return []
         return [site for site in sites if self.__is_managed_domain(getattr(site, "domain", ""))]
+
+    def __cleanup_managed_sites(self) -> int:
+        """
+        清理站点管理中由本插件托管的全部虚拟站点。
+
+        插件关闭时调用：仅删除站点表记录，保留已同步的索引器快照（get_data("indexers")），
+        以便重新开启后通过 restore_only 同步自动恢复。
+
+        :return: 被删除的站点数量
+        """
+        removed = 0
+        for site in self.__get_managed_site_records():
+            site_id = getattr(site, "id", None)
+            if not site_id:
+                continue
+            try:
+                self.site_oper.delete(site_id)
+                removed += 1
+            except Exception as e:
+                logger.warn(
+                    f"【{self.plugin_name}】删除虚拟站点失败（id={site_id}）：{str(e)}"
+                )
+        if removed:
+            self.eventmanager.send_event(EventType.SiteDeleted, {"plugin_id": self.plugin_name})
+            logger.info(
+                f"【{self.plugin_name}】插件已关闭，清理站点管理中的虚拟站点 {removed} 个"
+            )
+        return removed
 
     def __sync_site_records(self) -> Tuple[List[int], List[int]]:
         """
