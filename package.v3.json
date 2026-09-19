@@ -90,22 +90,5 @@
       "v1.2.0": "修复bug",
       "v1.0.0": "test"
     }
-  },
-  "PostSubscribe": {
-    "name": "新订阅不自动搜索",
-    "description": "添加订阅后阻止自动搜索资源，RSS 订阅下载和手动搜索不受影响。",
-    "labels": "订阅管理",
-    "version": "1.4.0",
-    "icon": "pause.png",
-    "author": "tafei",
-    "author_url": "https://github.com/cudamin",
-    "level": 1,
-    "release": true,
-    "system_version": ">=3.0.1",
-    "history": {
-      "v1.4.0": "适配 MoviePilot V3：迁移订阅数据、事件与日志接口路径。",
-      "v1.3.0": "可用版本",
-      "v1.0.0": "测试版"
-    }
   }
 }
