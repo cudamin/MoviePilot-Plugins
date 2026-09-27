@@ -47,7 +47,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理＆RSS过滤"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "5.4.0"
+    plugin_version = "5.4.1"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -5158,8 +5158,8 @@ class SpaceCleaner(_PluginBase):
         """监听 MoviePilot 本地搜索/订阅等添加下载事件，触发种子重命名。
 
         插件自身 RSS 下载（username=SC-RSS）已由「监听RSS下载」处理，这里跳过避免重复。
-        本地下载按下载器中的种子名走缓存优先识别，与批量重命名逻辑一致，但识别结果
-        不写入插件独立缓存（write_cache=False）。
+        优先复用下载事件上下文里 MoviePilot 已识别好的媒体信息（不再识别、也不调用 TMDB API）；
+        仅在上下文缺失媒体信息时才回退按种子名走缓存优先识别，且识别结果不写入插件独立缓存。
         """
         if not (self._rename_on and self._rename_listen_native):
             return
@@ -5171,10 +5171,12 @@ class SpaceCleaner(_PluginBase):
                 thash = data.get("hash")
                 username = data.get("username")
                 source = data.get("source")
+                context = data.get("context")
             else:
                 thash = getattr(data, "hash", None)
                 username = getattr(data, "username", None)
                 source = getattr(data, "source", None)
+                context = getattr(data, "context", None)
         except Exception:
             return
         if not thash:
@@ -5182,12 +5184,16 @@ class SpaceCleaner(_PluginBase):
         # 跳过插件自身 RSS 下载，避免与「监听RSS下载」重复触发
         if str(username or "") == "SC-RSS":
             return
+        # 优先复用下载事件里 MoviePilot 已识别好的媒体信息，直接跳过重识别，
+        # 从根本上避免重复调用 TMDB API；缺失时才回退按种子名识别（write_cache=False）。
+        media = getattr(context, "media_info", None) if context is not None else None
+        meta = getattr(context, "meta_info", None) if context is not None else None
         label = "本地监听"
         orig_name = str(source or username or "")
         try:
             threading.Thread(
                 target=self._rss_rename_after_add,
-                args=(str(thash).strip(), None, None, orig_name),
+                args=(str(thash).strip(), media, meta, orig_name),
                 kwargs={"write_cache": False, "label": label},
                 daemon=True, name="SC-NativeRename").start()
         except Exception as exc:
