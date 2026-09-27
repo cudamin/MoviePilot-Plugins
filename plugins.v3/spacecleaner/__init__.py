@@ -47,7 +47,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理＆RSS过滤"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "5.3.1"
+    plugin_version = "5.4.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -98,6 +98,7 @@ class SpaceCleaner(_PluginBase):
                       "{% if season_episode %} - {{season_episode}}{% endif %}")
     _rename_once = False  # 立即运行一次
     _rss_rename_listen = False  # 监听RSS下载：BT动漫RSS下载/洗版板块添加种子到下载器时自动触发重命名
+    _rename_listen_native = False  # 监听本地下载：MoviePilot 搜索/订阅等添加下载时自动触发重命名（识别不写入独立缓存）
     _rename_skip_tagged = True  # 跳过已打标签的种子，避免重复重命名与重复识别
     _rename_tag = "SC-renamed"  # 重命名成功后打的标签
 
@@ -184,6 +185,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_proxy_retry = True
         self._rss_save_path = ""
         self._rename_on = self._rename_once = self._rss_rename_listen = False
+        self._rename_listen_native = False
         self._rename_skip_tagged = True
         self._rename_cron = ""
         self._rename_downloader = []
@@ -269,6 +271,7 @@ class SpaceCleaner(_PluginBase):
         fmt = str(config.get("rename_format") or "").strip()
         self._rename_format = fmt or self._rename_format
         self._rss_rename_listen = bool(config.get("rss_rename_listen"))
+        self._rename_listen_native = bool(config.get("rename_listen_native"))
         self._rename_skip_tagged = bool(config.get("rename_skip_tagged", True))
         self._rename_tag = str(config.get("rename_tag") or "SC-renamed").strip() or "SC-renamed"
         rename_once = bool(config.get("rename_once"))
@@ -342,6 +345,7 @@ class SpaceCleaner(_PluginBase):
             "rename_on": self._rename_on, "rename_cron": self._rename_cron,
             "rename_downloader": self._rename_downloader, "rename_format": self._rename_format,
             "rename_once": False, "rss_rename_listen": self._rss_rename_listen,
+            "rename_listen_native": self._rename_listen_native,
             "rename_skip_tagged": self._rename_skip_tagged, "rename_tag": self._rename_tag,
         })
 
@@ -935,6 +939,7 @@ class SpaceCleaner(_PluginBase):
                 {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rename_on", "label": "启用"}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_rename_listen", "label": "监听RSS下载", "hint": "开启后 BT动漫RSS下载/洗版板块添加种子到下载器时自动触发重命名", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rename_listen_native", "label": "监听本地下载", "hint": "开启后 MoviePilot 搜索/订阅等添加下载时自动触发重命名（识别结果不写入插件独立缓存）", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rename_once", "label": "立即运行一次"}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rename_skip_tagged", "label": "跳过已处理种子", "hint": "重命名成功后打标签，下次跳过，避免重复识别与改名", "persistent-hint": True}}]},
                 ]},
@@ -995,6 +1000,7 @@ class SpaceCleaner(_PluginBase):
             "rename_format": ("{{ title }}{% if year %} ({{ year }}){% endif %}"
                               "{% if season_episode %} - {{season_episode}}{% endif %}"),
             "rename_once": False, "rss_rename_listen": False,
+            "rename_listen_native": False,
             "rename_skip_tagged": True, "rename_tag": "SC-renamed",
         }
 
@@ -4813,12 +4819,13 @@ class SpaceCleaner(_PluginBase):
         except Exception:
             pass
 
-    def _recognize_media_by_name(self, name: str) -> Tuple[Optional[MediaInfo], MetaInfo]:
+    def _recognize_media_by_name(self, name: str, write_cache: bool = True) -> Tuple[Optional[MediaInfo], MetaInfo]:
         """按种子名称识别媒体，优先使用插件识别缓存。
 
         识别顺序与 RSS 保持一致：MetaInfo 解析（套用自定义识别词）→ 识别成功独立正缓存
         → 独立负缓存（命中则跳过）→ MoviePilot 本地识别缓存 → TMDB 官方 API。
         命中缓存后按 tmdb_id 补全季集详情。返回 (media, meta)，识别失败时 media 为 None。
+        write_cache=False 时（如本地搜索/订阅下载触发的识别）只读缓存、不写入插件独立缓存。
         """
         meta = MetaInfo(title=name)
         if not meta.name:
@@ -4842,7 +4849,8 @@ class SpaceCleaner(_PluginBase):
         if native_media:
             self._rename_log("命中本地识别缓存", name,
                              f"TMDB={native_media.tmdb_id} 《{native_media.title}》")
-            self._save_api_success_cache(cache_key, meta.name, native_media)
+            if write_cache:
+                self._save_api_success_cache(cache_key, meta.name, native_media)
             return self._complete_media_by_tmdbid(meta, native_media), meta
 
         # 4. TMDB 官方 API（绕过其识别缓存）
@@ -4856,11 +4864,13 @@ class SpaceCleaner(_PluginBase):
             self._rename_log("识别异常", name, f"TMDB 官方 API 调用失败: {exc}")
             return None, meta
         if media:
-            self._save_api_success_cache(cache_key, meta.name, media)
+            if write_cache:
+                self._save_api_success_cache(cache_key, meta.name, media)
             self._rename_log("TMDB官方API识别成功", name,
                              f"TMDB={media.tmdb_id} 《{media.title}》")
             return media, meta
-        self._save_api_negative_cache(cache_key, meta.name)
+        if write_cache:
+            self._save_api_negative_cache(cache_key, meta.name)
         self._rename_log("识别未命中", name, "TMDB 官方 API 未匹配到媒体")
         return None, meta
 
@@ -5072,19 +5082,21 @@ class SpaceCleaner(_PluginBase):
         except Exception as exc:
             self._rename_log("RSS监听", orig_name or str(thash), f"启动重命名线程失败: {exc}")
 
-    def _rss_rename_after_add(self, thash: str, media=None, meta=None, orig_name: str = "") -> None:
-        """对 RSS 刚添加的指定 hash 种子触发一次重命名（仅 qBittorrent）。
+    def _rss_rename_after_add(self, thash: str, media=None, meta=None, orig_name: str = "",
+                              write_cache: bool = True, label: str = "RSS监听") -> None:
+        """对刚添加的指定 hash 种子触发一次重命名（仅 qBittorrent）。
 
         种子添加后可能尚未在下载器登记，先短暂轮询取到该种子再改名。已带媒体识别
         结果（洗版链路）时直接复用，否则按种子显示名走缓存优先识别。
+        write_cache=False 时（本地搜索/订阅下载）识别结果不写入插件独立缓存。
         """
-        if not (self._rename_on and self._rss_rename_listen) or not thash:
+        if not self._rename_on or not thash:
             return
         tag = (self._rename_tag or "SC-renamed").strip()
         try:
             services = DownloaderHelper().get_services()
         except Exception as exc:
-            self._rename_log("RSS监听", orig_name or thash, f"获取下载器失败: {exc}")
+            self._rename_log(label, orig_name or thash, f"获取下载器失败: {exc}")
             return
         for name, service in (services or {}).items():
             instance = getattr(service, "instance", None)
@@ -5117,9 +5129,9 @@ class SpaceCleaner(_PluginBase):
                         return
                 m, mt = media, meta
                 if m is None or mt is None:
-                    m, mt = self._recognize_media_by_name(cur_name)
+                    m, mt = self._recognize_media_by_name(cur_name, write_cache=write_cache)
                 if not m:
-                    self._rename_log("RSS监听", cur_name, "识别失败，保持原名")
+                    self._rename_log(label, cur_name, "识别失败，保持原名")
                     return
                 new_name = self._render_rename(self._rename_format, mt, m, cur_name)
                 if not new_name or new_name == cur_name:
@@ -5135,9 +5147,49 @@ class SpaceCleaner(_PluginBase):
                         qbc.torrents_add_tags(tags=tag, torrent_hashes=thash)
                     except Exception:
                         pass
-                self._rename_log("RSS监听重命名", cur_name, f"-> {new_name}")
+                self._rename_log(f"{label}重命名", cur_name, f"-> {new_name}")
             except Exception as exc:
-                self._rename_log("RSS监听重命名失败", orig_name or thash, str(exc))
+                self._rename_log(f"{label}重命名失败", orig_name or thash, str(exc))
             return
-        self._rename_log("RSS监听", orig_name or thash, "未在 qBittorrent 中找到该种子，跳过重命名")
+        self._rename_log(label, orig_name or thash, "未在 qBittorrent 中找到该种子，跳过重命名")
+
+    @eventmanager.register(EventType.DownloadAdded)
+    def on_download_added(self, event: Event) -> None:
+        """监听 MoviePilot 本地搜索/订阅等添加下载事件，触发种子重命名。
+
+        插件自身 RSS 下载（username=SC-RSS）已由「监听RSS下载」处理，这里跳过避免重复。
+        本地下载按下载器中的种子名走缓存优先识别，与批量重命名逻辑一致，但识别结果
+        不写入插件独立缓存（write_cache=False）。
+        """
+        if not (self._rename_on and self._rename_listen_native):
+            return
+        data = getattr(event, "event_data", None)
+        if not data:
+            return
+        try:
+            if isinstance(data, dict):
+                thash = data.get("hash")
+                username = data.get("username")
+                source = data.get("source")
+            else:
+                thash = getattr(data, "hash", None)
+                username = getattr(data, "username", None)
+                source = getattr(data, "source", None)
+        except Exception:
+            return
+        if not thash:
+            return
+        # 跳过插件自身 RSS 下载，避免与「监听RSS下载」重复触发
+        if str(username or "") == "SC-RSS":
+            return
+        label = "本地监听"
+        orig_name = str(source or username or "")
+        try:
+            threading.Thread(
+                target=self._rss_rename_after_add,
+                args=(str(thash).strip(), None, None, orig_name),
+                kwargs={"write_cache": False, "label": label},
+                daemon=True, name="SC-NativeRename").start()
+        except Exception as exc:
+            self._rename_log(label, orig_name or str(thash), f"启动重命名线程失败: {exc}")
 
