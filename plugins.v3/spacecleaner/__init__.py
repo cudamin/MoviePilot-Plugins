@@ -47,7 +47,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理＆RSS过滤"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "5.4.1"
+    plugin_version = "5.4.2"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -2428,9 +2428,12 @@ class SpaceCleaner(_PluginBase):
             rec_owners = {rec.get("download_hash", ""): rec.get("downloader", "")
                           for rec in all_recs if rec.get("download_hash")}
             for dh in main_hashes:
-                torrents_deleted += self._delete_downloader_torrents(
+                deleted_count = self._delete_downloader_torrents(
                     chain, dh, display_name, torrent_index, rec_owners.get(dh, "")
                 )
+                if deleted_count < 0:
+                    raise RuntimeError(f"种子删除失败，已中止文件和整理记录清理: {dh}")
+                torrents_deleted += deleted_count
             if not main_hashes:
                 logger.info(f"SC [{display_name}] 无关联种子（可能为无 hash 记录），跳过删种")
             # 2) 删种后删除源文件、媒体库文件及残留空目录
@@ -2767,8 +2770,8 @@ class SpaceCleaner(_PluginBase):
         - by_path:    磁盘路径 -> hash，用于无 download_hash 的整理记录按源文件反查任务
         - by_content_path: 内容路径 -> [hash, ...]，同一目录内容可被多个不同名称的
           种子任务共享（不同站点辅种常保留各自原始命名），按路径聚合避免漏删
-        - by_save_path:    保存目录 -> [hash, ...]，单文件种子 content_path 是文件，
-          无法直接匹配目录时用保存目录兜底聚合
+        - by_save_path:    保存目录 -> [hash, ...]，仅保留索引供诊断和后续精确匹配使用，
+          不作为独立的辅种删除依据
         """
         index: Dict[str, dict] = {
             "by_hash": {}, "by_content": {}, "by_path": {},
@@ -2861,8 +2864,9 @@ class SpaceCleaner(_PluginBase):
         1. 体积一致且名称一致（同名同内容，旧规则）；
         2. 体积一致且内容路径一致（content_path 相同）：不同站点添加辅种时常保留
            各自的原始命名，仅靠同名会漏；共享同一目录即共享同一份文件。
-        3. 体积一致且保存目录一致：单文件种子的 content_path 是文件路径而非目录，
-           用保存目录兜底聚合同目录的不同名单文件辅种。
+
+        保存目录相同不能证明两个任务共享文件；同一目录下的不同资源可能恰好具有
+        相同总体积，因此不再把 save_path + size 作为辅种匹配条件。
 
         删除时必须一并处理辅种，否则残留的辅种会重新占用/锁定文件。用于删种与
         试运行统计（不执行删除）。
@@ -2884,9 +2888,8 @@ class SpaceCleaner(_PluginBase):
         candidates: set = set()
         # 规则 1：同名同体积
         candidates.update(((index or {}).get("by_content") or {}).get((main_size, main_name), []))
-        # 规则 2/3：同内容路径或同保存目录，且体积一致
-        for attr, bucket in (("content_path", "by_content_path"),
-                             ("save_path", "by_save_path")):
+        # 规则 2：同内容路径且体积一致。保存目录相同不足以证明共享文件，不能据此删种。
+        for attr, bucket in (("content_path", "by_content_path"),):
             value = str(getattr(main_t, attr, None) or "").strip()
             if not value:
                 continue
@@ -2905,6 +2908,9 @@ class SpaceCleaner(_PluginBase):
     def _delete_downloader_torrents(self, chain, download_hash, display_name, index,
                                     owner_downloader: str = "") -> int:
         """删除主种子及其辅种（cross-seed），返回实际删除的种子数量。
+
+        返回负数表示至少一个删除请求失败。调用方必须在继续处理文件和整理记录前
+        检查该结果；否则下载器中的残留种子可能继续指向已删除的文件。
 
         删除请求按种子实际所属下载器下发：MoviePilot 的 remove_torrents 不带下载器名时
         只作用于默认下载器，其他下载器中的种子既删不掉、qb 又会返回成功，导致漏删被静默。
@@ -2935,6 +2941,7 @@ class SpaceCleaner(_PluginBase):
         logger.info(f"SC 准备删种 [{display_name}]: 主种子 {main_cnt} 个" +
                     (f"，辅种 {cross_cnt} 个" if cross_cnt else "，无辅种"))
         deleted = 0
+        failed = False
         deleted_hashes = set()
         for h, name, is_cross, downloader in to_delete:
             role = "辅种" if is_cross else "主种子"
@@ -2946,12 +2953,14 @@ class SpaceCleaner(_PluginBase):
                     deleted += 1
                     deleted_hashes.add(h)
                 else:
+                    failed = True
                     logger.warning(f"SC   删除{role}未成功: {name} ({h}){dl_label}")
             except Exception as e:
+                failed = True
                 logger.error(f"SC   删除{role}失败 {name} ({h}){dl_label}: {str(e)}")
         # 只从索引与列表缓存中剔除已删种子，避免后续删除单元重新全量拉取种子列表
         self._drop_torrents_from_index(index, deleted_hashes)
-        return deleted
+        return -1 if failed else deleted
 
     @staticmethod
     def _torrent_size(t) -> int:
@@ -3271,7 +3280,6 @@ class SpaceCleaner(_PluginBase):
                 with self._rss_lk:
                     if e in self._rss_seen:
                         continue
-                    self._rss_seen[e] = None
                 if self._rss_inc and not re.search(self._rss_inc, t, re.IGNORECASE):
                     continue
                 if self._rss_exc and re.search(self._rss_exc, t, re.IGNORECASE):
@@ -3440,6 +3448,8 @@ class SpaceCleaner(_PluginBase):
             item, m, meta, s_season, se_fmt, ts = payload
             if self._rss_dl_add(item, m, meta):
                 dc += 1
+                with self._rss_lk:
+                    self._rss_seen[item.get("enclosure", "") or item.get("link", "")] = None
                 ep_key = self._rss_wash_key(dedup_key)
                 if ep_key:
                     self._rss_washed[ep_key] = None
@@ -3533,8 +3543,6 @@ class SpaceCleaner(_PluginBase):
             with self._rss_lk:
                 if e in self._rss_seen:
                     continue
-                self._rss_seen[e] = None
-            url_new += 1
             if self._rss_inc and not re.search(self._rss_inc, t, re.IGNORECASE):
                 continue
             if self._rss_exc and re.search(self._rss_exc, t, re.IGNORECASE):
@@ -3558,11 +3566,15 @@ class SpaceCleaner(_PluginBase):
             # 未开启洗版：跳过 TMDB 识别，仅本地解析标题用于通知的类别/质量（不调用 TMDB）
             meta = MetaInfo(title=t)
             if self._rss_add_direct(item):
+                with self._rss_lk:
+                    self._rss_seen[e] = None
+                url_new += 1
                 self._rss_log("下载", t)
                 if self._rss_ntf:
                     self.post_message(title="SC-RSS 已添加下载",
                                       text=self._rss_notify_text(item, meta))
             else:
+                # 下载失败不写入 _rss_seen，允许下一轮重试；过滤跳过的条目同样不占用去重位。
                 self._rss_log("下载失败", t, "添加下载器失败")
                 if self._rss_ntf:
                     self.post_message(title="SC-RSS 添加失败", text=f"名称: {t}")
@@ -5198,4 +5210,3 @@ class SpaceCleaner(_PluginBase):
                 daemon=True, name="SC-NativeRename").start()
         except Exception as exc:
             self._rename_log(label, orig_name or str(thash), f"启动重命名线程失败: {exc}")
-
