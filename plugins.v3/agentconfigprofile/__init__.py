@@ -30,7 +30,7 @@ class agentconfigprofile(_PluginBase):
     plugin_name = "API聚合自动切换"
     plugin_desc = "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。"
     plugin_icon = "agentresourceofficer.png"
-    plugin_version = "2.6.0"
+    plugin_version = "2.6.1"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
     # 插件市场仓库地址，安装统计上报时一并提交
@@ -124,7 +124,16 @@ class agentconfigprofile(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         """初始化插件配置，并处理来自配置页的一次性动作。"""
-        self._lock = threading.RLock()
+        # v3 initialize() 会在同一个实例上再次调用 init_plugin()。先停止旧代后台
+        # 任务，并保留同一把锁，避免旧线程与新配置各自使用不同锁而发生交叉写入。
+        previous_stop_event = getattr(self, "_stop_event", None)
+        if previous_stop_event is not None:
+            previous_stop_event.set()
+        if not hasattr(self, "_lock"):
+            self._lock = threading.RLock()
+        if not hasattr(self, "_failover_lock"):
+            self._failover_lock = threading.Lock()
+        self._generation = getattr(self, "_generation", 0) + 1
         self._stop_event = threading.Event()
         config = self._migrate_legacy_id(config or {})
         self._active_tab = str(config.get("_active_tab") or "basic")
@@ -167,6 +176,7 @@ class agentconfigprofile(_PluginBase):
         self._g_retry_transfer = bool(
             config.get("g_retry_transfer", getattr(settings, "AI_AGENT_RETRY_TRANSFER", False)))
         self._g_ai_recommend = bool(config.get("g_ai_recommend", getattr(settings, "AI_RECOMMEND_ENABLED", False)))
+        self._discovery_api_key_runtime = ""
 
         self._runtime = self._load_runtime()
 
@@ -206,11 +216,12 @@ class agentconfigprofile(_PluginBase):
         迁移标记为准），旧记录保留不动便于回滚。
         """
         legacy_id = self._LEGACY_PLUGIN_ID
-        if not legacy_id or legacy_id == self.__class__.__name__:
+        if self.is_clone or not legacy_id or legacy_id == self.__class__.__name__:
             return config
         runtime = self.get_data(self.DATA_KEY_RUNTIME)
         if isinstance(runtime, dict) and runtime.get("legacy_migrated_at"):
             return config
+        migration_ok = False
         try:
             # 配置迁移：旧 ID 存在配置时以旧配置为准，覆盖同名 ID 的历史残留配置
             legacy_config = self.get_config(plugin_id=legacy_id) or {}
@@ -231,10 +242,11 @@ class agentconfigprofile(_PluginBase):
                 migrated_keys.append(key)
             if migrated_keys:
                 logger.info(f"{self.plugin_name}：已从旧插件 ID [{legacy_id}] 迁移数据 {migrated_keys}")
+            migration_ok = True
         except Exception as err:  # noqa: BLE001
             logger.error(f"{self.plugin_name}：旧插件 ID 数据迁移失败 - {err}")
-        finally:
-            # 无论旧记录是否存在都打标记，保证迁移只执行一次
+        if migration_ok:
+            # 只有完整迁移流程成功后才打标记；失败时保留重试机会。
             runtime = self.get_data(self.DATA_KEY_RUNTIME)
             runtime = dict(runtime) if isinstance(runtime, dict) else {}
             runtime["legacy_migrated_at"] = self._now()
@@ -265,9 +277,13 @@ class agentconfigprofile(_PluginBase):
                     return
             except ValueError:
                 pass
-        threading.Thread(target=self._report_install_worker, daemon=True).start()
+        threading.Thread(
+            target=self._report_install_worker,
+            args=(self._generation, self._stop_event),
+            daemon=True,
+        ).start()
 
-    def _report_install_worker(self):
+    def _report_install_worker(self, generation: int, stop_event: threading.Event):
         """后台执行安装统计上报，避免阻塞插件加载。"""
         record: Dict[str, Any] = {
             "version": self.plugin_version,
@@ -295,7 +311,7 @@ class agentconfigprofile(_PluginBase):
         except Exception as err:  # noqa: BLE001
             record["message"] = str(err)[:180]
             logger.warn(f"{self.plugin_name}：安装统计上报异常 - {err}")
-        if self._stop_event.is_set():
+        if self._is_cancelled(generation, stop_event):
             return
         with self._lock:
             self._runtime["install_report"] = record
@@ -370,28 +386,28 @@ class agentconfigprofile(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
-            {"path": "/save_current", "endpoint": self.api_save_current, "methods": ["GET"],
+            {"path": "/save_current", "endpoint": self.api_save_current, "methods": ["POST"],
              "summary": "保存当前配置为模板"},
-            {"path": "/apply", "endpoint": self.api_apply, "methods": ["GET"], "summary": "应用模板"},
-            {"path": "/probe", "endpoint": self.api_probe, "methods": ["GET"], "summary": "探活配置"},
-            {"path": "/probe_all", "endpoint": self.api_probe_all, "methods": ["GET"], "summary": "探活全部模板"},
-            {"path": "/delete", "endpoint": self.api_delete, "methods": ["GET"], "summary": "删除模板"},
-            {"path": "/move", "endpoint": self.api_move, "methods": ["GET"], "summary": "调整模板顺序"},
+            {"path": "/apply", "endpoint": self.api_apply, "methods": ["POST"], "summary": "应用模板"},
+            {"path": "/probe", "endpoint": self.api_probe, "methods": ["POST"], "summary": "探活配置"},
+            {"path": "/probe_all", "endpoint": self.api_probe_all, "methods": ["POST"], "summary": "探活全部模板"},
+            {"path": "/delete", "endpoint": self.api_delete, "methods": ["POST"], "summary": "删除模板"},
+            {"path": "/move", "endpoint": self.api_move, "methods": ["POST"], "summary": "调整模板顺序"},
             {"path": "/set_page", "endpoint": self.api_set_page, "methods": ["GET"], "summary": "切换模板列表分页"},
-            {"path": "/failover_now", "endpoint": self.api_failover_now, "methods": ["GET"], "summary": "立即执行故障切换检查"},
-            {"path": "/clear_log", "endpoint": self.api_clear_log, "methods": ["GET"], "summary": "清空切换日志"},
+            {"path": "/failover_now", "endpoint": self.api_failover_now, "methods": ["POST"], "summary": "立即执行故障切换检查"},
+            {"path": "/clear_log", "endpoint": self.api_clear_log, "methods": ["POST"], "summary": "清空切换日志"},
             {"path": "/noop", "endpoint": self.api_noop, "methods": ["GET"], "summary": "仅刷新页面数据"},
-            {"path": "/discover", "endpoint": self.api_discover, "methods": ["GET"], "summary": "探测端点可用模型"},
-            {"path": "/import_discovered", "endpoint": self.api_import_discovered, "methods": ["GET"],
+            {"path": "/discover", "endpoint": self.api_discover, "methods": ["POST"], "summary": "探测端点可用模型"},
+            {"path": "/import_discovered", "endpoint": self.api_import_discovered, "methods": ["POST"],
              "summary": "导入探测到的模型为模板"},
-            {"path": "/add_model", "endpoint": self.api_add_model, "methods": ["GET"], "summary": "把单个模型加为模板"},
-            {"path": "/clear_discovery", "endpoint": self.api_clear_discovery, "methods": ["GET"],
+            {"path": "/add_model", "endpoint": self.api_add_model, "methods": ["POST"], "summary": "把单个模型加为模板"},
+            {"path": "/clear_discovery", "endpoint": self.api_clear_discovery, "methods": ["POST"],
              "summary": "清除探测结果"},
-            {"path": "/normalize_names", "endpoint": self.api_normalize_names, "methods": ["GET"],
+            {"path": "/normalize_names", "endpoint": self.api_normalize_names, "methods": ["POST"],
              "summary": "规范模板名称"},
-            {"path": "/prune_offlist", "endpoint": self.api_prune_offlist, "methods": ["GET"],
+            {"path": "/prune_offlist", "endpoint": self.api_prune_offlist, "methods": ["POST"],
              "summary": "清理白名单外的探测模板"},
-            {"path": "/apply_global", "endpoint": self.api_apply_global, "methods": ["GET"],
+            {"path": "/apply_global", "endpoint": self.api_apply_global, "methods": ["POST"],
              "summary": "应用全局参数到所有模板"},
         ]
 
@@ -425,6 +441,17 @@ class agentconfigprofile(_PluginBase):
     @staticmethod
     def _now() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _is_cancelled(
+            self,
+            generation: Optional[int] = None,
+            stop_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """判断后台任务是否属于已停止或已被新配置替换的实例代次。"""
+        event = stop_event if stop_event is not None else getattr(self, "_stop_event", None)
+        if event is not None and event.is_set():
+            return True
+        return generation is not None and generation != getattr(self, "_generation", generation)
 
     @classmethod
     def _provider_spec(cls, provider: Any):
@@ -531,6 +558,27 @@ class agentconfigprofile(_PluginBase):
     def _profile_llm(profile: Dict[str, Any]) -> Dict[str, Any]:
         return ((profile or {}).get("snapshot") or {}).get("llm") or {}
 
+    def _update_settings_checked(self, updates: Dict[str, Any], label: str) -> None:
+        """逐项写入系统设置，失败时尽力回滚本次已成功写入的项目。"""
+        if not updates:
+            return
+        previous = {key: getattr(settings, key, None) for key in updates}
+        results = settings.update_settings(env=updates)
+        failed = [key for key, (ok, _message) in results.items() if ok is False]
+        if not failed:
+            return
+        rollback = {
+            key: previous[key]
+            for key, (ok, _message) in results.items()
+            if ok is True
+        }
+        if rollback:
+            try:
+                settings.update_settings(env=rollback)
+            except Exception as error:  # noqa: BLE001
+                logger.error(f"{self.plugin_name}：{label}失败后的回滚异常 - {error}")
+        raise RuntimeError(f"{label}失败：{', '.join(failed)}")
+
     def _apply_llm_config(self, llm: Dict[str, Any]) -> bool:
         """将 LLM 配置写回系统设置。"""
         env_updates = {}
@@ -540,10 +588,7 @@ class agentconfigprofile(_PluginBase):
             env_updates[key] = value
         if not env_updates:
             return False
-        results = settings.update_settings(env=env_updates)
-        failed = [k for k, (ok, _msg) in results.items() if ok is False]
-        if failed:
-            logger.warn(f"{self.plugin_name}：部分 LLM 配置写入失败 - {failed}")
+        self._update_settings_checked(env_updates, "LLM 配置写入")
         return True
 
     @staticmethod
@@ -635,7 +680,12 @@ class agentconfigprofile(_PluginBase):
         health["duration_ms"] = duration
         health["fail_count"] = 0 if ok else self._to_int(health.get("fail_count"), 0) + 1
 
-    def _probe_profile(self, profile_id: str) -> Tuple[bool, str]:
+    def _probe_profile(
+            self,
+            profile_id: str,
+            generation: Optional[int] = None,
+            stop_event: Optional[threading.Event] = None,
+    ) -> Tuple[bool, str]:
         """探活单个模板并持久化结果。"""
         with self._lock:
             profiles = self._load_profiles()
@@ -644,6 +694,8 @@ class agentconfigprofile(_PluginBase):
                 return False, "模板不存在"
             llm = self._profile_llm(profile)
         ok, message, duration = self._probe(llm)
+        if self._is_cancelled(generation, stop_event):
+            return False, "探活任务已停止"
         with self._lock:
             profiles = self._load_profiles()
             profile = self._find_by_id(profiles, profile_id)
@@ -655,10 +707,16 @@ class agentconfigprofile(_PluginBase):
         logger.info(f"{self.plugin_name}：{text}")
         return ok, text
 
-    def _probe_current(self) -> Tuple[bool, str, int]:
+    def _probe_current(
+            self,
+            generation: Optional[int] = None,
+            stop_event: Optional[threading.Event] = None,
+    ) -> Tuple[bool, str, int]:
         """探活当前生效配置并写入运行状态。"""
         llm = self._current_llm_config()
         ok, message, duration = self._probe(llm)
+        if self._is_cancelled(generation, stop_event):
+            return False, "探活任务已停止", duration
         self._runtime["last_check_at"] = self._now()
         self._runtime["last_check_ok"] = ok
         self._runtime["last_check_message"] = message
@@ -682,32 +740,41 @@ class agentconfigprofile(_PluginBase):
 
     def _start_probe_all(self) -> str:
         """后台并发探活全部模板，每完成一个立即写入进度，页面刷新即可看到最新结果。"""
-        progress = (self._runtime.get("probe_all") or {})
-        if progress.get("status") == "running":
-            done = self._to_int(progress.get("done"), 0)
-            total = self._to_int(progress.get("total"), 0)
-            return f"探活正在进行中（{done}/{total}），刷新页面查看进度"
+        with self._lock:
+            progress = (self._runtime.get("probe_all") or {})
+            if progress.get("status") == "running":
+                done = self._to_int(progress.get("done"), 0)
+                total = self._to_int(progress.get("total"), 0)
+                return f"探活正在进行中（{done}/{total}），刷新页面查看进度"
 
-        profiles = self._load_profiles()
-        self._runtime["probe_all"] = {
-            "status": "running",
-            "total": len(profiles) + 1,
-            "done": 0,
-            "ok": 0,
-            "fail": 0,
-            "current": "当前生效配置",
-            "started_at": self._now(),
-            "finished_at": "",
-        }
-        self._save_runtime()
-        threading.Thread(target=self._probe_all_worker, daemon=True).start()
+            profiles = self._load_profiles()
+            self._runtime["probe_all"] = {
+                "status": "running",
+                "total": len(profiles) + 1,
+                "done": 0,
+                "ok": 0,
+                "fail": 0,
+                "current": "当前生效配置",
+                "started_at": self._now(),
+                "finished_at": "",
+            }
+            self._save_runtime()
+            generation = self._generation
+            stop_event = self._stop_event
+        threading.Thread(
+            target=self._probe_all_worker,
+            args=(generation, stop_event),
+            daemon=True,
+        ).start()
         return f"已开始探活当前配置与 {len(profiles)} 个模板（{self._PROBE_WORKERS} 并发），刷新页面查看进度"
 
-    def _probe_all_worker(self):
+    def _probe_all_worker(self, generation: int, stop_event: threading.Event):
         """探活当前配置与所有模板，多线程并发执行并逐个刷新进度。"""
         from concurrent.futures import ThreadPoolExecutor
 
         def bump(ok: bool, current: str):
+            if self._is_cancelled(generation, stop_event):
+                return
             with self._lock:
                 progress = self._runtime.setdefault("probe_all", {})
                 progress["done"] = self._to_int(progress.get("done"), 0) + 1
@@ -716,23 +783,25 @@ class agentconfigprofile(_PluginBase):
                 self._save_runtime()
 
         try:
-            ok, _message, _duration = self._probe_current()
+            if self._is_cancelled(generation, stop_event):
+                return
+            ok, _message, _duration = self._probe_current(generation, stop_event)
             bump(ok, "当前生效配置")
 
             profiles = [p for p in self._load_profiles() if p.get("id")]
-            if profiles and not self._stop_event.is_set():
+            if profiles and not self._is_cancelled(generation, stop_event):
                 def probe_one(profile: Dict[str, Any]):
-                    if self._stop_event.is_set():
+                    if self._is_cancelled(generation, stop_event):
                         return
                     name = profile.get("name") or ""
-                    result, _text = self._probe_profile(profile.get("id"))
+                    result, _text = self._probe_profile(profile.get("id"), generation, stop_event)
                     bump(result, name)
 
                 workers = max(1, min(self._PROBE_WORKERS, len(profiles)))
                 with ThreadPoolExecutor(max_workers=workers) as executor:
                     list(executor.map(probe_one, profiles))
 
-            if self._stop_event.is_set():
+            if self._is_cancelled(generation, stop_event):
                 return
             with self._lock:
                 progress = self._runtime.setdefault("probe_all", {})
@@ -788,10 +857,7 @@ class agentconfigprofile(_PluginBase):
         changed_settings = [key for key, value in env_updates.items()
                             if getattr(settings, key, None) != value]
         if changed_settings:
-            results = settings.update_settings(env=env_updates)
-            failed = [k for k, (ok, _msg) in results.items() if ok is False]
-            if failed:
-                logger.warn(f"{self.plugin_name}：部分全局参数写入失败 - {failed}")
+                self._update_settings_checked(env_updates, "全局参数写入")
 
         touched = 0
         with self._lock:
@@ -853,12 +919,10 @@ class agentconfigprofile(_PluginBase):
             llm = self._profile_llm(profile)
             name = profile.get("name")
         llm = self._overlay_global(llm)
-        if not self._apply_llm_config(llm):
-            return f"应用失败：模板 [{name}] 无可写入配置"
         if self._apply_global:
-            agent_values = self._global_agent_values()
-            if any(getattr(settings, key, None) != value for key, value in agent_values.items()):
-                settings.update_settings(env=agent_values)
+            llm = {**llm, **self._global_agent_values()}
+        if not self._apply_llm_config(llm):
+            raise RuntimeError(f"应用失败：模板 [{name}] 无可写入配置")
         self._runtime["fail_count"] = 0
         self._runtime["takeover_id"] = ""
         self._runtime["current_profile_id"] = profile_id
@@ -918,6 +982,10 @@ class agentconfigprofile(_PluginBase):
     def _load_discovery(self) -> Dict[str, Any]:
         data = self.get_data(self.DATA_KEY_DISCOVERY)
         if isinstance(data, dict):
+            if "api_key" in data:
+                data = dict(data)
+                data.pop("api_key", None)
+                self.save_data(self.DATA_KEY_DISCOVERY, data)
             return data
         return {}
 
@@ -1002,32 +1070,47 @@ class agentconfigprofile(_PluginBase):
         if not api_key:
             return "探测失败：请先填写 API Key"
 
-        discovery = self._load_discovery()
-        if discovery.get("status") == "running":
-            return "探测正在进行中，请稍后刷新查看结果"
-
-        self._save_discovery({
-            "status": "running",
-            "base_url": base_url,
-            "api_key": api_key,
-            "started_at": self._now(),
-            "providers": {},
-        })
-        threading.Thread(target=self._discovery_worker, args=(base_url, api_key), daemon=True).start()
+        with self._lock:
+            discovery = self._load_discovery()
+            if discovery.get("status") == "running":
+                return "探测正在进行中，请稍后刷新查看结果"
+            self._discovery_api_key_runtime = api_key
+            generation = self._generation
+            stop_event = self._stop_event
+            self._save_discovery({
+                "status": "running",
+                "base_url": base_url,
+                "started_at": self._now(),
+                "providers": {},
+            })
+        threading.Thread(
+            target=self._discovery_worker,
+            args=(base_url, api_key, generation, stop_event),
+            daemon=True,
+        ).start()
         return f"已开始探测 {self._host_of(base_url)} 的可用模型，稍后在数据详情页查看结果"
 
-    def _discovery_worker(self, base_url: str, api_key: str):
+    def _discovery_worker(
+            self,
+            base_url: str,
+            api_key: str,
+            generation: int,
+            stop_event: threading.Event,
+    ):
         """依次用各协议探测端点模型目录，可选自动导入模板。"""
         result: Dict[str, Any] = {
             "status": "running",
             "base_url": base_url,
-            "api_key": api_key,
             "started_at": self._now(),
             "providers": {},
         }
         try:
             for provider in self._discover_providers:
+                if self._is_cancelled(generation, stop_event):
+                    return
                 ok, message, models = self._list_models(provider, base_url, api_key)
+                if self._is_cancelled(generation, stop_event):
+                    return
                 result["providers"][provider] = {
                     "label": self._DISCOVER_PROVIDERS.get(provider, provider),
                     "ok": ok,
@@ -1039,14 +1122,19 @@ class agentconfigprofile(_PluginBase):
                 self._save_discovery({**result, "status": "running"})
             result["status"] = "done"
             result["finished_at"] = self._now()
+            if self._is_cancelled(generation, stop_event):
+                return
             self._save_discovery(result)
 
             if self._discover_auto_import:
+                if self._is_cancelled(generation, stop_event):
+                    return
                 import_message = self._import_discovered(api_key=api_key)
                 result["import_message"] = import_message
                 result["imported_at"] = self._now()
-                self._save_discovery(result)
-            if self._notify:
+                if not self._is_cancelled(generation, stop_event):
+                    self._save_discovery(result)
+            if self._notify and not self._is_cancelled(generation, stop_event):
                 summary = "、".join(
                     f"{(info or {}).get('label') or pid}：{(info or {}).get('count') or 0} 个"
                     for pid, info in (result.get("providers") or {}).items()
@@ -1062,7 +1150,8 @@ class agentconfigprofile(_PluginBase):
             result["status"] = "error"
             result["message"] = str(err)[:180]
             result["finished_at"] = self._now()
-            self._save_discovery(result)
+            if not self._is_cancelled(generation, stop_event):
+                self._save_discovery(result)
             logger.error(f"{self.plugin_name}：模型探测失败 - {err}")
 
     def _model_snapshot(self, provider: str, base_url: str, api_key: str,
@@ -1160,12 +1249,16 @@ class agentconfigprofile(_PluginBase):
     def whitelist_status(self, discovery: Dict[str, Any]) -> Dict[str, Dict[str, List[str]]]:
         """返回每个协议白名单的命中与未命中情况，供页面展示。"""
         model_map, _order = self._collect_discovered(discovery)
-        lower_map = {mid.lower(): mid for mid in model_map}
         status: Dict[str, Dict[str, List[str]]] = {}
         for provider in self._DISCOVER_PROVIDERS:
+            provider_models = {
+                model_id.lower()
+                for model_id, records in model_map.items()
+                if provider in records
+            }
             names = self._whitelists.get(provider) or []
-            hit = [name for name in names if name.lower() in lower_map]
-            miss = [name for name in names if name.lower() not in lower_map]
+            hit = [name for name in names if name.lower() in provider_models]
+            miss = [name for name in names if name.lower() not in provider_models]
             status[provider] = {"hit": hit, "miss": miss}
         return status
 
@@ -1173,7 +1266,11 @@ class agentconfigprofile(_PluginBase):
         """把探测结果中的模型批量建成模板。白名单优先，其次智能匹配。"""
         discovery = self._load_discovery()
         base_url = discovery.get("base_url") or self._discover_base_url
-        api_key = api_key or discovery.get("api_key") or self._discover_api_key
+        api_key = (
+            api_key
+            or getattr(self, "_discovery_api_key_runtime", "")
+            or self._discover_api_key
+        )
         if not (discovery.get("providers") or {}):
             return "导入失败：没有探测结果"
 
@@ -1196,7 +1293,11 @@ class agentconfigprofile(_PluginBase):
                         missed.append(f"{self._DISCOVER_PROVIDERS.get(provider, provider)}:{name}")
                         continue
                     record = model_map[model_id]
-                    plan.append((provider, model_id, record.get(provider) or next(iter(record.values()))))
+                    model = record.get(provider)
+                    if not model:
+                        missed.append(f"{self._DISCOVER_PROVIDERS.get(provider, provider)}:{name}")
+                        continue
+                    plan.append((provider, model_id, model))
         else:
             smart = self._discover_smart_match and not provider_filter
             for model_id in order:
@@ -1339,8 +1440,13 @@ class agentconfigprofile(_PluginBase):
                 "updated_at": self._now(),
                 "health": {"status": "unknown", "fail_count": 0},
                 "source": "discover",
-                **self._model_snapshot(provider, base_url,
-                                       discovery.get("api_key") or self._discover_api_key, model),
+                **self._model_snapshot(
+                    provider,
+                    base_url,
+                    getattr(self, "_discovery_api_key_runtime", "")
+                    or self._discover_api_key,
+                    model,
+                ),
             })
             self._save_profiles(profiles)
         logger.info(f"{self.plugin_name}：已添加模板 [{name}]")
@@ -1360,7 +1466,20 @@ class agentconfigprofile(_PluginBase):
         return None
 
     def _do_failover(self, reason: str) -> str:
+        """串行执行故障切换，避免多个入口同时改写系统 LLM 配置。"""
+        if self._is_cancelled():
+            return "自动切换已停止"
+        if not self._failover_lock.acquire(blocking=False):
+            return "自动切换正在进行中"
+        try:
+            return self._do_failover_locked(reason)
+        finally:
+            self._failover_lock.release()
+
+    def _do_failover_locked(self, reason: str) -> str:
         """按模板顺序寻找可用配置并切换。"""
+        if self._is_cancelled():
+            return "自动切换已停止"
         current = self._current_llm_config()
         profiles = self._load_profiles()
         candidates = [p for p in profiles if not self._same_endpoint(self._profile_llm(p), current)]
@@ -1379,6 +1498,8 @@ class agentconfigprofile(_PluginBase):
         ordered = sorted(candidates, key=rank)
         tried = 0
         for profile in ordered:
+            if self._is_cancelled():
+                return "自动切换已停止"
             if self._FAILOVER_MAX_TRY and tried >= self._FAILOVER_MAX_TRY:
                 break
             tried += 1
@@ -1505,6 +1626,8 @@ class agentconfigprofile(_PluginBase):
 
     def _failover_in_background(self, reason: str):
         """后台执行一次故障切换，避免阻塞事件链。"""
+        if self._is_cancelled():
+            return
         try:
             self._do_failover(reason=reason)
         except Exception as err:  # noqa: BLE001
@@ -1856,13 +1979,14 @@ class agentconfigprofile(_PluginBase):
         """构造一个直接调用插件 API 的按钮。"""
         query = dict(params or {})
         query["apikey"] = settings.API_TOKEN
+        method = "get" if path in {"set_page", "noop"} else "post"
         return {
             "component": "VBtn",
             "props": {"color": color, "variant": variant, "size": size, "class": "px-2",
                       "style": "text-transform: none; letter-spacing: 0;"},
             "text": text,
             "events": {"click": {"api": f"plugin/{self.__class__.__name__}/{path}",
-                                 "method": "get", "params": query}},
+                                 "method": method, "params": query}},
         }
 
     def _discovery_card(self, discovery: Dict[str, Any]) -> dict:
