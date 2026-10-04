@@ -50,7 +50,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.5"
+    plugin_version = "1.3.6"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -146,8 +146,13 @@ class JackettBridge(_PluginBase):
             logger.info(f"【{self.plugin_name}】后台异步同步索引器，避免阻塞插件加载")
             self.__start_sync_thread()
         elif self._enabled and self._indexers:
-            # 使用本地快照先把虚拟站点注册回来
-            self.__start_sync_thread(restore_only=True)
+            # 使用本地快照先把虚拟站点注册回来；快照缺媒体分类声明（旧版本生成）时
+            # 改走完整同步，避免站点索引助手中残留旧结构导致按类型站点列表缺失
+            if any(not item.get("category") for item in self._indexers):
+                logger.info(f"【{self.plugin_name}】索引器快照缺少媒体分类声明，执行完整同步更新注册结构")
+                self.__start_sync_thread()
+            else:
+                self.__start_sync_thread(restore_only=True)
 
     def get_state(self) -> bool:
         """
@@ -669,7 +674,7 @@ class JackettBridge(_PluginBase):
         if not isinstance(exists, dict):
             return False
         for key in ("id", "name", "url", "rss", "domain", "public", "privacy", "proxy",
-                    "parser", "plugin", "result_num", "timeout"):
+                    "parser", "plugin", "result_num", "timeout", "category"):
             if exists.get(key) != indexer.get(key):
                 return False
         # search 只比较「是否可搜索」的真值形态：已注册条目可能被宿主补充额外键，
@@ -1333,7 +1338,29 @@ class JackettBridge(_PluginBase):
             "last_sync": self.get_data("last_sync"),
             "indexer_count": len(self._indexers or []),
             "indexers": [item.get("name") for item in (self._indexers or [])],
+            # 诊断：站点索引助手中的注册结构是否携带媒体分类声明（音乐站点列表依赖）
+            "helper_category_declared": self.__helper_category_declared(),
         }
+
+    def __helper_category_declared(self) -> Optional[bool]:
+        """
+        检查站点索引助手中注册的索引器结构是否携带媒体分类声明。
+
+        :return: 已声明返回 True，未声明返回 False，无法读取时返回 None
+        """
+        for indexer in self._indexers or []:
+            domain = indexer.get("domain")
+            if not domain:
+                continue
+            try:
+                registered = self.sites_helper.get_indexer(domain)
+            except Exception as e:
+                logger.warn(f"【{self.plugin_name}】读取站点索引 {domain} 失败：{str(e)}")
+                return None
+            if isinstance(registered, dict):
+                return bool(registered.get("category"))
+            return False
+        return None
 
     def api_test(self) -> Dict[str, Any]:
         """
