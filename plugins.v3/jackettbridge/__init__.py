@@ -50,7 +50,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.4"
+    plugin_version = "1.3.5"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -88,6 +88,7 @@ class JackettBridge(_PluginBase):
         """
         根据插件配置初始化运行状态，并在需要时后台同步索引器。
         """
+        self.stop_service()
         self.sites_helper = SitesHelper()
         self.site_oper = SiteOper()
         self._enabled = False
@@ -288,9 +289,10 @@ class JackettBridge(_PluginBase):
 
     def __update_config(self) -> None:
         """
-        持久化当前插件配置。
+        持久化当前插件配置，合并到已保存配置之上，避免覆盖并发保存的其他键。
         """
-        self.update_config({
+        config = self.get_config() or {}
+        config.update({
             "enabled": self._enabled,
             "onlyonce": self._onlyonce,
             "host": self._host,
@@ -302,6 +304,7 @@ class JackettBridge(_PluginBase):
             "selected_indexers": self._selected_indexers,
             "indexer_catalog": self._indexer_catalog,
         })
+        self.update_config(config)
 
     # ------------------------------------------------------------------ 同步
 
@@ -375,7 +378,6 @@ class JackettBridge(_PluginBase):
             res = RequestUtils(headers=self.__headers(), session=session).post_res(
                 url=f"{self._host}/UI/Dashboard",
                 data={"password": self._password},
-                params={"password": self._password},
             )
             if res and session.cookies:
                 return session.cookies.get_dict()
@@ -467,12 +469,6 @@ class JackettBridge(_PluginBase):
         if not res:
             logger.warn(f"【{self.plugin_name}】索引器列表请求无响应，请检查地址与网络")
             return None
-        if res.status_code in (301, 302, 303, 307, 308) or "/UI/Login" in (res.headers.get("Location") or ""):
-            logger.error(
-                f"【{self.plugin_name}】Jackett 管理接口要求登录，"
-                f"请在插件中填写 Jackett 管理密码，或确认 API Key 正确"
-            )
-            return None
         if res.status_code >= 400:
             logger.error(
                 f"【{self.plugin_name}】索引器列表请求失败：HTTP {res.status_code}，"
@@ -502,7 +498,22 @@ class JackettBridge(_PluginBase):
 
         :return: 索引器列表，请求失败时返回 None
         """
-        self._indexers_authoritative = False
+        indexers = self.__fetch_indexers()
+        if indexers is None:
+            return None
+        self._indexers_authoritative = True
+        self._indexer_catalog = [
+            {"title": item.get("origin_name") or item.get("name"), "value": item.get("indexer_id")}
+            for item in indexers
+        ]
+        return self.__apply_selection(indexers)
+
+    def __fetch_indexers(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        请求 Jackett 并构造索引器列表，不修改任何插件运行状态。
+
+        :return: 全部已配置索引器列表，请求失败时返回 None
+        """
         # 优先使用 Torznab t=indexers 接口：只需 apikey，兼容设置了管理密码的 Jackett
         data = self.__fetch_indexers_torznab()
         if data is None:
@@ -510,8 +521,6 @@ class JackettBridge(_PluginBase):
             data = self.__fetch_indexers_admin_api()
         if data is None:
             return None
-
-        self._indexers_authoritative = True
         indexers = []
         skipped = 0
         for item in data:
@@ -525,15 +534,10 @@ class JackettBridge(_PluginBase):
                 skipped += 1
                 continue
             indexers.append(self.__build_indexer(indexer_id, indexer_name, item.get("type")))
-
-        self._indexer_catalog = [
-            {"title": item.get("origin_name") or item.get("name"), "value": item.get("indexer_id")}
-            for item in indexers
-        ]
         logger.info(
             f"【{self.plugin_name}】Jackett 返回 {len(indexers)} 个已配置索引器，跳过未配置 {skipped} 个"
         )
-        return self.__apply_selection(indexers)
+        return indexers
 
     def __build_indexer(self, indexer_id: str, indexer_name: str,
                         indexer_type: Optional[str] = None) -> Dict[str, Any]:
@@ -759,6 +763,8 @@ class JackettBridge(_PluginBase):
                     updated += 1
             if site and site.id:
                 site_ids.append(site.id)
+                # 快照记录整型站点 ID，供检索结果归属与按选中站点过滤使用
+                indexer["site_id"] = site.id
 
         if self._indexers_authoritative:
             for site in self.__get_managed_site_records():
@@ -826,17 +832,20 @@ class JackettBridge(_PluginBase):
 
     def search_torrents(self, site: Optional[dict] = None, keyword: str = None,
                         mtype: Optional[MediaType] = None,
-                        page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
+                        page: Optional[int] = 0,
+                        sites: Optional[List[int]] = None, **kwargs) -> List[TorrentInfo]:
         """
         检索资源。
 
         MoviePilot V3 只在「插件资源源」通道调用本方法一次，且固定传入空的 site；此时需要
-        自行遍历全部已桥接索引器并合并结果。site 非空时保留按站点检索的旧行为。
+        自行遍历已桥接索引器并合并结果。site 非空时保留按站点检索的旧行为。
 
         :param site: 站点信息，插件资源源调用时为空
         :param keyword: 搜索关键词
         :param mtype: 媒体类型
         :param page: 页码
+        :param sites: 选中的站点 ID 列表，空表示全部；宿主当前版本暂未传入，
+                      传入后只检索选中范围内的桥接站点
         :return: 资源列表
         """
         if not self.get_state():
@@ -845,7 +854,7 @@ class JackettBridge(_PluginBase):
         if site:
             return self.__search_managed_site(site=site, keyword=keyword, mtype=mtype, page=page)
 
-        return self.__search_bridged_indexers(keyword=keyword, mtype=mtype, page=page)
+        return self.__search_bridged_indexers(keyword=keyword, mtype=mtype, page=page, sites=sites)
 
     def __search_managed_site(self, site: dict, keyword: str = None,
                               mtype: Optional[MediaType] = None,
@@ -889,13 +898,15 @@ class JackettBridge(_PluginBase):
 
     def __search_bridged_indexers(self, keyword: str = None,
                                   mtype: Optional[MediaType] = None,
-                                  page: Optional[int] = 0) -> List[TorrentInfo]:
+                                  page: Optional[int] = 0,
+                                  sites: Optional[List[int]] = None) -> List[TorrentInfo]:
         """
-        插件资源源入口：并发检索全部已桥接索引器并合并结果。
+        插件资源源入口：并发检索已桥接索引器并合并结果。
 
         :param keyword: 搜索关键词
         :param mtype: 媒体类型
         :param page: 页码
+        :param sites: 选中的站点 ID 列表，空表示全部
         :return: 合并后的资源列表
         """
         if not self._indexers:
@@ -905,6 +916,11 @@ class JackettBridge(_PluginBase):
         indexers = [item for item in self._indexers if item.get("indexer_id")]
         if not indexers:
             logger.warn(f"【{self.plugin_name}】插件资源源检索失败：索引器快照缺少索引器 ID")
+            return []
+
+        indexers = self.__filter_indexers_by_sites(indexers, sites)
+        if not indexers:
+            logger.info(f"【{self.plugin_name}】选中站点不包含桥接索引器，跳过插件资源源检索")
             return []
 
         started = time.monotonic()
@@ -962,6 +978,7 @@ class JackettBridge(_PluginBase):
         :return: 站点信息字典
         """
         domain = indexer.get("domain")
+        site: Dict[str, Any] = {}
         if domain:
             try:
                 registered = self.sites_helper.get_indexer(domain)
@@ -973,8 +990,67 @@ class JackettBridge(_PluginBase):
                 site["indexer_id"] = indexer.get("indexer_id")
                 site.setdefault("name", indexer.get("name"))
                 site.setdefault("domain", domain)
-                return site
-        return dict(indexer)
+        if not site:
+            site = dict(indexer)
+        # TorrentInfo.site 需要整型站点 ID：注册条目或快照携带的字符串 id 会让
+        # Pydantic 校验失败并丢弃整批结果，缺整型 id 时回退快照 site_id 或数据库
+        if not isinstance(site.get("id"), int):
+            site["id"] = self.__resolve_site_id(indexer)
+        return site
+
+    def __resolve_site_id(self, indexer: Dict[str, Any]) -> Optional[int]:
+        """
+        解析索引器对应的整型站点 ID。
+
+        :param indexer: 索引器快照
+        :return: 站点 ID，无法确定时返回 None
+        """
+        site_id = indexer.get("site_id")
+        if isinstance(site_id, int):
+            return site_id
+        domain = str(indexer.get("domain") or "")
+        if domain:
+            try:
+                db_site = self.site_oper.get_by_domain(domain)
+            except Exception as e:
+                logger.warn(f"【{self.plugin_name}】查询站点 {domain} 失败：{str(e)}")
+                db_site = None
+            if db_site and getattr(db_site, "id", None):
+                indexer["site_id"] = db_site.id
+                return db_site.id
+        return None
+
+    def __filter_indexers_by_sites(self, indexers: List[Dict[str, Any]],
+                                   sites: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+        """
+        按宿主选中的站点 ID 过滤索引器，未指定选中项时返回全部。
+
+        :param indexers: 索引器快照列表
+        :param sites: 选中的站点 ID 列表，空表示不限制
+        :return: 参与本次检索的索引器列表
+        """
+        if not sites:
+            return indexers
+        selected = set()
+        for value in sites:
+            try:
+                selected.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        if not selected:
+            return indexers
+        filtered = []
+        for indexer in indexers:
+            site_id = self.__resolve_site_id(indexer)
+            if site_id is not None:
+                indexer["site_id"] = site_id
+            if site_id in selected:
+                filtered.append(indexer)
+        if len(filtered) != len(indexers):
+            logger.info(
+                f"【{self.plugin_name}】按选中站点过滤索引器：{len(indexers)} → {len(filtered)}"
+            )
+        return filtered
 
     def __query_jackett(self, indexer_id: str, site: dict, keyword: str = None,
                         mtype: Optional[MediaType] = None,
@@ -1265,10 +1341,11 @@ class JackettBridge(_PluginBase):
         """
         if not self._host or not self._api_key:
             return {"code": 1, "message": "请先配置 Jackett 地址与 API Key"}
-        indexers = self.get_indexers()
+        indexers = self.__fetch_indexers()
         if indexers is None:
             return {"code": 1, "message": "连接失败，请检查地址、API Key 与管理密码"}
-        return {"code": 0, "message": f"连接成功，已配置索引器 {len(indexers)} 个"}
+        selected = self.__apply_selection(indexers)
+        return {"code": 0, "message": f"连接成功，已配置索引器 {len(selected)} 个"}
 
     def api_sync(self) -> Dict[str, Any]:
         """
