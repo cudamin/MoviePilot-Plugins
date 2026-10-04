@@ -30,7 +30,7 @@ class agentconfigprofile(_PluginBase):
     plugin_name = "API聚合自动切换"
     plugin_desc = "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。"
     plugin_icon = "agentresourceofficer.png"
-    plugin_version = "2.6.1"
+    plugin_version = "2.6.2"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
     # 插件市场仓库地址，安装统计上报时一并提交
@@ -386,28 +386,28 @@ class agentconfigprofile(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
-            {"path": "/save_current", "endpoint": self.api_save_current, "methods": ["POST"],
+            {"path": "/save_current", "endpoint": self.api_save_current, "methods": ["GET", "POST"],
              "summary": "保存当前配置为模板"},
-            {"path": "/apply", "endpoint": self.api_apply, "methods": ["POST"], "summary": "应用模板"},
-            {"path": "/probe", "endpoint": self.api_probe, "methods": ["POST"], "summary": "探活配置"},
-            {"path": "/probe_all", "endpoint": self.api_probe_all, "methods": ["POST"], "summary": "探活全部模板"},
-            {"path": "/delete", "endpoint": self.api_delete, "methods": ["POST"], "summary": "删除模板"},
-            {"path": "/move", "endpoint": self.api_move, "methods": ["POST"], "summary": "调整模板顺序"},
+            {"path": "/apply", "endpoint": self.api_apply, "methods": ["GET", "POST"], "summary": "应用模板"},
+            {"path": "/probe", "endpoint": self.api_probe, "methods": ["GET", "POST"], "summary": "探活配置"},
+            {"path": "/probe_all", "endpoint": self.api_probe_all, "methods": ["GET", "POST"], "summary": "探活全部模板"},
+            {"path": "/delete", "endpoint": self.api_delete, "methods": ["GET", "POST"], "summary": "删除模板"},
+            {"path": "/move", "endpoint": self.api_move, "methods": ["GET", "POST"], "summary": "调整模板顺序"},
             {"path": "/set_page", "endpoint": self.api_set_page, "methods": ["GET"], "summary": "切换模板列表分页"},
-            {"path": "/failover_now", "endpoint": self.api_failover_now, "methods": ["POST"], "summary": "立即执行故障切换检查"},
-            {"path": "/clear_log", "endpoint": self.api_clear_log, "methods": ["POST"], "summary": "清空切换日志"},
+            {"path": "/failover_now", "endpoint": self.api_failover_now, "methods": ["GET", "POST"], "summary": "立即执行故障切换检查"},
+            {"path": "/clear_log", "endpoint": self.api_clear_log, "methods": ["GET", "POST"], "summary": "清空切换日志"},
             {"path": "/noop", "endpoint": self.api_noop, "methods": ["GET"], "summary": "仅刷新页面数据"},
-            {"path": "/discover", "endpoint": self.api_discover, "methods": ["POST"], "summary": "探测端点可用模型"},
-            {"path": "/import_discovered", "endpoint": self.api_import_discovered, "methods": ["POST"],
+            {"path": "/discover", "endpoint": self.api_discover, "methods": ["GET", "POST"], "summary": "探测端点可用模型"},
+            {"path": "/import_discovered", "endpoint": self.api_import_discovered, "methods": ["GET", "POST"],
              "summary": "导入探测到的模型为模板"},
-            {"path": "/add_model", "endpoint": self.api_add_model, "methods": ["POST"], "summary": "把单个模型加为模板"},
-            {"path": "/clear_discovery", "endpoint": self.api_clear_discovery, "methods": ["POST"],
+            {"path": "/add_model", "endpoint": self.api_add_model, "methods": ["GET", "POST"], "summary": "把单个模型加为模板"},
+            {"path": "/clear_discovery", "endpoint": self.api_clear_discovery, "methods": ["GET", "POST"],
              "summary": "清除探测结果"},
-            {"path": "/normalize_names", "endpoint": self.api_normalize_names, "methods": ["POST"],
+            {"path": "/normalize_names", "endpoint": self.api_normalize_names, "methods": ["GET", "POST"],
              "summary": "规范模板名称"},
-            {"path": "/prune_offlist", "endpoint": self.api_prune_offlist, "methods": ["POST"],
+            {"path": "/prune_offlist", "endpoint": self.api_prune_offlist, "methods": ["GET", "POST"],
              "summary": "清理白名单外的探测模板"},
-            {"path": "/apply_global", "endpoint": self.api_apply_global, "methods": ["POST"],
+            {"path": "/apply_global", "endpoint": self.api_apply_global, "methods": ["GET", "POST"],
              "summary": "应用全局参数到所有模板"},
         ]
 
@@ -1979,7 +1979,9 @@ class agentconfigprofile(_PluginBase):
         """构造一个直接调用插件 API 的按钮。"""
         query = dict(params or {})
         query["apikey"] = settings.API_TOKEN
-        method = "get" if path in {"set_page", "noop"} else "post"
+        # 前端渲染器对 POST 会把 params 放进请求体，verify_apikey 只读 query/header，
+        # 会导致鉴权失败跳转登录页；统一用 GET，apikey 保持在 query 中。
+        method = "get"
         return {
             "component": "VBtn",
             "props": {"color": color, "variant": variant, "size": size, "class": "px-2",
