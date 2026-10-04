@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import copy
 import re
+import sys
 import threading
 import time
 import traceback
@@ -15,6 +16,7 @@ import requests
 from apscheduler.triggers.cron import CronTrigger
 from fastapi.concurrency import run_in_threadpool
 
+from app.application.configuration import get_configured_system_config
 from app.db.oper.site import SiteOper
 from app.sdk.config import settings
 from app.sdk.logging import logger
@@ -34,6 +36,36 @@ DEFAULT_RESULT_NUM = 100
 # 插件资源源并发检索的索引器数量上限
 DEFAULT_PARALLEL_INDEXERS = 4
 
+# 权威搜索帧的方法名白名单。
+#
+# 宿主 V3 把搜索 provider 拆成 app/chain/search/provider.py 里的 owner，再由
+# app/chain/search/facade.py 以「类属性赋值」的方式挂到 SearchChain 上
+# （_SearchChain__search_all_sites = SearchProviderOwner._search_all_sites 等）。
+# 别名赋值不产生新函数对象，函数身份仍是 provider.py 里定义的那一个，因此
+# co_name 保持原样、不受 Facade 的名字改写影响，可以稳定用于帧匹配：
+#   · 同步链：_search_all_sites(keyword, mediainfo, sites, page, area, mtype)
+#   · 异步链：_iter_torrent_events(keyword, mediainfo, sites, page, area, mtype)
+# 两个方法都把调用方选中的站点 ID 收在形参 sites 上，但向下调用插件资源源时
+# （search_plugin_torrents / async_search_plugin_torrents）刻意不传该值，所以只能
+# 从调用栈的帧局部变量里取回。
+SITES_FRAME_NAMES = frozenset({
+    "_search_all_sites",
+    "_iter_torrent_events",
+    "_async_search_all_sites",
+    "_async_search_all_sites_stream",
+    "_iter_subtitle_events",
+    "_async_search_subtitles_all_sites",
+    "_async_search_subtitles_all_sites_stream",
+})
+# 帧回溯深度上限：正常链路只需 6 层，留出余量同时避免异常栈上长时间遍历
+FRAME_WALK_LIMIT = 32
+
+# 站点选择来源标记，写入 /status 供排查
+SITES_SOURCE_EXPLICIT = "explicit"
+SITES_SOURCE_FRAME = "frame"
+SITES_SOURCE_SYSTEM = "system"
+SITES_SOURCE_UNLIMITED = "unlimited"
+
 
 class JackettBridge(_PluginBase):
     """
@@ -50,7 +82,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.7"
+    plugin_version = "1.3.8"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -83,6 +115,10 @@ class JackettBridge(_PluginBase):
     _indexer_catalog: List[Dict[str, str]] = []
     _indexers: List[Dict[str, Any]] = []
     _sync_lock = threading.Lock()
+    # 站点选择诊断：最近一次插件资源源检索实际采用的选中站点与来源
+    _last_selected_sites: Optional[List[int]] = None
+    _last_sites_source = SITES_SOURCE_UNLIMITED
+    _last_frame_sites: Optional[List[int]] = None
 
     def init_plugin(self, config: dict = None) -> None:
         """
@@ -103,6 +139,9 @@ class JackettBridge(_PluginBase):
         self._indexer_catalog: List[Dict[str, str]] = []
         self._indexers: List[Dict[str, Any]] = []
         self._indexers_authoritative = False
+        self._last_selected_sites = None
+        self._last_sites_source = SITES_SOURCE_UNLIMITED
+        self._last_frame_sites = None
 
         # 恢复上次同步的索引器快照，避免重启后检索失效
         saved = self.get_data("indexers") or []
@@ -328,6 +367,105 @@ class JackettBridge(_PluginBase):
             "indexer_catalog": self._indexer_catalog,
         })
         self.update_config(config)
+
+    # -------------------------------------------------------------- 站点选择
+
+    @staticmethod
+    def __normalize_site_ids(value: Any) -> List[int]:
+        """
+        将任意形态的站点选择规范化为去重的整型 ID 列表。
+        """
+        if value is None or value == "":
+            return []
+        if isinstance(value, (str, bytes, int, float)):
+            candidates: List[Any] = [value]
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            candidates = list(value)
+        else:
+            return []
+        result: List[int] = []
+        for item in candidates:
+            if isinstance(item, bool):
+                continue
+            try:
+                number = int(str(item).strip()) if isinstance(item, str) else int(item)
+            except (TypeError, ValueError):
+                continue
+            if number not in result:
+                result.append(number)
+        return result
+
+    def __extract_selected_sites(self) -> Optional[List[int]]:
+        """
+        从权威搜索帧中取回宿主本次搜索选中的站点 ID。
+
+        宿主调用插件资源源时不传 sites，但调用栈上仍保留权威帧：
+          · 同步链 search_torrents ← _execute_plugin_provider_sequence
+            ← execute_plugin_modules ← search_plugin_torrents ← _search_all_sites
+          · 异步链 async_search_torrents ← _async_call ← async_execute_plugin_modules
+            ← async_search_plugin_torrents ← _iter_torrent_events
+        两链都在同一线程内直连，帧链完整（异步链的 _async_call 对协程函数直接
+        await、不落线程池），因此可以从帧局部变量里读到 sites。
+
+        :return: 选中站点 ID 列表；未命中权威帧或该帧未做选择时返回 None
+        """
+        frame = sys._getframe(1)
+        depth = 0
+        try:
+            while frame is not None and depth < FRAME_WALK_LIMIT:
+                if frame.f_code.co_name in SITES_FRAME_NAMES:
+                    return self.__normalize_site_ids(frame.f_locals.get("sites"))
+                frame = frame.f_back
+                depth += 1
+        except Exception as e:  # 帧回溯属于尽力而为，任何异常都退化为「未命中」
+            logger.warn(f"【{self.plugin_name}】回溯权威搜索帧失败：{str(e)}")
+        finally:
+            del frame
+        return None
+
+    def __system_indexer_sites(self) -> List[int]:
+        """
+        读取系统「搜索站点」（IndexerSites）配置，与宿主 _selected_site_ids 同源。
+        """
+        try:
+            configured = get_configured_system_config().get(SystemConfigKey.IndexerSites)
+        except Exception as e:
+            logger.warn(f"【{self.plugin_name}】读取系统「搜索站点」配置失败：{str(e)}")
+            return []
+        return self.__normalize_site_ids(configured)
+
+    def __resolve_effective_sites(self, sites: Optional[List[int]] = None) -> Optional[List[int]]:
+        """
+        解析本次插件资源源检索应采用的有效站点范围。
+
+        回退顺序与宿主 _selected_site_ids 保持一致：
+          显式传入 → 权威帧提取 → 系统「搜索站点」→ 空（不限站点）
+        """
+        explicit = self.__normalize_site_ids(sites)
+        if explicit:
+            self.__record_sites_choice(explicit, SITES_SOURCE_EXPLICIT)
+            return explicit
+
+        extracted = self.__extract_selected_sites()
+        self._last_frame_sites = extracted
+        if extracted:
+            self.__record_sites_choice(extracted, SITES_SOURCE_FRAME)
+            return extracted
+
+        configured = self.__system_indexer_sites()
+        if configured:
+            self.__record_sites_choice(configured, SITES_SOURCE_SYSTEM)
+            return configured
+
+        self.__record_sites_choice(None, SITES_SOURCE_UNLIMITED)
+        return None
+
+    def __record_sites_choice(self, sites: Optional[List[int]], source: str) -> None:
+        """
+        记录本次站点选择结果，供 /status 诊断。
+        """
+        self._last_selected_sites = list(sites) if sites else None
+        self._last_sites_source = source
 
     # ------------------------------------------------------------------ 同步
 
@@ -864,12 +1002,14 @@ class JackettBridge(_PluginBase):
         MoviePilot V3 只在「插件资源源」通道调用本方法一次，且固定传入空的 site；此时需要
         自行遍历已桥接索引器并合并结果。site 非空时保留按站点检索的旧行为。
 
+        选中站点由 __resolve_effective_sites 统一解析：显式参数 → 权威调用帧
+        （_search_all_sites / _iter_torrent_events）→ 系统「搜索站点」→ 不限。
+
         :param site: 站点信息，插件资源源调用时为空
         :param keyword: 搜索关键词
         :param mtype: 媒体类型
         :param page: 页码
-        :param sites: 选中的站点 ID 列表，空表示全部；宿主当前版本暂未传入，
-                      传入后只检索选中范围内的桥接站点
+        :param sites: 选中的站点 ID 列表，空表示按回退顺序解析
         :return: 资源列表
         """
         if not self.get_state():
@@ -878,7 +1018,8 @@ class JackettBridge(_PluginBase):
         if site:
             return self.__search_managed_site(site=site, keyword=keyword, mtype=mtype, page=page)
 
-        return self.__search_bridged_indexers(keyword=keyword, mtype=mtype, page=page, sites=sites)
+        selected = self.__resolve_effective_sites(sites)
+        return self.__search_bridged_indexers(keyword=keyword, mtype=mtype, page=page, sites=selected)
 
     def __search_managed_site(self, site: dict, keyword: str = None,
                               mtype: Optional[MediaType] = None,
@@ -930,7 +1071,7 @@ class JackettBridge(_PluginBase):
         :param keyword: 搜索关键词
         :param mtype: 媒体类型
         :param page: 页码
-        :param sites: 选中的站点 ID 列表，空表示全部
+        :param sites: 已解析的选中站点 ID 列表，空表示不限
         :return: 合并后的资源列表
         """
         if not self._indexers:
@@ -944,7 +1085,10 @@ class JackettBridge(_PluginBase):
 
         indexers = self.__filter_indexers_by_sites(indexers, sites)
         if not indexers:
-            logger.info(f"【{self.plugin_name}】选中站点不包含桥接索引器，跳过插件资源源检索")
+            logger.info(
+                f"【{self.plugin_name}】选中站点不包含桥接索引器，跳过插件资源源检索"
+                f"（来源：{self._last_sites_source}，选中：{sites or '不限'}）"
+            )
             return []
 
         started = time.monotonic()
@@ -953,7 +1097,7 @@ class JackettBridge(_PluginBase):
         max_workers = max(1, min(len(indexers), DEFAULT_PARALLEL_INDEXERS))
         logger.info(
             f"【{self.plugin_name}】插件资源源开始检索 {len(indexers)} 个索引器，"
-            f"关键词：{keyword}，选中站点：{sites or '不限'}"
+            f"关键词：{keyword}，选中站点：{sites or '不限'}（来源：{self._last_sites_source}）"
         )
         with ThreadPoolExecutor(
             max_workers=max_workers,
@@ -1054,14 +1198,7 @@ class JackettBridge(_PluginBase):
         :param sites: 选中的站点 ID 列表，空表示不限制
         :return: 参与本次检索的索引器列表
         """
-        if not sites:
-            return indexers
-        selected = set()
-        for value in sites:
-            try:
-                selected.add(int(value))
-            except (TypeError, ValueError):
-                continue
+        selected = set(self.__normalize_site_ids(sites))
         if not selected:
             return indexers
         filtered = []
@@ -1131,11 +1268,20 @@ class JackettBridge(_PluginBase):
             )
             return []
 
-    async def async_search_torrents(self, site: dict, keyword: str = None, mtype: Optional[MediaType] = None,
+    async def async_search_torrents(self, site: Optional[dict] = None, keyword: str = None,
+                                   mtype: Optional[MediaType] = None,
                                    page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
         """
-        异步检索单个索引器，内部转为线程池执行同步实现。
+        异步检索资源。
+
+        宿主异步链的 _async_call 对协程函数直接 await、不落线程池，因此本协程与权威帧
+        _iter_torrent_events 同在事件循环线程，帧链完整：必须在进入线程池之前先把选中
+        站点取出来，随调用显式下传，否则线程池里已看不到宿主栈帧。
         """
+        if kwargs.get("sites") is None:
+            extracted = self.__extract_selected_sites()
+            if extracted is not None:
+                kwargs["sites"] = extracted
         return await run_in_threadpool(
             self.search_torrents,
             site=site,
@@ -1151,30 +1297,34 @@ class JackettBridge(_PluginBase):
         """
         获取索引器最新种子，供订阅刷新（spider 模式）与站点资源浏览使用。
 
-        Torznab 不分页浏览首页，这里只在第 0 页返回数据，避免订阅刷新重复请求。
-        与检索一致，site 为空时按「插件资源源」合并全部已桥接索引器。
+        MoviePilot V3 的刷新链路（ChainBase.refresh_torrents，入口是 app/chain/torrents.py
+        的 browse / rss）恒以真实站点调用，宿主没有「插件资源源刷新」入口，因此这里只处理
+        已托管的虚拟站点；空站点直接返回，不把刷新误当作插件资源源检索。
 
-        :param site: 站点信息，插件资源源刷新时为空
+        Torznab 不分页浏览首页，这里只在第 0 页返回数据，避免订阅刷新重复请求。
+
+        :param site: 站点信息
         :param keyword: 关键词，订阅刷新时为空表示取最新
         :param cat: 系统站点分类，Torznab 分类体系不同，忽略
         :param page: 页码
         :return: 资源列表
         """
-        if not self.get_state():
+        if not self.get_state() or not site:
             return []
-        if not site:
-            # 插件资源源刷新：合并全部已桥接索引器的最新种子
-            return self.__search_bridged_indexers(keyword=keyword, mtype=None, page=0)
         if not self.__is_managed_site(site):
             return []
         if (page or 0) > 0:
             return []
         return self.__search_managed_site(site=site, keyword=keyword, mtype=None, page=0)
 
-    async def async_refresh_torrents(self, site: dict, keyword: str = None, cat: str = None,
+    async def async_refresh_torrents(self, site: Optional[dict] = None, keyword: str = None,
+                                     cat: str = None,
                                      page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
         """
-        异步获取索引器最新种子，内部转为线程池执行同步实现。
+        异步获取索引器最新种子。
+
+        宿主异步刷新（async_run_module）同样恒传真实站点，没有权威帧可回溯，
+        本方法只是把同步实现交给线程池执行。
         """
         return await run_in_threadpool(
             self.refresh_torrents,
@@ -1182,7 +1332,6 @@ class JackettBridge(_PluginBase):
             keyword=keyword,
             cat=cat,
             page=page,
-            **kwargs,
         )
 
     def __parse_torznab(self, content: str, site: dict, site_name: str) -> List[TorrentInfo]:
@@ -1360,6 +1509,14 @@ class JackettBridge(_PluginBase):
             "indexers": [item.get("name") for item in (self._indexers or [])],
             # 诊断：站点索引助手中的注册结构是否携带媒体分类声明（音乐站点列表依赖）
             "helper_category_declared": self.__helper_category_declared(),
+            # 诊断：最近一次插件资源源检索的选中站点及其来源
+            # explicit=宿主显式传入 / frame=从权威帧提取 / system=系统「搜索站点」/ unlimited=不限
+            "selected_sites": {
+                "source": self._last_sites_source,
+                "frame_detected": self._last_frame_sites is not None,
+                "frame_sites": self._last_frame_sites,
+                "effective_sites": self._last_selected_sites,
+            },
         }
 
     def __helper_category_declared(self) -> Optional[bool]:
@@ -1454,6 +1611,17 @@ class JackettBridge(_PluginBase):
                             "text": "站点管理板块显示站点无法连通是正常现象，不用管。"
                                     "如果日志中提示【jackettBridge】索引器列表请求无响应，请检查地址与网络，"
                                     "请尝试将网络地址改为 MoviePilot 所在网段的地址，如：http://172.18.0.1:9117。"
+                        }
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "density": "compact",
+                            "class": "mb-2",
+                            "text": "搜索时选中的站点范围与宿主一致：显式选中 → 系统「搜索站点」设置 → 不限；"
+                                    "插件会从宿主搜索调用栈取回选中项，只检索选中范围内的桥接索引器。"
                         }
                     },
                     {"component": "VDivider", "props": {"class": "my-3"}},
