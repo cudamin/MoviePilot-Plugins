@@ -50,7 +50,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -102,7 +102,6 @@ class JackettBridge(_PluginBase):
         self._indexer_catalog: List[Dict[str, str]] = []
         self._indexers: List[Dict[str, Any]] = []
         self._indexers_authoritative = False
-        self._sync_lock = threading.Lock()
 
         # 恢复上次同步的索引器快照，避免重启后检索失效
         saved = self.get_data("indexers") or []
@@ -635,6 +634,9 @@ class JackettBridge(_PluginBase):
         """
         将虚拟索引器注册或更新到站点索引助手。
 
+        宿主 SitesHelper 未提供移除接口，索引器被移除或多选收窄后，已注册条目会
+        残留至进程重启；因 search 为空字典，宿主蜘蛛会跳过这些条目，不影响检索。
+
         :return: (新注册数量, 更新数量)
         """
         registered = 0
@@ -817,7 +819,7 @@ class JackettBridge(_PluginBase):
             return [5000]
         if mtype == MediaType.MUSIC:
             return [3000]
-        return [2000, 5000]
+        return [2000, 3000, 5000]
 
     def search_torrents(self, site: Optional[dict] = None, keyword: str = None,
                         mtype: Optional[MediaType] = None,
@@ -1113,8 +1115,13 @@ class JackettBridge(_PluginBase):
             if leechers is None:
                 total_peers = self.__to_number(peers, 0)
                 leechers = max(0, total_peers - seeders) if total_peers else 0
-            categories = [text.strip() for text in
-                          (item.findtext("category") or "").split(",") if text.strip()]
+            # RSS 条目允许重复出现 <category> 元素，逐个收集并去重
+            categories = []
+            for node in item.findall("category"):
+                for text in (node.text or "").split(","):
+                    text = text.strip()
+                    if text and text not in categories:
+                        categories.append(text)
             # MoviePilot V3 的 TorrentInfo 用 media_source/media_id 取代了 V2 的 imdbid 字段
             imdb_id = self.__parse_imdbid(attrs.get("imdb") or attrs.get("imdbid"))
             results.append(TorrentInfo(
@@ -1227,6 +1234,8 @@ class JackettBridge(_PluginBase):
             code = int(text)
             if 2000 <= code < 3000:
                 return MediaType.MOVIE.value
+            if 3000 <= code < 4000:
+                return MediaType.MUSIC.value
             if 5000 <= code < 6000:
                 return MediaType.TV.value
         return None
