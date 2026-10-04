@@ -57,7 +57,7 @@
     "name": "API聚合自动切换",
     "description": "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。",
     "labels": "智能助手",
-    "version": "2.6.1",
+    "version": "2.6.2",
     "icon": "agentresourceofficer.png",
     "author": "tafei",
     "author_url": "https://github.com/cudamin",
@@ -65,7 +65,7 @@
     "release": true,
     "system_version": ">=3.0.1",
     "history": {
-      "v2.6.1": "修复BUG",
+      "v2.6.2": "修复BUG",
       "v2.6.0": "适配 MoviePilot V3：迁移配置、事件、日志与服务端上报接口路径。",
       "v2.5.0": "插件ID改为小写agentconfigprofile以对齐安装统计",
       "v2.4.0": "修复bug，优化ui布局",
