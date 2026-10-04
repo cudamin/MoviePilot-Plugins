@@ -21,7 +21,7 @@ from app.sdk.logging import logger
 from app.sdk.media import TorrentInfo
 from app.sdk.network import RequestUtils, SitesHelper
 from app.plugins import _PluginBase
-from app.schemas.types import EventType, MediaSource, MediaType
+from app.schemas.types import EventType, MediaSource, MediaType, SystemConfigKey
 
 # Torznab 命名空间
 TORZNAB_NS = "http://torznab.com/schemas/2015/feed"
@@ -50,7 +50,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.6"
+    plugin_version = "1.3.7"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -146,10 +146,15 @@ class JackettBridge(_PluginBase):
             logger.info(f"【{self.plugin_name}】后台异步同步索引器，避免阻塞插件加载")
             self.__start_sync_thread()
         elif self._enabled and self._indexers:
-            # 使用本地快照先把虚拟站点注册回来；快照缺媒体分类声明（旧版本生成）时
-            # 改走完整同步，避免站点索引助手中残留旧结构导致按类型站点列表缺失
-            if any(not item.get("category") for item in self._indexers):
-                logger.info(f"【{self.plugin_name}】索引器快照缺少媒体分类声明，执行完整同步更新注册结构")
+            # 使用本地快照先把虚拟站点注册回来；插件版本变化或快照缺媒体分类声明时
+            # 改走完整同步，确保站点索引助手中的注册结构更新到当前版本
+            last_version = self.get_data("synced_plugin_version")
+            if last_version != self.plugin_version or any(
+                    not item.get("category") for item in self._indexers):
+                logger.info(
+                    f"【{self.plugin_name}】插件版本 {last_version or '未知'} → "
+                    f"{self.plugin_version}，执行完整同步更新索引器注册结构"
+                )
                 self.__start_sync_thread()
             else:
                 self.__start_sync_thread(restore_only=True)
@@ -225,8 +230,21 @@ class JackettBridge(_PluginBase):
     def stop_service(self) -> None:
         """
         停止插件后台服务并释放资源。
+
+        卸载流程会先从已安装列表移除本插件再执行停止，据此区分卸载与重载/关停：
+        仅在卸载场景清理站点管理中由本插件托管的虚拟站点。
         """
-        return None
+        if self.is_clone:
+            return
+        try:
+            installed = self.systemconfig.get(SystemConfigKey.UserInstalledPlugins) or []
+        except Exception as e:
+            logger.warn(f"【{self.plugin_name}】读取已安装插件列表失败，跳过卸载清理：{str(e)}")
+            return
+        if self.__class__.__name__ in installed:
+            return
+        logger.info(f"【{self.plugin_name}】插件已卸载，清理站点管理中的虚拟站点")
+        self.__cleanup_managed_sites()
 
     # ------------------------------------------------------------------ 配置
 
@@ -345,6 +363,7 @@ class JackettBridge(_PluginBase):
                 self._indexers = indexers
                 self.save_data("indexers", indexers)
                 self.save_data("last_sync", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                self.save_data("synced_plugin_version", self.plugin_version)
                 self.__update_config()
 
             if not self._indexers:
@@ -933,7 +952,8 @@ class JackettBridge(_PluginBase):
         details: List[str] = []
         max_workers = max(1, min(len(indexers), DEFAULT_PARALLEL_INDEXERS))
         logger.info(
-            f"【{self.plugin_name}】插件资源源开始检索 {len(indexers)} 个索引器，关键词：{keyword}"
+            f"【{self.plugin_name}】插件资源源开始检索 {len(indexers)} 个索引器，"
+            f"关键词：{keyword}，选中站点：{sites or '不限'}"
         )
         with ThreadPoolExecutor(
             max_workers=max_workers,
