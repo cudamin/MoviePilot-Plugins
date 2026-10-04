@@ -50,7 +50,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.3"
+    plugin_version = "1.3.4"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -565,6 +565,9 @@ class JackettBridge(_PluginBase):
             "timeout": 5,
             "parser": self.plugin_name,
             "plugin": self.plugin_name,
+            # 声明支持的媒体分类：音乐搜索的站点列表（/site/media/music）要求
+            # category.music 非空才收录本插件站点；电影/剧集声明后同样显式匹配
+            "category": {"movie": [2000], "tv": [5000], "music": [3000]},
             "search": {},
             "browse": {"path": ""},
             "torrents": {"list": {"selector": ""}, "fields": {}},
