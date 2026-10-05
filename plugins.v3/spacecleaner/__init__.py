@@ -47,7 +47,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理＆RSS过滤"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "5.4.2"
+    plugin_version = "5.4.3"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -82,6 +82,7 @@ class SpaceCleaner(_PluginBase):
     _rss_once = False
     _rss_ntf = False
     _rss_th = 85
+    _rss_ep_jump = 11  # 集号跳变阈值：识别集号超出本地观看进度达到该值时触发兜底重新识别
     _rss_wash_mode = False  # 洗版模式：播放进度低于阈值时触发洗版，只下载最早版本
     _rss_fname_identify = False  # 种子文件名兜底识别：报文识别失败/无集号/季号不一致时下载种子用文件名再识别
     _rss_ai_identify = False  # 智能助手识别兜底：识别失败/无集号/季号不一致时交给 LLM 接管识别
@@ -130,8 +131,11 @@ class SpaceCleaner(_PluginBase):
     # 去重容器用 dict 充当「有序集合」：保留插入顺序，裁剪时才能真正丢弃最早记录
     _rss_seen: Dict[str, None] = {}
     _rss_washed: Dict[str, None] = {}  # 已洗版下载过的集(tmdbid:SxxExx)，一集一个槽位
+    _rss_skipped: Dict[str, None] = {}  # 已看完/旧集/季号不一致而终态跳过的报文(enclosure)，避免每轮重复识别与通知
     _rss_seen_max = 2000
     _rss_washed_max = 3000
+    _rss_skipped_max = 2000
+    _rss_skip_notified: Dict[str, None] = {}  # 本轮已通知过跳过/失败的键，仅单轮 RSS 内有效
     _rss_lk = threading.Lock()
     _api_recognize_cache: List[dict] = []  # TMDB API 识别失败后的独立负缓存
     _api_recognize_cache_max = 5
@@ -141,6 +145,8 @@ class SpaceCleaner(_PluginBase):
     # 智能助手识别兜底的单轮状态：调用计数与本轮已失败标题（避免同一轮重复烧 token）
     _rss_ai_calls = 0
     _rss_ai_failed: Dict[str, str] = {}
+    _rss_ai_failed_ts: Dict[str, float] = {}  # 智能助手失败标题的持久冷却（key -> 失败时间戳）
+    _rss_ai_cooldown = 24 * 3600  # 同一标题智能助手识别失败后的冷却秒数
     _rss_ai_timeout = 90  # 单次智能助手调用超时（秒）
 
     @staticmethod
@@ -177,6 +183,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_rule_group = ""
         self._rss_once = self._rss_ntf = False
         self._rss_th = 85
+        self._rss_ep_jump = 11
         self._rss_wash_mode = False
         self._rss_fname_identify = False
         self._rss_ai_identify = False
@@ -198,6 +205,7 @@ class SpaceCleaner(_PluginBase):
         self._migrate_delete_history()
         self._rss_seen = {}
         self._rss_washed = {}
+        self._rss_skipped = {}
         self._api_recognize_cache = self._load_api_recognize_cache()
         self._api_recognize_success_cache = self._load_api_recognize_success_cache()
         self._stop_rss_scheduler()
@@ -248,8 +256,18 @@ class SpaceCleaner(_PluginBase):
         self._rss_once = bool(config.get("rss_once"))
         self._rss_ntf = bool(config.get("rss_ntf", True))
         self._rss_th = self._to_int(config.get("rss_th"), 85, 1, 100)
+        self._rss_ep_jump = self._to_int(config.get("rss_ep_jump"), 11, 2, 999)
         self._rss_seen = dict.fromkeys(self.get_data("rss_seen") or [])
         self._rss_washed = dict.fromkeys(self.get_data("rss_washed") or [])
+        self._rss_skipped = dict.fromkeys(self.get_data("rss_skipped") or [])
+        self._rss_ai_failed_ts = {}
+        raw_ai_failed = self.get_data("rss_ai_failed")
+        if isinstance(raw_ai_failed, dict):
+            for k, v in raw_ai_failed.items():
+                try:
+                    self._rss_ai_failed_ts[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_fname_identify = bool(config.get("rss_fname_identify"))
         self._rss_ai_identify = bool(config.get("rss_ai_identify"))
@@ -334,7 +352,7 @@ class SpaceCleaner(_PluginBase):
             "rss_dl": self._rss_dl, "rss_rule_group": self._rss_rule_group,
             "rss_sz": self._rss_sz, "rss_inc": self._rss_inc,
             "rss_exc": self._rss_exc, "rss_once": self._rss_once, "rss_ntf": self._rss_ntf,
-            "rss_th": self._rss_th, "rss_wash_mode": self._rss_wash_mode,
+            "rss_th": self._rss_th, "rss_ep_jump": self._rss_ep_jump, "rss_wash_mode": self._rss_wash_mode,
             "rss_fname_identify": self._rss_fname_identify,
             "rss_ai_identify": self._rss_ai_identify,
             "rss_ai_add_words": self._rss_ai_add_words,
@@ -737,29 +755,33 @@ class SpaceCleaner(_PluginBase):
         return schemas.Response(success=True)
 
     def rss_ca(self, confirm: Any = None, apikey: str = ""):
-        """清除 RSS 已处理报文记录（需二次确认，清除后同一批报文会被重新处理）。"""
+        """清除 RSS 已处理报文与跳过记录（需二次确认，清除后同一批报文会被重新处理）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
         if self._need_confirm("clear_seen", confirm,
-                              "再次点击「确认清除已处理报文」将清空 RSS 去重记录，旧报文可能被重新下载"):
+                              "再次点击「确认清除已处理报文」将清空 RSS 去重与跳过记录，旧报文可能被重新下载"):
             return schemas.Response(success=True, message="等待确认")
         self.save_data("rss_seen", [])
+        self.save_data("rss_skipped", [])
         with self._rss_lk:
             self._rss_seen = {}
-        self._set_notice("已清除 RSS 已处理报文记录", "success")
+            self._rss_skipped = {}
+        self._set_notice("已清除 RSS 已处理报文与跳过记录", "success")
         return schemas.Response(success=True)
 
     def rss_wash_clear(self, confirm: Any = None, apikey: str = ""):
-        """清除洗版记录（需二次确认，清除后同一集会被重新洗版下载）。"""
+        """清除洗版记录（需二次确认，清除后同一集会被重新洗版下载，已看完跳过的报文也重新参与判定）。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
         if self._need_confirm("clear_washed", confirm,
-                              "再次点击「确认清除洗版记录」后，已洗版的剧集会被重新下载"):
+                              "再次点击「确认清除洗版记录」后，已洗版的剧集会被重新下载，已看完跳过的报文也会重新参与判定"):
             return schemas.Response(success=True, message="等待确认")
         self.save_data("rss_washed", [])
+        self.save_data("rss_skipped", [])
         with self._rss_lk:
             self._rss_washed = {}
-        self._set_notice("已清除洗版记录", "success")
+            self._rss_skipped = {}
+        self._set_notice("已清除洗版记录与已看完跳过记录", "success")
         return schemas.Response(success=True)
 
     def rename_run_once(self, apikey: str = ""):
@@ -793,6 +815,9 @@ class SpaceCleaner(_PluginBase):
             if kind in ("negative", "all"):
                 self._api_recognize_cache = []
                 self.save_data("api_recognize_cache", [])
+                # 负缓存清空意味着允许重新识别，智能助手失败冷却一并解除
+                self._rss_ai_failed_ts = {}
+                self.save_data("rss_ai_failed", {})
         self._set_notice(f"已清空{labels[kind]}", "success")
         logger.info(f"SC 已清空{labels[kind]}")
         return schemas.Response(success=True)
@@ -915,6 +940,9 @@ class SpaceCleaner(_PluginBase):
                     {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSelect", "props": {"model": "rss_dl", "label": "下载器", "items": dls, "clearable": True}}]},
                 ]},
                 {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "rss_ep_jump", "label": "集号跳变阈值（集）", "type": "number", "min": 2, "hint": "识别集号超出本地观看进度达到该值时视为疑似绝对集号：先用种子文件名、再交智能助手重新识别季集，修正后入库，仍跳变则跳过下载", "persistent-hint": True}}]},
+                ]},
+                {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSelect", "props": {"model": "rss_rule_group", "label": "优先级规则组", "items": groups, "clearable": True, "hint": "留空不过滤", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [{"component": "VTextField", "props": {"model": "rss_save_path", "label": "自定义保存路径", "placeholder": "留空使用默认路径", "hint": "支持 <storage>:<path> 格式", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_proxy_retry", "label": "优先使用代理", "hint": "RSS 刷新与种子获取优先走系统代理，失败自动回退直连（需配置系统代理）", "persistent-hint": True}}]},
@@ -993,7 +1021,7 @@ class SpaceCleaner(_PluginBase):
             "pb_filter_watched": True, "watched_threshold": 85,
             "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
             "rss_dl": "", "rss_rule_group": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
-            "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False,
+            "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_ep_jump": 11, "rss_wash_mode": False,
             "rss_fname_identify": False, "rss_ai_identify": False, "rss_ai_add_words": True, "rss_ai_max": 5,
             "rss_proxy_retry": True, "rss_save_path": "",
             "rename_on": False, "rename_cron": "0 */12 * * *", "rename_downloader": [],
@@ -1276,13 +1304,14 @@ class SpaceCleaner(_PluginBase):
         negative_cache = self._load_api_recognize_cache()
         washed = self._page_washed_items(self._page_titles(pb_items, success_cache))
         seen_count = len(self.get_data("rss_seen") or [])
+        skipped_count = len(self.get_data("rss_skipped") or [])
         counts = {"pb": len(pb_items), "history": len(history), "rss": len(washed),
                   "cache": len(success_cache) + len(negative_cache)}
 
         if view["tab"] == "history":
             body = self._page_tab_history(view, history)
         elif view["tab"] == "rss":
-            body = self._page_tab_rss(view, washed, seen_count)
+            body = self._page_tab_rss(view, washed, seen_count, skipped_count)
         elif view["tab"] == "cache":
             body = self._page_tab_cache(view, success_cache, negative_cache)
         else:
@@ -1633,7 +1662,8 @@ class SpaceCleaner(_PluginBase):
 
     # ---------- RSS 记录 ----------
 
-    def _page_tab_rss(self, view: dict, washed: List[dict], seen_count: int) -> List[dict]:
+    def _page_tab_rss(self, view: dict, washed: List[dict], seen_count: int,
+                      skipped_count: int = 0) -> List[dict]:
         tiles = [
             self._tile("已处理报文", str(seen_count), f"上限 {self._rss_seen_max} 条"),
             self._tile("已洗版集数", str(len(washed)), f"上限 {self._rss_washed_max} 条"),
@@ -1648,6 +1678,7 @@ class SpaceCleaner(_PluginBase):
             self._chip(f"保存路径 {self._rss_save_path or '默认'}", icon="mdi-folder-outline"),
             self._chip(f"体积过滤 {self._rss_sz or '不限'} GB", icon="mdi-scale"),
             self._chip(f"洗版阈值 {self._rss_th}%", icon="mdi-percent-outline"),
+            self._chip(f"已看完跳过 {skipped_count} 条", icon="mdi-skip-forward"),
         ]
         if self._rss_ai_identify:
             info_chips.append(self._chip(f"智能助手单轮上限 {self._rss_ai_max} 次", color="info",
@@ -3219,9 +3250,10 @@ class SpaceCleaner(_PluginBase):
                 return
             self._rss_busy = True
         logger.info("SC-RSS 开始运行...")
-        # 重置智能助手兜底的单轮预算与失败标题记录
+        # 重置智能助手兜底的单轮预算、失败标题记录与轮内通知去重
         self._rss_ai_calls = 0
         self._rss_ai_failed = {}
+        self._rss_skip_notified = {}
         try:
             if self._rss_wash_mode:
                 # 洗版模式：先收集所有 URL 的条目，统一去重后再下载
@@ -3278,7 +3310,7 @@ class SpaceCleaner(_PluginBase):
                 if not t or not e:
                     continue
                 with self._rss_lk:
-                    if e in self._rss_seen:
+                    if e in self._rss_seen or e in self._rss_skipped:
                         continue
                 if self._rss_inc and not re.search(self._rss_inc, t, re.IGNORECASE):
                     continue
@@ -3312,7 +3344,7 @@ class SpaceCleaner(_PluginBase):
                             m, meta, video_name = ai_m, ai_meta, ai_name
                         else:
                             self._rss_log("识别失败", t)
-                            if self._rss_ntf:
+                            if self._rss_ntf and self._rss_notify_once(f"fail:{e}"):
                                 self.post_message(title="SC-RSS识别失败",
                                                   text=f"资源无法识别: {t}")
                             continue
@@ -3323,7 +3355,7 @@ class SpaceCleaner(_PluginBase):
                         m, meta, video_name = ai_m, ai_meta, ai_name
                     else:
                         self._rss_log("跳过无TMDB", t, "未识别到 TMDB ID")
-                        if self._rss_ntf:
+                        if self._rss_ntf and self._rss_notify_once(f"notmdb:{e}"):
                             self.post_message(title="SC-RSS跳过",
                                               text=f"未识别到 TMDB ID: {t}")
                         continue
@@ -3347,7 +3379,7 @@ class SpaceCleaner(_PluginBase):
                             s_season, s_episode = self._rss_tv_season_episode(m, meta, video_name)
                     if s_episode is None:
                         self._rss_log("跳过无集号", t, "电视剧未识别到集号")
-                        if self._rss_ntf:
+                        if self._rss_ntf and self._rss_notify_once(f"noep:{e}"):
                             self.post_message(title="SC-RSS跳过",
                                               text=f"电视剧未识别到集号: {t}")
                         continue
@@ -3386,9 +3418,12 @@ class SpaceCleaner(_PluginBase):
                                     self._rss_log("智能助手兜底命中", m.title, f"改用智能助手识别结果 {se_fmt}")
                                     fb_ok = True
                         if not fb_ok:
+                            # 分季策略差异是标题的稳定属性：记录跳过，同一报文不再每轮重跑兜底识别
+                            with self._rss_lk:
+                                self._rss_skipped[e] = None
                             self._rss_log("跳过季号不一致", m.title,
                                           f"RSS={se_fmt}，播放缓存季={cached_text}，疑似分季策略不同")
-                            if self._rss_ntf:
+                            if self._rss_ntf and self._rss_notify_once(f"mismatch:{m.tmdb_id}:{se_fmt}"):
                                 self.post_message(
                                     title="SC-RSS季号不一致",
                                     text=f"资源: {m.title}\nRSS识别: {se_fmt}\n播放缓存季: {cached_text}\n"
@@ -3397,23 +3432,58 @@ class SpaceCleaner(_PluginBase):
                             continue
                 else:
                     se_fmt = "电影"
+                # 洗版模式：识别集号远超本地观看进度时，疑似绝对集号被当作季内集号
+                # （如「第三季 [49]」实为 S03E01）：先用种子文件名、再交智能助手重新判定季集，
+                # 修正后继续洗版判定；兜底结果仍跳变则记录跳过，避免按错误季集入库。
+                if is_tv and s_episode is not None and m.tmdb_id \
+                        and (self._rss_fname_identify or self._rss_ai_identify):
+                    known_ep = self._rss_show_latest_watched_ep(m.tmdb_id)
+                    if known_ep is not None and int(s_episode) - known_ep >= self._rss_ep_jump:
+                        fixed, jump_rejected = self._rss_fix_episode_jump(
+                            item, t, m, s_season, s_episode, known_ep)
+                        if fixed:
+                            m, meta, video_name, s_season, s_episode = fixed
+                            se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}"
+                            self._rss_log("集号修正", m.title,
+                                          f"原识别集号超出本地进度 E{known_ep:02d}，已按兜底结果修正为 {se_fmt}")
+                        elif jump_rejected:
+                            # 兜底给出了结果但仍跳变：判定稳定，记录跳过并通知一次
+                            with self._rss_lk:
+                                self._rss_skipped[e] = None
+                            self._rss_log("跳过集号跳变", m.title,
+                                          f"{se_fmt} 超出本地进度 E{known_ep:02d}，兜底结果仍跳变，疑似绝对集号未换算")
+                            if self._rss_ntf and self._rss_notify_once(f"jump:{m.tmdb_id}:{se_fmt}"):
+                                self.post_message(title="SC-RSS集号跳变",
+                                                  text=f"资源: {m.title}\nRSS识别: {se_fmt}\n本地进度: E{known_ep:02d}\n"
+                                                       "疑似绝对集号未换算且兜底无法修正，已跳过下载")
+                            continue
+                        else:
+                            # 兜底不可用或临时失败：本轮不添加，下轮重试
+                            self._rss_log("暂缓集号跳变", m.title,
+                                          f"{se_fmt} 超出本地进度 E{known_ep:02d}，兜底不可用，本轮跳过待下轮重试")
+                            continue
                 cr = self._rss_ck(m, meta, s_season, s_episode)
                 # 洗版模式：若该季已有更新集的播放记录，则跳过之前的所有旧集
                 # 例：缓存中已有第 10 集记录，则该季 1-9 集不再洗版下载
                 if is_tv and s_episode is not None:
                     latest_ep = self._rss_latest_watched_ep(m.tmdb_id, s_season)
                     if latest_ep is not None and int(s_episode) < latest_ep:
+                        # 旧集判定随播放进度单调不变：记录跳过，同一报文不再每轮重复识别
+                        with self._rss_lk:
+                            self._rss_skipped[e] = None
                         self._rss_log("跳过旧集", m.title,
                                       f"{se_fmt} 已看到 E{latest_ep:02d}，跳过更早的集")
-                        if self._rss_ntf:
+                        if self._rss_ntf and self._rss_notify_once(f"old:{m.tmdb_id}:{se_fmt}"):
                             self.post_message(title="SC-RSS跳过旧集",
                                               text=f"{m.title} {se_fmt} 已看到第{latest_ep}集，跳过旧集")
                         continue
                 # 洗版模式：播放进度低于阈值才触发洗版
                 if cr["s"]:
-                    # 已看完（进度 >= 阈值），跳过
+                    # 已看完（进度 >= 阈值）：进度只增不减，记录跳过后同一报文不再每轮重复识别
+                    with self._rss_lk:
+                        self._rss_skipped[e] = None
                     self._rss_log("跳过", m.title, cr["r"])
-                    if self._rss_ntf:
+                    if self._rss_ntf and self._rss_notify_once(f"watched:{m.tmdb_id}:{se_fmt}"):
                         self.post_message(title="SC-RSS跳过",
                                           text=f"{m.title} {se_fmt} {cr['r']}")
                     continue
@@ -3510,10 +3580,17 @@ class SpaceCleaner(_PluginBase):
         """ts_a 是否比 ts_b 更早发布。"""
         return ts_a < ts_b
 
+    def _rss_notify_once(self, key: str) -> bool:
+        """同一轮 RSS 内相同 key 的跳过/失败只通知一次：多个 RSS 源常带同一集的不同报文。"""
+        if not key or key in self._rss_skip_notified:
+            return False
+        self._rss_skip_notified[key] = None
+        return True
+
     def _rss_save_dedup(self) -> None:
         """裁剪并持久化 RSS 去重容器。
 
-        _rss_seen / _rss_washed 用 dict 保留插入顺序，超限时丢弃最早记录；
+        _rss_seen / _rss_washed / _rss_skipped 用 dict 保留插入顺序，超限时丢弃最早记录；
         旧实现用 set 转 list 后切片，丢弃的是随机记录，会导致老资源重复下载。
         """
         with self._rss_lk:
@@ -3521,10 +3598,14 @@ class SpaceCleaner(_PluginBase):
                 self._rss_seen = dict.fromkeys(list(self._rss_seen)[-self._rss_seen_max:])
             if len(self._rss_washed) > self._rss_washed_max:
                 self._rss_washed = dict.fromkeys(list(self._rss_washed)[-self._rss_washed_max:])
+            if len(self._rss_skipped) > self._rss_skipped_max:
+                self._rss_skipped = dict.fromkeys(list(self._rss_skipped)[-self._rss_skipped_max:])
             seen_snapshot = list(self._rss_seen)
             washed_snapshot = list(self._rss_washed)
+            skipped_snapshot = list(self._rss_skipped)
         self.save_data("rss_seen", seen_snapshot)
         self.save_data("rss_washed", washed_snapshot)
+        self.save_data("rss_skipped", skipped_snapshot)
 
     def _rss_proc(self, url: str):
         """普通模式（未开启洗版）：不做 TMDB 识别，直接添加种子到下载器。
@@ -3638,6 +3719,62 @@ class SpaceCleaner(_PluginBase):
                 if latest is None or ep > latest:
                     latest = ep
         return latest
+
+    def _rss_show_latest_watched_ep(self, tmdb_id) -> Optional[int]:
+        """该 tmdbid 在播放缓存中跨所有季的最大集号，用于识别集号跳变检测；无记录返回 None。"""
+        if not tmdb_id:
+            return None
+        prefix = f"{int(tmdb_id)}:S"
+        latest = None
+        with self._pb_lock:
+            for r in self._pb:
+                k = str(r.get("k") or "")
+                if not k.startswith(prefix):
+                    continue
+                km = re.match(r"^\d+:S\d+E(\d+)$", k)
+                if not km:
+                    continue
+                ep = int(km.group(1))
+                if latest is None or ep > latest:
+                    latest = ep
+        return latest
+
+    def _rss_fix_episode_jump(self, item: dict, t: str, m,
+                              s_season: int, s_episode: int, known_ep: int):
+        """识别集号远超本地进度时按「种子文件名 → 智能助手」重新判定季集。
+
+        返回 (fixed, rejected)：fixed 为 (media, meta, video_name, season, episode)；
+        rejected 表示兜底给出过结果但仍跳变（判定稳定，调用方可记录跳过）；
+        兜底不可用或临时失败时 rejected 为 False（调用方仅本轮跳过、不落记录，下轮重试）。
+        """
+        reason = (f"识别 S{int(s_season):02d}E{int(s_episode):02d} 超出本地进度 "
+                  f"E{int(known_ep):02d} 达 {int(s_episode) - int(known_ep)} 集，疑似绝对集号未换算")
+        rejected = False
+        fb_m, fb_meta, fb_name = self._rss_filename_fallback(item, t, reason)
+        if fb_m and fb_meta:
+            fb_season, fb_episode = self._rss_tv_season_episode(fb_m, fb_meta, fb_name)
+            if fb_episode is not None:
+                fb_known = self._rss_show_latest_watched_ep(getattr(fb_m, "tmdb_id", None))
+                if fb_known is None or int(fb_episode) - fb_known < self._rss_ep_jump:
+                    self._rss_log("文件名回退命中", getattr(fb_m, "title", m.title),
+                                  f"改用文件名识别结果 S{int(fb_season):02d}E{int(fb_episode):02d}")
+                    return (fb_m, fb_meta, fb_name, fb_season, fb_episode), False
+                self._rss_log("文件名回退仍跳变", getattr(fb_m, "title", m.title),
+                              f"S{int(fb_season):02d}E{int(fb_episode):02d} 超出本地进度 E{fb_known:02d}，继续智能助手兜底")
+                rejected = True
+        ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, reason)
+        if ai_m and ai_meta:
+            ai_season, ai_episode = self._rss_tv_season_episode(ai_m, ai_meta, ai_name)
+            if ai_episode is not None:
+                ai_known = self._rss_show_latest_watched_ep(getattr(ai_m, "tmdb_id", None))
+                if ai_known is None or int(ai_episode) - ai_known < self._rss_ep_jump:
+                    self._rss_log("智能助手兜底命中", getattr(ai_m, "title", m.title),
+                                  f"改用智能助手识别结果 S{int(ai_season):02d}E{int(ai_episode):02d}")
+                    return (ai_m, ai_meta, ai_name, ai_season, ai_episode), False
+                self._rss_log("智能助手兜底仍跳变", getattr(ai_m, "title", m.title),
+                              f"S{int(ai_season):02d}E{int(ai_episode):02d} 超出本地进度 E{ai_known:02d}，不采用")
+                rejected = True
+        return None, rejected
 
     def _rss_cached_seasons(self, tmdb_id: int) -> List[int]:
         """获取指定电视剧在播放缓存中已有记录的季号列表。"""
@@ -4176,6 +4313,16 @@ class SpaceCleaner(_PluginBase):
             self._rss_log("智能助手识别异常", getattr(meta, "name", ""), f"TMDB 查询失败: {exc}")
             return None
 
+    def _rss_ai_mark_failed(self, key: str, reason: str) -> None:
+        """记录智能助手失败并持久化冷却时间戳：冷却期内同一标题不再重复调用（避免每轮烧 token）。"""
+        if not key:
+            return
+        self._rss_ai_failed[key] = reason
+        self._rss_ai_failed_ts[key] = time.time()
+        if len(self._rss_ai_failed_ts) > 200:
+            self._rss_ai_failed_ts = dict(list(self._rss_ai_failed_ts.items())[-200:])
+        self.save_data("rss_ai_failed", dict(self._rss_ai_failed_ts))
+
     def _rss_ai_fallback(self, item: dict, rt: str, reason: str,
                          cached_seasons: Optional[List[int]] = None):
         """智能助手识别兜底。
@@ -4198,6 +4345,12 @@ class SpaceCleaner(_PluginBase):
         if key and key in self._rss_ai_failed:
             self._rss_log("智能助手跳过", rt, f"本轮已失败：{self._rss_ai_failed[key]}")
             return None, None, ""
+        if key:
+            failed_ts = self._rss_ai_failed_ts.get(key)
+            if failed_ts and time.time() - failed_ts < self._rss_ai_cooldown:
+                self._rss_log("智能助手跳过", rt,
+                              f"冷却期内（{self._rss_ai_cooldown // 3600} 小时内已失败），不再调用")
+                return None, None, ""
         if self._rss_ai_calls >= self._rss_ai_max:
             self._rss_log("智能助手跳过", rt, f"已达本轮调用上限 {self._rss_ai_max} 次")
             return None, None, ""
@@ -4220,14 +4373,12 @@ class SpaceCleaner(_PluginBase):
             reply = self._rss_ai_ask(self._rss_ai_prompt(rt, reason, base_meta, cached_seasons, file_names))
         except Exception as exc:
             self._rss_log("智能助手调用失败", rt, str(exc))
-            if key:
-                self._rss_ai_failed[key] = "调用失败"
+            self._rss_ai_mark_failed(key, "调用失败")
             return None, None, ""
         guess = self._rss_ai_parse_json(reply)
         if not guess:
             self._rss_log("智能助手回复无效", rt, (reply or "")[:200])
-            if key:
-                self._rss_ai_failed[key] = "回复无法解析"
+            self._rss_ai_mark_failed(key, "回复无法解析")
             return None, None, ""
 
         title = str(guess.get("title") or "").strip()
@@ -4244,20 +4395,17 @@ class SpaceCleaner(_PluginBase):
                       f"依据={str(guess.get('reason') or '')[:80]}")
         if not title and not tmdb_id:
             self._rss_log("智能助手识别失败", rt, "未给出标题与 TMDB ID")
-            if key:
-                self._rss_ai_failed[key] = "结果不完整"
+            self._rss_ai_mark_failed(key, "结果不完整")
             return None, None, ""
         if is_tv and episode is None:
             self._rss_log("智能助手识别失败", rt, "电视剧未给出集号")
-            if key:
-                self._rss_ai_failed[key] = "缺少集号"
+            self._rss_ai_mark_failed(key, "缺少集号")
             return None, None, ""
         if cached_seasons and is_tv and season is not None and int(season) not in cached_seasons:
             cached_text = "、".join(f"S{s:02d}" for s in cached_seasons)
             self._rss_log("智能助手结果不采用", rt,
                           f"S{int(season):02d} 仍与播放缓存季（{cached_text}）不一致")
-            if key:
-                self._rss_ai_failed[key] = "季号仍不一致"
+            self._rss_ai_mark_failed(key, "季号仍不一致")
             return None, None, ""
 
         # 生成并校验自定义识别词：优先用智能助手给出的，无效时自造窄匹配规则
@@ -4286,8 +4434,7 @@ class SpaceCleaner(_PluginBase):
                 meta = MetaInfo(title=rt)
             except Exception:
                 self._rss_log("智能助手识别失败", rt, "标题解析异常")
-                if key:
-                    self._rss_ai_failed[key] = "标题解析异常"
+                self._rss_ai_mark_failed(key, "标题解析异常")
                 return None, None, ""
         if is_tv:
             if getattr(meta, "begin_season", None) is None or int(meta.begin_season) != int(season):
@@ -4300,8 +4447,7 @@ class SpaceCleaner(_PluginBase):
         media = self._rss_ai_recognize_media(meta, guess)
         if not media or not getattr(media, "tmdb_id", None):
             self._rss_log("智能助手识别失败", rt, "TMDB 未查到对应媒体")
-            if key:
-                self._rss_ai_failed[key] = "TMDB 查询失败"
+            self._rss_ai_mark_failed(key, "TMDB 查询失败")
             return None, None, ""
         # TMDB 详情查询可能重置季集（按 ID 查询会重建 meta 的季信息），这里再兜一次
         if is_tv:
@@ -4310,6 +4456,10 @@ class SpaceCleaner(_PluginBase):
             if getattr(meta, "begin_season", None) is None:
                 meta.begin_season = int(season)
         self._drop_api_negative_cache_by_title(rt)
+        if key:
+            # 识别成功即解除该标题的失败冷却
+            self._rss_ai_failed_ts.pop(key, None)
+            self.save_data("rss_ai_failed", dict(self._rss_ai_failed_ts))
         try:
             self._save_api_success_cache(self._api_recognize_cache_key(meta), getattr(meta, "name", "") or title, media)
         except Exception:
