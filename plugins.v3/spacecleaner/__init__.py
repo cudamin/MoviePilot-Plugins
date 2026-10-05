@@ -47,7 +47,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理＆RSS过滤"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "5.4.3"
+    plugin_version = "5.4.4"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -4532,8 +4532,8 @@ class SpaceCleaner(_PluginBase):
             if native_media:
                 self._rss_log("命中TMDB识别缓存", title,
                               f"TMDB={native_media.tmdb_id} 《{native_media.title}》")
-                # 识别成功结果同步写入独立正缓存，后续相同标题报文直接命中。
-                self._save_api_success_cache(cache_key, meta.name, native_media)
+                # MP 本地缓存是全实例共享的识别结果（订阅/刷库/手动识别等来源），
+                # 不回写独立正缓存：独立缓存只记录插件 RSS 识别链路（官方 API、智能助手）的结果。
                 native_media = self._complete_media_by_tmdbid(meta, native_media)
                 return native_media, meta, True
 
