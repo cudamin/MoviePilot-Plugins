@@ -30,7 +30,7 @@ class agentconfigprofile(_PluginBase):
     plugin_name = "API聚合自动切换"
     plugin_desc = "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。"
     plugin_icon = "agentresourceofficer.png"
-    plugin_version = "2.6.2"
+    plugin_version = "2.7.0"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
     # 插件市场仓库地址，安装统计上报时一并提交
@@ -62,20 +62,26 @@ class agentconfigprofile(_PluginBase):
 
     _SENSITIVE_SETTING_KEYS = {"LLM_API_KEY"}
 
-    # 全局参数：插件配置键 -> 系统设置键
-    _GLOBAL_LLM_OPTIONS = {
-        "g_thinking_level": "LLM_THINKING_LEVEL",
-        "g_use_proxy": "LLM_USE_PROXY",
-        "g_image_input": "LLM_SUPPORT_IMAGE_INPUT",
-        "g_audio_input": "LLM_SUPPORT_AUDIO_INPUT",
-        "g_audio_output": "LLM_SUPPORT_AUDIO_OUTPUT",
-    }
-    # 全局参数：与模型无关，仅写入系统设置
-    _GLOBAL_AGENT_OPTIONS = {
-        "g_retry_transfer": "AI_AGENT_RETRY_TRANSFER",
-        "g_ai_recommend": "AI_RECOMMEND_ENABLED",
-    }
-    _THINKING_LEVELS = ["off", "auto", "minimal", "low", "medium", "high", "max", "xhigh"]
+    # 思考模式可选项（值, 展示名），与系统设置页保持一致
+    _THINKING_LEVEL_OPTIONS = (
+        ("off", "关闭"), ("auto", "自动"), ("minimal", "最低"), ("low", "低"),
+        ("medium", "中"), ("high", "高"), ("xhigh", "极高"), ("max", "最大"),
+    )
+    # OpenAI 兼容接口请求协议可选项
+    _API_PROTOCOL_OPTIONS = (
+        ("auto", "自动"),
+        ("chat_completions", "Chat Completions"),
+        ("responses", "Responses"),
+    )
+    # 联网搜索模式可选项
+    _WEB_SEARCH_MODE_OPTIONS = (
+        ("local", "MoviePilot 本地搜索"),
+        ("builtin", "模型服务商检索"),
+        ("auto", "自动回退"),
+        ("disabled", "完全关闭"),
+    )
+    # 定时唤醒间隔可选项（小时），0 为不启用
+    _JOB_INTERVAL_OPTIONS = (1, 2, 4, 6, 12, 24, 48)
 
     # 探活时可直接传给 LLMHelper.test_current_settings 的参数映射
     _PROBE_ARG_MAP = {
@@ -160,10 +166,15 @@ class agentconfigprofile(_PluginBase):
         self._discover_limit = max(0, self._to_int(config.get("discover_limit"), 20))
         self._discover_auto_import = bool(config.get("discover_auto_import", True))
         self._discover_smart_match = bool(config.get("discover_smart_match", True))
-        self._whitelists = {
-            provider: self._parse_list(config.get(f"whitelist_{provider}"))
-            for provider in self._DISCOVER_PROVIDERS
-        }
+        # 旧版按协议拆分的三个白名单输入框（whitelist_<provider>）合并为单一白名单
+        if not str(config.get("whitelist") or "").strip():
+            merged = []
+            for key in ("whitelist_anthropic", "whitelist_openai", "whitelist_deepseek"):
+                merged.extend(self._parse_list(config.get(key)))
+            if merged:
+                config["whitelist"] = ", ".join(merged)
+                logger.info(f"{self.plugin_name}：已合并旧版按协议拆分的模型白名单，共 {len(merged)} 项")
+        self._whitelist = self._parse_list(config.get("whitelist"))
 
         # 全局参数（统一应用到所有模板与系统设置）
         self._apply_global = bool(config.get("apply_global"))
@@ -176,9 +187,20 @@ class agentconfigprofile(_PluginBase):
         self._g_retry_transfer = bool(
             config.get("g_retry_transfer", getattr(settings, "AI_AGENT_RETRY_TRANSFER", False)))
         self._g_ai_recommend = bool(config.get("g_ai_recommend", getattr(settings, "AI_RECOMMEND_ENABLED", False)))
+        self._g_api_protocol = str(
+            config.get("g_api_protocol") or getattr(settings, "LLM_API_PROTOCOL", "auto") or "auto")
+        self._g_web_search_mode = str(
+            config.get("g_web_search_mode") or getattr(settings, "LLM_WEB_SEARCH_MODE", "local") or "local")
+        # User-Agent 留空表示使用 SDK 默认值；只有从未配置过时才继承系统设置
+        self._g_user_agent = str(
+            config.get("g_user_agent") if config.get("g_user_agent") is not None
+            else (getattr(settings, "LLM_USER_AGENT", "") or "")).strip()
+        self._g_job_interval = max(0, self._to_int(
+            config.get("g_job_interval"), self._to_int(getattr(settings, "AI_AGENT_JOB_INTERVAL", 0), 0)))
         self._discovery_api_key_runtime = ""
 
         self._runtime = self._load_runtime()
+        self._mark_interrupted_states()
 
         action = str(config.get("action") or "none").strip()
         new_profile_name = str(config.get("new_profile_name") or "").strip()
@@ -343,12 +365,14 @@ class agentconfigprofile(_PluginBase):
             "discover_limit": self._discover_limit,
             "discover_auto_import": self._discover_auto_import,
             "discover_smart_match": self._discover_smart_match,
-            "whitelist_openai": ", ".join(self._whitelists.get("openai") or []),
-            "whitelist_anthropic": ", ".join(self._whitelists.get("anthropic") or []),
-            "whitelist_deepseek": ", ".join(self._whitelists.get("deepseek") or []),
+            "whitelist": ", ".join(self._whitelist),
             "apply_global": self._apply_global,
             "g_thinking_level": self._g_thinking_level,
             "g_use_proxy": self._g_use_proxy,
+            "g_api_protocol": self._g_api_protocol,
+            "g_web_search_mode": self._g_web_search_mode,
+            "g_user_agent": self._g_user_agent,
+            "g_job_interval": self._g_job_interval,
             "g_image_input": self._g_image_input,
             "g_audio_input": self._g_audio_input,
             "g_audio_output": self._g_audio_output,
@@ -516,6 +540,31 @@ class agentconfigprofile(_PluginBase):
     def _save_runtime(self):
         self.save_data(self.DATA_KEY_RUNTIME, self._runtime)
 
+    def _mark_interrupted_states(self):
+        """
+        把上代后台任务遗留的 running 状态改写为中断。
+
+        init_plugin 会先停掉旧代任务再执行到这里，因此此刻仍处于 running 的
+        探活/探测必然没能落终态（进程重启或保存配置触发重载）；若不改写，
+        任务入口会一直判定“正在进行中”，进度面板也会永久停在旧进度。
+        """
+        dirty = False
+        progress = self._runtime.get("probe_all")
+        if isinstance(progress, dict) and progress.get("status") == "running":
+            progress["status"] = "error"
+            progress["message"] = "任务已中断（插件重载或进程重启）"
+            progress["current"] = ""
+            progress["finished_at"] = self._now()
+            dirty = True
+        discovery = self._load_discovery()
+        if discovery.get("status") == "running":
+            discovery["status"] = "error"
+            discovery["message"] = "任务已中断（插件重载或进程重启）"
+            discovery["finished_at"] = self._now()
+            self._save_discovery(discovery)
+        if dirty:
+            self._save_runtime()
+
     def _add_log(self, text: str, level: str = "info"):
         """记录一条切换/探活日志。"""
         logs = self._runtime.setdefault("log", [])
@@ -664,7 +713,8 @@ class agentconfigprofile(_PluginBase):
             message = str(err) or err.__class__.__name__
             if api_key and len(api_key) > 6:
                 message = message.replace(api_key, "***")
-            return False, message[:180], 0
+            # 宿主的 LLMTestError/LLMTestTimeout 会带上已耗时 duration_ms
+            return False, message[:180], self._to_int(getattr(err, "duration_ms", 0), 0)
 
         duration = self._to_int((result or {}).get("duration_ms"), 0)
         if not (result or {}).get("reply_preview"):
@@ -829,6 +879,9 @@ class agentconfigprofile(_PluginBase):
         return {
             "LLM_THINKING_LEVEL": self._g_thinking_level,
             "LLM_USE_PROXY": self._g_use_proxy,
+            "LLM_API_PROTOCOL": self._g_api_protocol,
+            "LLM_WEB_SEARCH_MODE": self._g_web_search_mode,
+            "LLM_USER_AGENT": self._g_user_agent,
             "LLM_SUPPORT_IMAGE_INPUT": self._g_image_input,
             "LLM_SUPPORT_AUDIO_INPUT": self._g_audio_input,
             "LLM_SUPPORT_AUDIO_OUTPUT": self._g_audio_output,
@@ -839,6 +892,7 @@ class agentconfigprofile(_PluginBase):
         return {
             "AI_AGENT_RETRY_TRANSFER": self._g_retry_transfer,
             "AI_RECOMMEND_ENABLED": self._g_ai_recommend,
+            "AI_AGENT_JOB_INTERVAL": self._g_job_interval,
         }
 
     def _overlay_global(self, llm: Dict[str, Any]) -> Dict[str, Any]:
@@ -857,7 +911,7 @@ class agentconfigprofile(_PluginBase):
         changed_settings = [key for key, value in env_updates.items()
                             if getattr(settings, key, None) != value]
         if changed_settings:
-                self._update_settings_checked(env_updates, "全局参数写入")
+            self._update_settings_checked(env_updates, "全局参数写入")
 
         touched = 0
         with self._lock:
@@ -925,7 +979,6 @@ class agentconfigprofile(_PluginBase):
             raise RuntimeError(f"应用失败：模板 [{name}] 无可写入配置")
         self._runtime["fail_count"] = 0
         self._runtime["takeover_id"] = ""
-        self._runtime["current_profile_id"] = profile_id
         self._runtime["applied_at"] = self._now()
         self._add_log(f"已切换到模板 [{name}]{('（' + reason + '）') if reason else ''}")
         self._save_runtime()
@@ -1210,8 +1263,8 @@ class agentconfigprofile(_PluginBase):
         return result
 
     def _has_whitelist(self) -> bool:
-        """是否配置了任意协议的模型白名单。"""
-        return any(self._whitelists.get(provider) for provider in self._DISCOVER_PROVIDERS)
+        """是否配置了模型白名单。"""
+        return bool(self._whitelist)
 
     def _preferred_provider(self, model_id: str, available: List[str]) -> Optional[str]:
         """按模型名推断最合适的协议，避免同一模型在多个协议下重复建模板。"""
@@ -1246,21 +1299,15 @@ class agentconfigprofile(_PluginBase):
                 model_map[model_id][provider] = model
         return model_map, order
 
-    def whitelist_status(self, discovery: Dict[str, Any]) -> Dict[str, Dict[str, List[str]]]:
-        """返回每个协议白名单的命中与未命中情况，供页面展示。"""
+    def whitelist_status(self, discovery: Dict[str, Any]) -> Dict[str, List[str]]:
+        """返回白名单在探测结果中的命中与未命中情况，供页面展示。"""
         model_map, _order = self._collect_discovered(discovery)
-        status: Dict[str, Dict[str, List[str]]] = {}
-        for provider in self._DISCOVER_PROVIDERS:
-            provider_models = {
-                model_id.lower()
-                for model_id, records in model_map.items()
-                if provider in records
-            }
-            names = self._whitelists.get(provider) or []
-            hit = [name for name in names if name.lower() in provider_models]
-            miss = [name for name in names if name.lower() not in provider_models]
-            status[provider] = {"hit": hit, "miss": miss}
-        return status
+        known = {model_id.lower() for model_id in model_map}
+        names = self._whitelist
+        return {
+            "hit": [name for name in names if name.lower() in known],
+            "miss": [name for name in names if name.lower() not in known],
+        }
 
     def _import_discovered(self, provider_filter: str = "", api_key: str = "") -> str:
         """把探测结果中的模型批量建成模板。白名单优先，其次智能匹配。"""
@@ -1284,20 +1331,18 @@ class agentconfigprofile(_PluginBase):
         use_whitelist = self._has_whitelist()
         if use_whitelist:
             lower_map = {mid.lower(): mid for mid in model_map}
-            for provider in self._DISCOVER_PROVIDERS:
-                if provider_filter and provider != provider_filter:
+            for name in self._whitelist:
+                model_id = lower_map.get(name.lower())
+                if not model_id:
+                    missed.append(name)
                     continue
-                for name in (self._whitelists.get(provider) or []):
-                    model_id = lower_map.get(name.lower())
-                    if not model_id:
-                        missed.append(f"{self._DISCOVER_PROVIDERS.get(provider, provider)}:{name}")
-                        continue
-                    record = model_map[model_id]
-                    model = record.get(provider)
-                    if not model:
-                        missed.append(f"{self._DISCOVER_PROVIDERS.get(provider, provider)}:{name}")
-                        continue
-                    plan.append((provider, model_id, model))
+                # 同名模型可能在多个协议下都存在，按模型名智能匹配归属协议
+                record = model_map[model_id]
+                provider = self._preferred_provider(model_id, list(record))
+                if not provider:
+                    missed.append(name)
+                    continue
+                plan.append((provider, model_id, record[provider]))
         else:
             smart = self._discover_smart_match and not provider_filter
             for model_id in order:
@@ -1386,8 +1431,7 @@ class agentconfigprofile(_PluginBase):
         """删除探测生成但不在白名单内的模板。"""
         if not self._has_whitelist():
             return "未配置白名单，未做清理"
-        allow = {provider: {name.lower() for name in (self._whitelists.get(provider) or [])}
-                 for provider in self._DISCOVER_PROVIDERS}
+        allow = {name.lower() for name in self._whitelist}
         removed: List[str] = []
         with self._lock:
             profiles = self._load_profiles()
@@ -1397,10 +1441,8 @@ class agentconfigprofile(_PluginBase):
                     kept.append(profile)
                     continue
                 llm = self._profile_llm(profile)
-                provider = str(llm.get("LLM_PROVIDER") or "")
                 model_id = str(llm.get("LLM_MODEL") or "").lower()
-                names = allow.get(provider)
-                if names and model_id in names:
+                if model_id in allow:
                     kept.append(profile)
                     continue
                 removed.append(profile.get("name") or model_id)
@@ -1614,6 +1656,12 @@ class agentconfigprofile(_PluginBase):
         if self._runtime.get("takeover_id") != backup.get("id"):
             self._runtime["takeover_id"] = backup.get("id")
             self._add_log(f"当前配置失效，本次调用由模板 [{backup.get('name')}] 接管")
+            # 事件契约不携带上下文上限等扩展字段，接管期间沿用系统设置的上下文上限
+            current_ctx = self._to_int(getattr(settings, "LLM_MAX_CONTEXT_TOKENS", 0), 0)
+            backup_ctx = self._to_int(llm.get("LLM_MAX_CONTEXT_TOKENS"), 0)
+            if current_ctx and backup_ctx and current_ctx != backup_ctx:
+                self._add_log(f"接管模板上下文上限 {backup_ctx}k 与当前配置 {current_ctx}k 不同，"
+                              f"本次调用沿用当前配置的 {current_ctx}k")
             self._save_runtime()
         logger.info(f"{self.plugin_name}：当前配置失效，用模板 [{backup.get('name')}] 接管本次调用")
 
@@ -1794,6 +1842,10 @@ class agentconfigprofile(_PluginBase):
                  "props": {"type": "info", "variant": "tonal", "class": "mt-2", "density": "compact",
                            "text": "模板的切换、探活、排序、删除、导入都在插件的“数据详情”页一键完成。"
                                    "含凭据的模板会以明文保存 API Key。"}},
+                {"component": "VAlert",
+                 "props": {"type": "warning", "variant": "tonal", "class": "mt-2", "density": "compact",
+                           "text": "关闭「模板包含 API Key」后模板只保存供应商、模型与地址，切换与探活会沿用当前系统密钥："
+                                   "仅适合同一密钥覆盖多模型的聚合端点；跨供应商的自动切换将因密钥不匹配而无法工作。"}},
             ],
         }
 
@@ -1830,35 +1882,26 @@ class agentconfigprofile(_PluginBase):
                     field("discover_api_key", "API Key", 6, type="password", placeholder="sk-..."),
                 ),
                 {"component": "VDivider", "props": {"class": "my-3"}},
-                caption("模型白名单（留空表示该协议不限制；填写后只导入名单内的模型，逗号或换行分隔）"),
+                caption("模型白名单（逗号或换行分隔；填写后只导入名单内的模型，协议按模型名自动匹配）"),
                 row(
-                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                    {"component": "VCol", "props": {"cols": 12, "md": 7},
                      "content": [{"component": "VTextarea",
-                                  "props": {"model": "whitelist_anthropic", "label": "Anthropic 白名单",
+                                  "props": {"model": "whitelist", "label": "模型白名单",
                                             "rows": 3, "auto-grow": True,
-                                            "placeholder": "claude-opus-5, claude-opus-4-8"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4},
-                     "content": [{"component": "VTextarea",
-                                  "props": {"model": "whitelist_openai", "label": "OpenAI 兼容白名单",
-                                            "rows": 3, "auto-grow": True,
-                                            "placeholder": "gpt-5.6-luna, gpt-5.6-sol"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4},
-                     "content": [{"component": "VTextarea",
-                                  "props": {"model": "whitelist_deepseek", "label": "DeepSeek 白名单",
-                                            "rows": 3, "auto-grow": True,
-                                            "placeholder": "deepseek-v4-pro, deepseek-v4-flash"}}]},
+                                            "placeholder": "claude-opus-5, gpt-5.6-luna, deepseek-v4-pro"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 5},
+                     "content": [{"component": "VSelect", "props": {
+                         "model": "discover_providers", "label": "LLM 提供商（探测协议）",
+                         "multiple": True, "chips": True,
+                         "items": [{"title": label, "value": pid}
+                                   for pid, label in self._DISCOVER_PROVIDERS.items()]}}]},
                 ),
                 {"component": "VDivider", "props": {"class": "my-3"}},
                 caption("探测与导入参数"),
                 row(
-                    {"component": "VCol", "props": {"cols": 12, "md": 6},
-                     "content": [{"component": "VSelect", "props": {
-                         "model": "discover_providers", "label": "探测协议", "multiple": True, "chips": True,
-                         "items": [{"title": label, "value": pid}
-                                   for pid, label in self._DISCOVER_PROVIDERS.items()]}}]},
-                    field("discover_filter", "模型名过滤（正则，白名单为空时生效）", 3,
+                    field("discover_filter", "模型名过滤（正则，白名单为空时生效）", 6,
                           placeholder="claude|gpt|deepseek"),
-                    field("discover_limit", "每协议导入上限（0=不限）", 3, type="number", placeholder="20"),
+                    field("discover_limit", "每协议导入上限（0=不限）", 6, type="number", placeholder="20"),
                 ),
                 row(
                     switch("discover_auto_import", "探测后自动导入模板", 6),
@@ -1866,9 +1909,9 @@ class agentconfigprofile(_PluginBase):
                 ),
                 {"component": "VAlert",
                  "props": {"type": "info", "variant": "tonal", "class": "mt-2", "density": "compact",
-                           "text": "探测分别用 OpenAI 兼容、Anthropic、DeepSeek 协议请求该端点的模型目录。"
-                                   "填了白名单就严格按名单建模板（协议归属由名单决定，不受上限限制）；"
-                                   "名单全空时才按正则过滤、智能匹配和每协议上限自动挑选。"
+                           "text": "按上方选中的 LLM 提供商（探测协议）请求该端点的模型目录。"
+                                   "填了白名单就严格按名单建模板（同名模型按名称智能匹配归属协议，不受上限限制）；"
+                                   "名单为空时才按正则过滤、智能匹配和每协议上限自动挑选。"
                                    "模板名格式为 模型 · 协议 · 站点。"}},
             ],
         }
@@ -1886,16 +1929,37 @@ class agentconfigprofile(_PluginBase):
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VSelect", "props": {
                          "model": "g_thinking_level", "label": "思考模式",
-                         "items": [{"title": title, "value": value} for value, title in (
-                             ("off", "关闭"), ("auto", "自动"), ("minimal", "最低"), ("low", "低"),
-                             ("medium", "中"), ("high", "高"), ("xhigh", "极高"), ("max", "最大"),
-                         )]}}]},
+                         "items": [{"title": title, "value": value}
+                                   for value, title in self._THINKING_LEVEL_OPTIONS]}}]},
                     switch("g_use_proxy", "使用系统代理", 4),
                     switch("g_image_input", "模型支持图片输入", 4),
                 ),
                 row(
                     switch("g_audio_input", "支持音频输入", 4),
                     switch("g_audio_output", "支持音频输出", 4),
+                ),
+                {"component": "VDivider", "props": {"class": "my-3"}},
+                caption("接口与调度参数"),
+                row(
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VSelect", "props": {
+                         "model": "g_api_protocol", "label": "API 协议",
+                         "items": [{"title": title, "value": value}
+                                   for value, title in self._API_PROTOCOL_OPTIONS]}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VSelect", "props": {
+                         "model": "g_web_search_mode", "label": "联网搜索",
+                         "items": [{"title": title, "value": value}
+                                   for value, title in self._WEB_SEARCH_MODE_OPTIONS]}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VSelect", "props": {
+                         "model": "g_job_interval", "label": "定时唤醒",
+                         "items": [{"title": "不启用", "value": 0}] + [
+                             {"title": f"{hours} 小时", "value": hours}
+                             for hours in self._JOB_INTERVAL_OPTIONS]}}]},
+                ),
+                row(
+                    field("g_user_agent", "User-Agent（留空使用 SDK 默认）", 12),
                 ),
                 {"component": "VDivider", "props": {"class": "my-3"}},
                 caption("智能助手功能开关（只写入系统设置，与模板无关）"),
@@ -1905,9 +1969,9 @@ class agentconfigprofile(_PluginBase):
                 ),
                 {"component": "VAlert",
                  "props": {"type": "info", "variant": "tonal", "class": "mt-2", "density": "compact",
-                           "text": "打开总开关并保存后立即生效：思考模式、系统代理、图片/音频支持会覆盖到所有已保存模板"
-                                   "与后续新建模板，切换模板时也会用这里的值，不会被旧模板快照覆盖回去；"
-                                   "整理失败智能接管与搜索智能推荐只写入系统设置。"
+                           "text": "打开总开关并保存后立即生效：思考模式、系统代理、API 协议、联网搜索、User-Agent、"
+                                   "图片/音频支持会覆盖到所有已保存模板与后续新建模板，切换模板时也会用这里的值，"
+                                   "不会被旧模板快照覆盖回去；定时唤醒、整理失败智能接管与搜索智能推荐只写入系统设置。"
                                    "也可以在“数据详情”页点“应用全局参数”手动执行一次。"}},
             ],
         }
@@ -1954,12 +2018,14 @@ class agentconfigprofile(_PluginBase):
             "discover_limit": 20,
             "discover_auto_import": True,
             "discover_smart_match": True,
-            "whitelist_anthropic": "",
-            "whitelist_openai": "",
-            "whitelist_deepseek": "",
+            "whitelist": "",
             "apply_global": False,
             "g_thinking_level": "off",
             "g_use_proxy": True,
+            "g_api_protocol": "auto",
+            "g_web_search_mode": "local",
+            "g_user_agent": "",
+            "g_job_interval": 0,
             "g_image_input": True,
             "g_audio_input": False,
             "g_audio_output": False,
@@ -1975,17 +2041,20 @@ class agentconfigprofile(_PluginBase):
     # ------------------------------------------------------------------
 
     def _api_btn(self, text: str, path: str, params: Dict[str, Any], color: str = "primary",
-                 variant: str = "text", size: str = "x-small") -> dict:
+                 variant: str = "text", size: str = "x-small", title: str = "") -> dict:
         """构造一个直接调用插件 API 的按钮。"""
         query = dict(params or {})
         query["apikey"] = settings.API_TOKEN
         # 前端渲染器对 POST 会把 params 放进请求体，verify_apikey 只读 query/header，
         # 会导致鉴权失败跳转登录页；统一用 GET，apikey 保持在 query 中。
         method = "get"
+        props = {"color": color, "variant": variant, "size": size, "class": "px-2",
+                 "style": "text-transform: none; letter-spacing: 0;"}
+        if title:
+            props["title"] = title
         return {
             "component": "VBtn",
-            "props": {"color": color, "variant": variant, "size": size, "class": "px-2",
-                      "style": "text-transform: none; letter-spacing: 0;"},
+            "props": props,
             "text": text,
             "events": {"click": {"api": f"plugin/{self.__class__.__name__}/{path}",
                                  "method": method, "params": query}},
@@ -2021,6 +2090,24 @@ class agentconfigprofile(_PluginBase):
                            "props": {"size": "small", "variant": "tonal",
                                      "color": "primary" if use_whitelist else "secondary", "class": "me-2"},
                            "text": "白名单模式" if use_whitelist else "自动挑选模式"})
+        if use_whitelist:
+            wl = self.whitelist_status(discovery or {})
+            wl_hit = wl.get("hit") or []
+            wl_miss = wl.get("miss") or []
+            if wl_hit or wl_miss:
+                head_chips.append({"component": "VChip",
+                                   "props": {"size": "small", "color": "primary", "variant": "tonal",
+                                             "class": "me-2"},
+                                   "text": f"白名单命中 {len(wl_hit)}/{len(wl_hit) + len(wl_miss)}"})
+            for name in wl_miss[:4]:
+                head_chips.append({"component": "VChip",
+                                   "props": {"size": "small", "color": "warning", "variant": "outlined",
+                                             "class": "me-2"},
+                                   "text": f"未探测到 {name}"})
+            if len(wl_miss) > 4:
+                head_chips.append({"component": "VChip",
+                                   "props": {"size": "small", "variant": "tonal", "class": "me-2"},
+                                   "text": f"…另有 {len(wl_miss) - 4} 个未探测到"})
         if (discovery or {}).get("import_message"):
             head_chips.append({"component": "VChip",
                                "props": {"size": "small", "color": "primary", "variant": "tonal", "class": "me-2"},
@@ -2033,13 +2120,12 @@ class agentconfigprofile(_PluginBase):
                                    "text": "还没有探测结果。配置页「模型探测」标签里填好地址与密钥（留空则用当前生效的），"
                                            "再点这里的“重新探测”即可。"}})
         else:
-            whitelist_status = self.whitelist_status(discovery) if use_whitelist else {}
             for provider, label in self._DISCOVER_PROVIDERS.items():
                 info = providers.get(provider)
                 if not info:
                     continue
                 ok = bool(info.get("ok"))
-                names = [n.lower() for n in (self._whitelists.get(provider) or [])]
+                names = [n.lower() for n in self._whitelist]
 
                 head_row = [
                     {"component": "VChip",
@@ -2049,19 +2135,6 @@ class agentconfigprofile(_PluginBase):
                     {"component": "span", "props": {"class": "text-caption text-medium-emphasis me-2"},
                      "text": str(info.get("message") or "")[:70]},
                 ]
-                if use_whitelist:
-                    hit = (whitelist_status.get(provider) or {}).get("hit") or []
-                    miss = (whitelist_status.get(provider) or {}).get("miss") or []
-                    if hit or miss:
-                        head_row.append({"component": "VChip",
-                                         "props": {"size": "x-small", "color": "primary", "variant": "tonal",
-                                                   "class": "me-2"},
-                                         "text": f"白名单命中 {len(hit)}/{len(hit) + len(miss)}"})
-                    for name in miss:
-                        head_row.append({"component": "VChip",
-                                         "props": {"size": "x-small", "color": "warning", "variant": "outlined",
-                                                   "class": "me-1"},
-                                         "text": f"未探测到 {name}"})
                 if ok:
                     head_row.append(self._api_btn("导入该协议", "import_discovered", {"provider": provider},
                                                   color="primary", variant="tonal"))
@@ -2358,7 +2431,8 @@ class agentconfigprofile(_PluginBase):
                 self._api_btn("探活", "probe", {"pid": profile.get("id")}, color="info", variant="tonal"),
                 self._api_btn("↑", "move", {"pid": profile.get("id"), "dir": "up"}, color="default"),
                 self._api_btn("↓", "move", {"pid": profile.get("id"), "dir": "down"}, color="default"),
-                self._api_btn("覆盖", "save_current", {"name": profile.get("name")}, color="warning"),
+                self._api_btn("更新", "save_current", {"name": profile.get("name")}, color="warning",
+                              title="用当前系统配置覆盖该模板快照（与「应用」方向相反：应用=模板→系统，更新=系统→模板）"),
                 self._api_btn("删除", "delete", {"pid": profile.get("id")}, color="error"),
             ]
 
@@ -2526,7 +2600,9 @@ class agentconfigprofile(_PluginBase):
         current = self._current_llm_config()
 
         col = {"cols": 12, "md": 6}
-        global_config = {"refresh": 5, "border": True,
+        # 忙时 5 秒刷新跟踪进度；空闲时降到 30 秒，减少无谓轮询
+        busy = (probe.get("status") == "running" or discovery.get("status") == "running")
+        global_config = {"refresh": 5 if busy else 30, "border": True,
                          "title": self.plugin_name, "subtitle": "探测与探活进度"}
 
         items: List[dict] = [
