@@ -47,7 +47,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理＆RSS过滤"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "5.4.4"
+    plugin_version = "5.4.5"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -95,8 +95,19 @@ class SpaceCleaner(_PluginBase):
     _rename_on = False  # 启用种子自动重命名
     _rename_cron = ""  # 执行周期（cron 表达式）
     _rename_downloader = []  # 扫描的下载器（仅 qBittorrent 支持改显示名，留空扫描全部）
-    _rename_format = ("{{ title }}{% if year %} ({{ year }}){% endif %}"
-                      "{% if season_episode %} - {{season_episode}}{% endif %}")
+    # 通用重命名模板：参考主程序默认命名格式，按 season_episode 自动分支——
+    # 有季集走电视剧版（头部空格分隔），无季集走电影版（全程点号分隔），尾部两版共用。
+    _rename_format = ("{{ title }}{% if season_episode %} {{ season_episode }}"
+                      "{% if videoFormat %} {{ videoFormat }}{% endif %}"
+                      "{% else %}{% if en_title %}.{{ en_title }}{% endif %}"
+                      "{% if year %}.{{ year }}{% endif %}{% if part %}.{{ part }}{% endif %}"
+                      "{% if videoFormat %}.{{ videoFormat }}{% endif %}{% endif %}"
+                      "{% if webSource %}.{{ webSource }}{% endif %}"
+                      "{% if edition %}.{{ edition }}{% endif %}"
+                      "{% if videoCodec %}.{{ videoCodec }}{% endif %}"
+                      "{% if audioCodec %}.{{ audioCodec }}{% endif %}"
+                      "{% if customization %}.{{ customization }}{% endif %}"
+                      "{% if releaseGroup %}-{{ releaseGroup }}{% endif %}{{ fileExt }}")
     _rename_once = False  # 立即运行一次
     _rss_rename_listen = False  # 监听RSS下载：BT动漫RSS下载/洗版板块添加种子到下载器时自动触发重命名
     _rename_listen_native = False  # 监听本地下载：MoviePilot 搜索/订阅等添加下载时自动触发重命名（识别不写入独立缓存）
@@ -196,8 +207,17 @@ class SpaceCleaner(_PluginBase):
         self._rename_skip_tagged = True
         self._rename_cron = ""
         self._rename_downloader = []
-        self._rename_format = ("{{ title }}{% if year %} ({{ year }}){% endif %}"
-                               "{% if season_episode %} - {{season_episode}}{% endif %}")
+        self._rename_format = ("{{ title }}{% if season_episode %} {{ season_episode }}"
+                               "{% if videoFormat %} {{ videoFormat }}{% endif %}"
+                               "{% else %}{% if en_title %}.{{ en_title }}{% endif %}"
+                               "{% if year %}.{{ year }}{% endif %}{% if part %}.{{ part }}{% endif %}"
+                               "{% if videoFormat %}.{{ videoFormat }}{% endif %}{% endif %}"
+                               "{% if webSource %}.{{ webSource }}{% endif %}"
+                               "{% if edition %}.{{ edition }}{% endif %}"
+                               "{% if videoCodec %}.{{ videoCodec }}{% endif %}"
+                               "{% if audioCodec %}.{{ audioCodec }}{% endif %}"
+                               "{% if customization %}.{{ customization }}{% endif %}"
+                               "{% if releaseGroup %}-{{ releaseGroup }}{% endif %}{{ fileExt }}")
         self._rename_tag = "SC-renamed"
         self._pb = self._latest_episode_records(list(self.get_data("pb") or []))
         self.save_data("pb", self._pb)
@@ -986,7 +1006,7 @@ class SpaceCleaner(_PluginBase):
                 {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
                         {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mb-0"},
-                         "content": [{"component": "div", "props": {"class": "text-caption"}, "text": "识别时优先使用插件识别缓存（识别成功正缓存 → 本地识别缓存 → TMDB API），仅修改下载器中种子的显示名称，不会改动磁盘文件与保存路径（当前仅支持 qBittorrent；Transmission 因改名会重命名磁盘文件，暂不处理）。模板变量与主程序整理完全一致（复用主程序命名字典）：title、name、en_name、original_title、year、title_year、season（数字）、season_fmt（S01）、episode（数字）、season_episode（S01E01）、part、customization、edition、videoFormat（分辨率）、resourceType、effect、releaseGroup、videoCodec、audioCodec。识别失败的种子保持原名不变。"}]}
+                         "content": [{"component": "div", "props": {"class": "text-caption"}, "text": "识别时优先使用插件识别缓存（识别成功正缓存 → 本地识别缓存 → TMDB API），仅修改下载器中种子的显示名称，不会改动磁盘文件与保存路径（当前仅支持 qBittorrent；Transmission 因改名会重命名磁盘文件，暂不处理）。模板变量与主程序整理完全一致（复用主程序命名字典）：title、name、en_name、original_title、year、title_year、season（数字）、season_fmt（S01）、episode（数字）、season_episode（S01E01）、part、customization、edition、videoFormat（分辨率）、resourceType、effect、releaseGroup（制作组）、videoCodec、audioCodec、webSource（网络来源）、en_title（英文标题）、fileExt（扩展名，显示名场景为空）。识别失败的种子保持原名不变。"}]}
                     ]},
                 ]},
             ],
@@ -1025,8 +1045,17 @@ class SpaceCleaner(_PluginBase):
             "rss_fname_identify": False, "rss_ai_identify": False, "rss_ai_add_words": True, "rss_ai_max": 5,
             "rss_proxy_retry": True, "rss_save_path": "",
             "rename_on": False, "rename_cron": "0 */12 * * *", "rename_downloader": [],
-            "rename_format": ("{{ title }}{% if year %} ({{ year }}){% endif %}"
-                              "{% if season_episode %} - {{season_episode}}{% endif %}"),
+            "rename_format": ("{{ title }}{% if season_episode %} {{ season_episode }}"
+                              "{% if videoFormat %} {{ videoFormat }}{% endif %}"
+                              "{% else %}{% if en_title %}.{{ en_title }}{% endif %}"
+                              "{% if year %}.{{ year }}{% endif %}{% if part %}.{{ part }}{% endif %}"
+                              "{% if videoFormat %}.{{ videoFormat }}{% endif %}{% endif %}"
+                              "{% if webSource %}.{{ webSource }}{% endif %}"
+                              "{% if edition %}.{{ edition }}{% endif %}"
+                              "{% if videoCodec %}.{{ videoCodec }}{% endif %}"
+                              "{% if audioCodec %}.{{ audioCodec }}{% endif %}"
+                              "{% if customization %}.{{ customization }}{% endif %}"
+                              "{% if releaseGroup %}-{{ releaseGroup }}{% endif %}{{ fileExt }}"),
             "rename_once": False, "rss_rename_listen": False,
             "rename_listen_native": False,
             "rename_skip_tagged": True, "rename_tag": "SC-renamed",
@@ -5072,6 +5101,7 @@ class SpaceCleaner(_PluginBase):
             "name": title,
             "title": title,
             "en_name": (getattr(media, "en_title", "") or getattr(meta, "en_name", "") or "").strip(),
+            "en_title": (getattr(media, "en_title", "") or getattr(meta, "en_name", "") or "").strip(),
             "original_title": (getattr(media, "original_title", "") or "").strip(),
             "year": year,
             "title_year": title_year,
@@ -5089,6 +5119,7 @@ class SpaceCleaner(_PluginBase):
             "releaseGroup": getattr(meta, "resource_team", "") or "",
             "videoCodec": getattr(meta, "video_encode", "") or "",
             "audioCodec": getattr(meta, "audio_encode", "") or "",
+            "webSource": getattr(meta, "web_source", "") or "",
             "fileExt": "",
         }
 
