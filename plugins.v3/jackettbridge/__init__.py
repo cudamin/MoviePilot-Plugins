@@ -82,7 +82,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.8"
+    plugin_version = "1.3.9"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -1613,17 +1613,6 @@ class JackettBridge(_PluginBase):
                                     "请尝试将网络地址改为 MoviePilot 所在网段的地址，如：http://172.18.0.1:9117。"
                         }
                     },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "tonal",
-                            "density": "compact",
-                            "class": "mb-2",
-                            "text": "搜索时选中的站点范围与宿主一致：显式选中 → 系统「搜索站点」设置 → 不限；"
-                                    "插件会从宿主搜索调用栈取回选中项，只检索选中范围内的桥接索引器。"
-                        }
-                    },
                     {"component": "VDivider", "props": {"class": "my-3"}},
                     {
                         "component": "div",
@@ -1741,26 +1730,6 @@ class JackettBridge(_PluginBase):
                                         "chips": True,
                                         "clearable": True,
                                         "items": indexer_items
-                                    }
-                                }]
-                            }
-                        ]
-                    },
-                    {
-                        "component": "VRow",
-                        "props": {"dense": True},
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [{
-                                    "component": "VAlert",
-                                    "props": {
-                                        "type": "info",
-                                        "variant": "tonal",
-                                        "density": "compact",
-                                        "text": "同步后每个 Jackett 索引器会生成一个虚拟站点（jackett-xxx.extend），"
-                                                "检索走 Torznab 接口。索引器列表需要管理密码时请填写，否则接口会返回 401。"
                                     }
                                 }]
                             }
