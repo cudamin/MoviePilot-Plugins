@@ -1,7 +1,7 @@
 """
 SpaceCleaner: 空间清理 + 智能RSS下载，共用播放进度缓存。
 """
-import asyncio, json, os, re, time, threading, shutil
+import asyncio, json, os, re, time, threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,7 +47,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理＆RSS过滤"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词。"
     plugin_icon = "delete.png"
-    plugin_version = "5.4.5"
+    plugin_version = "5.4.10"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -127,6 +127,8 @@ class SpaceCleaner(_PluginBase):
     _all_torrents_cache = None
     _all_torrents_cache_time = 0
     _torrents_cache_ttl = 120
+    _scan_incomplete = False  # 本次种子扫描是否不完整（有选中下载器未连接/取种失败）
+    _no_path_warned: set = set()  # 已提示过「整理记录缺路径」的资源，避免每轮刷日志
     _pb_cache = None
     _pb_cache_time = 0
     _pb_cache_ttl = 30
@@ -147,6 +149,8 @@ class SpaceCleaner(_PluginBase):
     _rss_washed_max = 3000
     _rss_skipped_max = 2000
     _rss_skip_notified: Dict[str, None] = {}  # 本轮已通知过跳过/失败的键，仅单轮 RSS 内有效
+    _rss_failed_enc: Dict[str, float] = {}  # 推送失败的候选 enclosure -> 失败时间戳（进程内冷却）
+    _rss_failed_cooldown = 6 * 3600  # 候选推送失败后的冷却秒数，避免每轮重复下载失效种子
     _rss_lk = threading.Lock()
     _api_recognize_cache: List[dict] = []  # TMDB API 识别失败后的独立负缓存
     _api_recognize_cache_max = 5
@@ -226,6 +230,9 @@ class SpaceCleaner(_PluginBase):
         self._rss_seen = {}
         self._rss_washed = {}
         self._rss_skipped = {}
+        self._rss_failed_enc = {}
+        self._scan_incomplete = False
+        self._no_path_warned = set()
         self._api_recognize_cache = self._load_api_recognize_cache()
         self._api_recognize_success_cache = self._load_api_recognize_success_cache()
         self._stop_rss_scheduler()
@@ -275,6 +282,15 @@ class SpaceCleaner(_PluginBase):
         self._rss_exc = str(config.get("rss_exc") or "")
         self._rss_once = bool(config.get("rss_once"))
         self._rss_ntf = bool(config.get("rss_ntf", True))
+        # 非法正则会中断整轮 RSS：保存时就拦下并禁用该条规则，同时明确告知用户
+        for field, label in (("_rss_inc", "包含"), ("_rss_exc", "排除")):
+            pattern = getattr(self, field)
+            if pattern and not self._rss_regex_valid(pattern):
+                logger.error(f"SC-RSS {label}（正则）表达式无效，已忽略该过滤规则: {pattern}")
+                if self._rss_ntf:
+                    self.post_message(title="SC-RSS 正则无效",
+                                      text=f"{label}（正则）表达式无法编译，已忽略：{pattern}")
+                setattr(self, field, "")
         self._rss_th = self._to_int(config.get("rss_th"), 85, 1, 100)
         self._rss_ep_jump = self._to_int(config.get("rss_ep_jump"), 11, 2, 999)
         self._rss_seen = dict.fromkeys(self.get_data("rss_seen") or [])
@@ -420,21 +436,10 @@ class SpaceCleaner(_PluginBase):
             m = re.search(r'tmdbid[=_](\d+)', ev.item_path)
             if m:
                 tid = m.group(1)
-        # 如果还没有 tmdb_id，尝试从已有缓存中按 (season, episode) 反查
-        if not tid and ev.season_id and ev.episode_id:
-            try:
-                ssn = int(ev.season_id)
-                een = int(ev.episode_id)
-                with self._pb_lock:
-                    for r in self._pb:
-                        if r.get("s") == ssn and r.get("e") == een:
-                            km = re.match(r'(\d+):', r.get("k", ""))
-                            if km:
-                                tid = km.group(1)
-                                break
-            except (ValueError, TypeError):
-                pass
+        # 季集号并非媒体身份：不同剧的 S01E01 不能互相更新观看进度。
+        # Webhook 没有可靠 TMDB 身份时宁可跳过，绝不从其他剧的播放缓存推断。
         if not tid:
+            logger.warning(f"SC webhook 缺少 TMDB 身份，跳过播放缓存更新: {ev.item_name}")
             return
         try:
             tmdb = int(tid)
@@ -1805,7 +1810,11 @@ class SpaceCleaner(_PluginBase):
 
         任一选中下载器取种失败或类型不支持时返回 None，由调用方整体回退到
         统一接口：只拿到部分下载器的数据会让辅种漏检、并误报「不在扫描范围」。
+
+        选中下载器未连接时仍继续读取其余下载器，但会把 _scan_incomplete 置位：
+        此时无法排除未扫描端持有同一份数据，调用方据此跳过本轮自动删除。
         """
+        self._scan_incomplete = False
         try:
             services = DownloaderHelper().get_services(name_filters=self._clean_downloader or None)
         except Exception as e:
@@ -1820,7 +1829,9 @@ class SpaceCleaner(_PluginBase):
                 return None
             try:
                 if instance.is_inactive():
-                    logger.warning(f"SC 下载器 {name} 未连接，跳过扫描")
+                    # 该下载器本次扫不到：索引不完整，跨下载器重复 hash 无法判定
+                    self._scan_incomplete = True
+                    logger.warning(f"SC 下载器 {name} 未连接，跳过扫描并标记本轮扫描不完整")
                     continue
             except Exception:
                 pass
@@ -1831,6 +1842,9 @@ class SpaceCleaner(_PluginBase):
             try:
                 torrents, err = instance.get_torrents()
             except Exception as e:
+                # 原生接口失败：回退统一接口再取一次，由 _get_cached_torrents 判断
+                # 回退是否也失败，失败时才标记扫描不完整（避免原生接口长期报错
+                # 而统一接口可用时把清理永久禁用）。
                 logger.warning(f"SC 下载器 {name} 原生取种失败，回退统一接口: {str(e)}")
                 return None
             if err:
@@ -1873,11 +1887,23 @@ class SpaceCleaner(_PluginBase):
         all_t: Optional[List[Any]] = self._list_raw_torrents()
         source = "下载器原生接口"
         if all_t is None:
-            # 回退路径：统一接口会对每个种子做一次 MetaInfo 名称识别，CPU 开销明显
+            # 回退路径：统一接口会对每个种子做一次 MetaInfo 名称识别，CPU 开销明显。
+            # 回退本身也失败时索引同样不完整，此时才置位 _scan_incomplete；
+            # 原生接口失败但统一接口可用属于可正常扫描的情况，不应禁用清理。
             source = "MoviePilot 统一接口"
             all_t = []
             for dl in (self._clean_downloader or [None]):
-                all_t.extend(chain.list_torrents(downloader=dl or None, include_all_tags=True) or [])
+                try:
+                    part = chain.list_torrents(downloader=dl or None, include_all_tags=True)
+                except Exception as e:
+                    self._scan_incomplete = True
+                    logger.warning(f"SC 统一接口取种失败（{dl or '默认下载器'}）: {e}")
+                    continue
+                if part is None:
+                    self._scan_incomplete = True
+                    logger.warning(f"SC 统一接口取种返回空（{dl or '默认下载器'}），标记扫描不完整")
+                    continue
+                all_t.extend(part)
         logger.info(f"SC 已获取下载器种子 {len(all_t)} 个（{source}，耗时 {time.time() - start:.1f}s）")
         self._all_torrents_cache = all_t
         self._all_torrents_cache_time = now
@@ -2041,6 +2067,15 @@ class SpaceCleaner(_PluginBase):
         # 是 CPU 密集操作，每个删除单元重复全量拉取会造成明显的 CPU 峰值。
         # 删种后由 _delete_downloader_torrents 从索引与缓存中剔除已删 hash，保持数据新鲜。
         torrent_index = self._build_torrent_index(self._get_cached_torrents(chain))
+        if self._scan_incomplete:
+            # 有选中下载器未扫到：无法排除未扫描端持有同一份数据，删种删文件会留下
+            # 指向已删文件的残留任务。此时整体跳过本轮删除，避免不可逆的误删。
+            logger.error("SC 存在未连接的扫描下载器，种子列表不完整，为避免误删跳过本轮清理")
+            if self._notify:
+                self.post_message(title="空间清理器 - 已跳过清理",
+                                  text="有「扫描下载器」中的下载器未连接，无法确认种子归属，"
+                                       "为避免误删已跳过本轮清理，请检查下载器连接后重试。")
+            return
         for unit in delete_units:
             if md and dc >= md:
                 fr = "limit"
@@ -2058,9 +2093,10 @@ class SpaceCleaner(_PluginBase):
                     fr = "space_ok"
                     break
             # 完整删除一个资源（种子+文件+记录），删除完成后立即使空间缓存失效，
-            # 下一次循环重新查询真实剩余空间，达标即停，否则继续删除下一个
-            self._delete_unit(unit, chain, cs or space_info, torrent_index)
-            dc += 1
+            # 下一次循环重新查询真实剩余空间，达标即停，否则继续删除下一个。
+            # 被跳过的单元（如种子跨多台下载器）不计入单次删除数量。
+            if self._delete_unit(unit, chain, cs or space_info, torrent_index):
+                dc += 1
             self._cached_space_info = None
             # 单元之间稍作停顿，把删种/删文件/清目录带来的瞬时占用摊平
             if not self._dry_run and self._unit_delete_interval > 0:
@@ -2332,31 +2368,47 @@ class SpaceCleaner(_PluginBase):
                 all_records.extend(recs)
             all_records.extend(no_hash_records)
 
-            # 电视剧：按 tmdbid+season 归并（跨种子/跨版本），整季作为一个删除单元
+            # 关闭「删除不同版本」时，删除单元必须按版本（download_hash）拆分：
+            # 每个版本只依据自己的季集判断是否已看完，未看完的版本不会被同一媒体
+            # 的其他版本带走。开启时维持按 tmdbid 归并，一次删掉该媒体的全部版本。
+            split_by_version = not self._delete_other_versions
+
+            def _version_key(record) -> str:
+                """版本标识：优先 download_hash，无 hash 时退化为记录自身 id。"""
+                return str(record.download_hash or f"id{record.id}")
+
+            # 电视剧：按 tmdbid+season（+版本）归并，整季作为一个删除单元
             tv_season_groups: Dict[str, List[TransferHistory]] = {}
-            # 电影：按 tmdbid 归并（跨种子/跨版本），同一部电影的所有版本只生成一个删除单元
-            movie_tmdb_groups: Dict[int, List[TransferHistory]] = {}
+            # 电影：按 tmdbid（+版本）归并，同一部电影的所有版本只生成一个删除单元
+            movie_tmdb_groups: Dict[str, List[TransferHistory]] = {}
             for r in all_records:
                 tid = self._tmdbid_of(r)
                 if not tid:
                     continue
+                ver = f":{_version_key(r)}" if split_by_version else ""
                 if (r.type or "") == "电视剧":
                     season = self._norm_season(r.seasons or "")
                     if season is None:
                         continue  # 无法判定季，跳过
-                    key = f"{tid}:S{season:02d}"
+                    key = f"{tid}:S{season:02d}{ver}"
                     tv_season_groups.setdefault(key, []).append(r)
                 else:
-                    movie_tmdb_groups.setdefault(tid, []).append(r)
+                    movie_tmdb_groups.setdefault(f"{tid}{ver}", []).append(r)
 
             # 电视剧：同一 TMDB 存在多个季度时，升级为整剧删除单元。
             # 规则：必须等待整理记录中最后一季的最后一集播放完成后，才删除所有季度；
             # 若最后一季最后一集未看完，则跳过该剧所有季度，让其他已看资源优先删除。
-            tv_show_groups: Dict[int, List[TransferHistory]] = {}
+            tv_show_groups: Dict[str, List[TransferHistory]] = {}
             for recs in tv_season_groups.values():
-                tid = self._tmdbid_of(recs[0]) if recs else None
-                if tid:
-                    tv_show_groups.setdefault(tid, []).extend(recs)
+                if not recs:
+                    continue
+                tid = self._tmdbid_of(recs[0])
+                if not tid:
+                    continue
+                # 与季分组保持一致：关闭「删除不同版本」时按版本分别升级为整剧单元，
+                # 避免把同剧不同版本重新合并回一个删除单元。
+                ver = f":{_version_key(recs[0])}" if split_by_version else ""
+                tv_show_groups.setdefault(f"{tid}{ver}", []).extend(recs)
 
             def _unit_earliest_show_mark_time(tmdbid, seasons):
                 """取整剧全部季在播放缓存中最早的标记时间（排序用）。
@@ -2429,11 +2481,14 @@ class SpaceCleaner(_PluginBase):
             sess.close()
         return delete_units
 
-    def _delete_unit(self, unit, chain, space_info, torrent_index=None):
-        """删除一个删除单元（合集的所有集一起删除）。
+    def _delete_unit(self, unit, chain, space_info, torrent_index=None) -> bool:
+        """删除一个删除单元（合集的所有集一起删除），返回是否实际执行了删除。
 
         使用预先快照的记录字典，避免跨 Session 访问 ORM 懒加载属性。
         torrent_index 为调用方预建的种子索引（见 _build_torrent_index），一轮清理复用同一份。
+
+        返回 False 表示该单元本轮被跳过（未做任何删除，如种子同时存在于多台下载器），
+        调用方不应把它计入单次删除数量。
         """
         records = unit["records"]
         display_name = unit["display"]
@@ -2471,7 +2526,7 @@ class SpaceCleaner(_PluginBase):
                 + (f"（含辅种 {cross_cnt} 个）" if cross_cnt else "")
             )
             # 试运行只是预演，不写入删除记录（删除记录只保留真实删除与失败结果）
-            return
+            return True
         try:
             unit_type = "电视剧整季" if is_tv else "电影"
             logger.info(f"SC 开始删除 [{unit_type}] {display_name}："
@@ -2483,53 +2538,24 @@ class SpaceCleaner(_PluginBase):
             main_hashes = self._collect_record_torrent_hashes(all_recs, torrent_index)
             if not main_hashes and download_hash:
                 main_hashes = [download_hash]
+            # 同一 infohash 同时存在于多台下载器时，只删一台会留下另一台继续占用文件，
+            # 而文件与整理记录却已被删除。此时整体跳过该单元，不消耗本轮删除额度。
+            ambiguous = set((torrent_index or {}).get("ambiguous") or ())
+            blocked = sorted(h for h in main_hashes if h in ambiguous)
+            if blocked:
+                logger.error(f"SC 跳过 [{display_name}]：种子 {', '.join(blocked)} "
+                             f"同时存在于多台下载器，需先在下载器侧清理其中一台")
+                self._add_delete_history(display_name, "跳过：种子同时存在于多台下载器")
+                return False
             # 记录归属下载器：主种子若落在扫描下载器范围外，仍按当初下载它的
             # 下载器定向删除，避免退回默认下载器时 qb 对不存在的 hash 假成功
             rec_owners = {rec.get("download_hash", ""): rec.get("downloader", "")
                           for rec in all_recs if rec.get("download_hash")}
-            for dh in main_hashes:
-                deleted_count = self._delete_downloader_torrents(
-                    chain, dh, display_name, torrent_index, rec_owners.get(dh, "")
-                )
-                if deleted_count < 0:
-                    raise RuntimeError(f"种子删除失败，已中止文件和整理记录清理: {dh}")
-                torrents_deleted += deleted_count
-            if not main_hashes:
-                logger.info(f"SC [{display_name}] 无关联种子（可能为无 hash 记录），跳过删种")
-            # 2) 删种后删除源文件、媒体库文件及残留空目录
-            #    复用 StorageChain.delete_media_file（含配置目录保护，不会误删下载/媒体库根目录）
-            storage_chain = StorageChain()
-            cleanup_dirs: set = set()  # 收集所有被处理文件所在的父目录路径
-            for rec in all_recs:
-                # 删除下载源文件（有种子的已随删种删除，此处兜底处理无 hash 记录）
-                src_fileitem = rec.get("src_fileitem", {})
-                if src_fileitem:
-                    fi = schemas.FileItem(**src_fileitem)
-                    storage_chain.delete_media_file(fi)
-                else:
-                    # 无 fileitem 时兜底删除 src 路径
-                    src = rec.get("src", "")
-                    if src:
-                        sp = Path(src)
-                        if sp.exists():
-                            self._safe_delete_path(sp)
-                            cleanup_dirs.add(sp.parent)
-                # 删除媒体库文件（链接+重命名后的成品）
-                dest_fileitem = rec.get("dest_fileitem", {})
-                if dest_fileitem:
-                    fi = schemas.FileItem(**dest_fileitem)
-                    storage_chain.delete_media_file(fi)
-                else:
-                    dest = rec.get("dest", "")
-                    if dest:
-                        dp = Path(dest)
-                        if dp.exists():
-                            self._safe_delete_path(dp)
-                            cleanup_dirs.add(dp.parent)
-            # 收集 src/dest 路径的父目录（含 fileitem 场景），同时记录本单元自己的
-            # 文件路径：下载器 delete_file 为异步操作，这些文件可能仍短暂存在，
-            # 清理目录时应视为已删除，避免单文件种子的专属目录被误判为「仍有视频文件」
+            # 本单元自己的文件路径：既用于删种时判断能否连带删文件，也用于目录清理。
+            # 必须先于删种算好——多文件种子只有在「其内容全部属于本单元」时才能
+            # delete_file=True，否则会连带删掉同一种子里的其他资源。
             unit_paths: set = set()
+            cleanup_dirs: set = set()
             for rec in all_recs:
                 src = rec.get("src", "")
                 if src:
@@ -2539,11 +2565,92 @@ class SpaceCleaner(_PluginBase):
                 if dest:
                     cleanup_dirs.add(Path(dest).parent)
                     unit_paths.add(str(Path(dest)))
+                # fileitem 里的路径同样是本单元的文件：记录可能没有 src/dest 字符串，
+                # 但仍带 fileitem，缺了它会导致「无路径可删 → 无法确认清理」而放弃整个单元。
+                for key in ("src_fileitem", "dest_fileitem"):
+                    item = rec.get(key) or {}
+                    path = str(item.get("path") or "").strip() if isinstance(item, dict) else ""
+                    if path:
+                        unit_paths.add(str(Path(path)))
+                        cleanup_dirs.add(Path(path).parent)
+            if main_hashes and not unit_paths:
+                # 整理记录既没有路径字符串也没有 fileitem：无法删除、也无法确认文件是否
+                # 已随删种消失。此时不删任何东西也不占用额度，避免在无法验证的情况下
+                # 连带删除同一种子里的其他资源。同一资源只告警一次，避免每轮刷日志与
+                # 反复写入删除记录。
+                if display_name not in self._no_path_warned:
+                    self._no_path_warned.add(display_name)
+                    logger.error(f"SC 跳过 [{display_name}]：整理记录缺少文件路径信息，"
+                                 f"无法确认删除范围（仅提示一次）")
+                    self._add_delete_history(display_name, "跳过：整理记录缺少文件路径信息")
+                return False
+            for dh in main_hashes:
+                deleted_count = self._delete_downloader_torrents(
+                    chain, dh, display_name, torrent_index, rec_owners.get(dh, ""), unit_paths
+                )
+                if deleted_count < 0:
+                    raise RuntimeError(f"种子删除失败，已中止文件和整理记录清理: {dh}")
+                torrents_deleted += deleted_count
+            if not main_hashes:
+                logger.info(f"SC [{display_name}] 无关联种子（可能为无 hash 记录），跳过删种")
+            # 2) 删种后删除源文件、媒体库文件及残留空目录
+            #    复用 StorageChain.delete_media_file（含配置目录保护，不会误删下载/媒体库根目录）
+            storage_chain = StorageChain()
+            unit_stems = self._unit_stems(unit_paths)
+            failed_paths: List[str] = []  # 未能确认删除的文件，用于决定是否保留整理记录
+            for rec in all_recs:
+                # 删除下载源文件（有种子的已随删种删除，此处兜底处理无 hash 记录）
+                src_fileitem = rec.get("src_fileitem", {})
+                if src_fileitem:
+                    fi = schemas.FileItem(**src_fileitem)
+                    if not storage_chain.delete_media_file(fi):
+                        failed_paths.append(str(rec.get("src", "") or fi.path or ""))
+                else:
+                    # 无 fileitem 时兜底删除 src 路径
+                    src = rec.get("src", "")
+                    if src:
+                        sp = Path(src)
+                        if sp.exists() and not self._safe_delete_path(sp, unit_stems):
+                            failed_paths.append(str(sp))
+                # 删除媒体库文件（链接+重命名后的成品）
+                dest_fileitem = rec.get("dest_fileitem", {})
+                if dest_fileitem:
+                    fi = schemas.FileItem(**dest_fileitem)
+                    if not storage_chain.delete_media_file(fi):
+                        failed_paths.append(str(rec.get("dest", "") or fi.path or ""))
+                else:
+                    dest = rec.get("dest", "")
+                    if dest:
+                        dp = Path(dest)
+                        if dp.exists() and not self._safe_delete_path(dp, unit_stems):
+                            failed_paths.append(str(dp))
+            # 下载器删种删文件是异步的：短暂等待本单元自己的文件消失，
+            # 再清理目录。等待超时则保留目录（宁可残留，也不把尚在的文件当已删除）。
+            if not self._dry_run and unit_paths:
+                still_there = self._wait_paths_gone(unit_paths)
+                failed_paths.extend(sorted(still_there))
             # 清理下载残留目录和媒体库空目录，并记录仍未清理的目录。
             for d in cleanup_dirs:
-                self._cleanup_download_dir(d, unit_paths)
-                self._delete_media_dir(d, max_levels=3, ignore_paths=unit_paths)
+                self._cleanup_download_dir(d, unit_stems)
+                self._delete_media_dir(d, max_levels=3, unit_stems=unit_stems)
             leftover_dirs = self._find_residual_dirs(cleanup_dirs, unit_paths)
+            if failed_paths:
+                # 文件仍在时删除整理记录会让这些文件失去可追踪记录，后续再也无法清理。
+                # 保留记录与播放缓存，留待下一轮重试。
+                uniq = sorted({p for p in failed_paths if p})
+                logger.error(f"SC [{display_name}] 有 {len(uniq)} 个文件未能确认删除，"
+                             f"保留整理记录待下轮重试: {', '.join(uniq[:5])}"
+                             + ("…" if len(uniq) > 5 else ""))
+                self._add_delete_history(
+                    display_name,
+                    f"部分删除：种子 {torrents_deleted} 个，{len(uniq)} 个文件删除失败，已保留整理记录")
+                if self._notify:
+                    self.post_message(title="空间清理器 - 部分删除",
+                                      text=f"资源: {display_name}\n删除种子: {torrents_deleted} 个\n"
+                                           f"文件删除失败: {len(uniq)} 个\n已保留整理记录，下轮将重试")
+                # 未完整删除、空间未完全释放：不计入单次删除数量，避免失败单元
+                # 每轮独占额度导致其他可删资源永远轮不到。
+                return False
             # 用独立 session 删除所有相关转移记录
             from app.db import ScopedSession
             ds = ScopedSession()
@@ -2580,9 +2687,12 @@ class SpaceCleaner(_PluginBase):
                 fresh = self._get_space_info() or space_info
                 self.post_message(title="空间清理器 - 资源已删除",
                                   text=f"资源: {display_name}{ver_line}\n删除种子: {torrents_deleted} 个\n当前剩余空间: {fresh['free_gb']:.2f} GB ({fresh['free_percent']:.1f}%){leftover_line}")
+            return True
         except Exception as e:
             logger.error(f"删除 {display_name} 失败: {str(e)}")
             self._add_delete_history(display_name, f"删除失败: {str(e)}")
+            # 失败未释放空间，不计入单次删除数量，避免占用本轮额度
+            return False
 
     @staticmethod
     def _norm_season(seasons: str) -> Optional[int]:
@@ -2809,53 +2919,35 @@ class SpaceCleaner(_PluginBase):
 
     # ==================== 种子索引 ====================
 
-    def _torrent_paths(self, torrent: Any) -> List[str]:
-        """收集一个下载器任务对应的磁盘路径（内容路径、任务路径、保存目录+名称）。"""
-        paths = []
-        for attr in ("content_path", "path"):
-            value = getattr(torrent, attr, None)
-            if value:
-                paths.append(str(value))
-        save_path = getattr(torrent, "save_path", None)
-        name = self._torrent_name(torrent)
-        if save_path and name:
-            paths.append(str(Path(str(save_path)) / name))
-        return paths
-
     def _build_torrent_index(self, torrents: List[Any]) -> Dict[str, dict]:
         """把种子列表预处理为索引，避免删除阶段反复做 O(整理记录 × 种子) 线性扫描。
 
         - by_hash:    hash -> 种子对象
-        - by_content: (体积, 名称) -> [hash, ...]，用于常数级查找辅种
-        - by_path:    磁盘路径 -> hash，用于无 download_hash 的整理记录按源文件反查任务
-        - by_content_path: 内容路径 -> [hash, ...]，同一目录内容可被多个不同名称的
-          种子任务共享（不同站点辅种常保留各自原始命名），按路径聚合避免漏删
-        - by_save_path:    保存目录 -> [hash, ...]，仅保留索引供诊断和后续精确匹配使用，
-          不作为独立的辅种删除依据
+        - by_content_path: 下载器报告的内容路径 -> [hash, ...]。单文件种子的内容路径是
+          文件本身，目录型种子的是其所在目录；用于按源文件反查归属任务，以及判定
+          共享同一份文件的辅种
+        - ambiguous:  同一 infohash 出现在多个下载器上的 hash 集合。此时只向其中
+          一台下发删除会留下另一台的种子，却仍会删掉共享文件与整理记录，
+          因此这类 hash 一律不删除，由调用方跳过整个删除单元。
+
+        不索引保存目录，也不按「同名同体积」建桶：这两者都无法证明两个任务共享同一份
+        文件，据其删种会误删其他资源。
         """
         index: Dict[str, dict] = {
-            "by_hash": {}, "by_content": {}, "by_path": {},
-            "by_content_path": {}, "by_save_path": {},
+            "by_hash": {}, "by_content_path": {}, "ambiguous": set(),
         }
         for torrent in torrents or []:
             torrent_hash = getattr(torrent, "hash", None)
             if not torrent_hash:
                 continue
+            existing = index["by_hash"].get(torrent_hash)
+            if existing is not None and self._torrent_downloader(existing) != self._torrent_downloader(torrent):
+                # 同一 infohash 被多个下载器同时保种：无法只删一台就安全释放文件
+                index["ambiguous"].add(torrent_hash)
             index["by_hash"][torrent_hash] = torrent
-            size = self._torrent_size(torrent)
-            name = self._torrent_name(torrent)
-            if size and name:
-                index["by_content"].setdefault((size, name), []).append(torrent_hash)
-            for path in self._torrent_paths(torrent):
-                # 同一路径可能对应多个辅种，保留首个即可：辅种会在 by_content 中一并取出。
-                # 键统一做 Path 规范化：qb 的 save_path 常带尾斜杠，反查方用 Path 逐级
-                # 向上生成的键不带，两者不一致会导致反查 miss。
-                index["by_path"].setdefault(str(Path(path)), torrent_hash)
-            for attr, bucket in (("content_path", "by_content_path"),
-                                 ("save_path", "by_save_path")):
-                value = str(getattr(torrent, attr, None) or "").strip()
-                if value:
-                    index[bucket].setdefault(str(Path(value)), []).append(torrent_hash)
+            value = str(getattr(torrent, "content_path", None) or "").strip()
+            if value:
+                index["by_content_path"].setdefault(str(Path(value)), []).append(torrent_hash)
         return index
 
     def _drop_torrents_from_index(self, index: Optional[dict], hashes: set) -> None:
@@ -2865,16 +2957,14 @@ class SpaceCleaner(_PluginBase):
         if index:
             for h in hashes:
                 index["by_hash"].pop(h, None)
-            for bucket in ("by_content", "by_content_path", "by_save_path"):
+            (index.get("ambiguous") or set()).difference_update(hashes)
+            for bucket in ("by_content_path",):
                 for key, hs in list((index.get(bucket) or {}).items()):
                     kept = [h for h in hs if h not in hashes]
                     if kept:
                         index[bucket][key] = kept
                     else:
                         index[bucket].pop(key, None)
-            for key, h in list(index["by_path"].items()):
-                if h in hashes:
-                    index["by_path"].pop(key, None)
         if self._all_torrents_cache:
             self._all_torrents_cache = [t for t in self._all_torrents_cache
                                         if getattr(t, "hash", None) not in hashes]
@@ -2884,12 +2974,16 @@ class SpaceCleaner(_PluginBase):
 
         两层收集（均去重）：
         1. 记录自带的 download_hash（原始下载种子）；
-        2. 按源路径逐级向上反查下载器任务。
+        2. 按源文件路径反查下载器任务：先精确匹配单文件种子的内容路径，再向上逐级
+           匹配「内容路径为目录」的种子（目录型种子，其 src 是目录内的文件）。
 
-        第二层不再只是「download_hash 缺失时的兜底」：原始下载种子可能已被移除
-        或落在扫描下载器范围外（例如转去保种下载器），此时该目录下同内容的其他
-        种子（不同站点辅种）仍在保种且占用文件。始终反查一次，能命中仍在的种子
-        作为入口，避免整个资源组的辅种被漏删。
+        第二层不只是「download_hash 缺失时的兜底」：原始下载种子可能已被移除或落在
+        扫描下载器范围外（例如转去保种下载器），此时该目录下同内容的其他种子仍在保种
+        且占用文件，反查能命中仍在的种子作为入口。
+
+        归属判定只依据下载器自己报告的内容路径：源文件位于某任务的内容路径之内即视为
+        该任务的文件。绝不使用保存目录（同目录可能有完全无关的种子），也不会仅凭
+        「父目录相同」把文件算到别的任务上。
         """
         hashes = []
         seen = set()
@@ -2899,20 +2993,24 @@ class SpaceCleaner(_PluginBase):
                 seen.add(h)
                 hashes.append(h)
 
-        by_path = (index or {}).get("by_path") or {}
+        by_content_path = (index or {}).get("by_content_path") or {}
         for record in records:
             download_hash = record.get("download_hash", "")
             if download_hash:
                 _add(download_hash)
             src = record.get("src", "")
-            if not src or not by_path:
+            if not src:
                 continue
             src_path = Path(src)
+            # 从文件自身开始向上找「内容路径」：单文件种子的内容路径就是该文件，
+            # 目录型种子的内容路径是其所在目录。只认单一归属——同一路径被多个
+            # 任务共同声明时无法判断文件属于谁，宁可不反查，也不误删别的资源。
             for candidate in (src_path, *src_path.parents):
-                torrent_hash = by_path.get(str(candidate))
-                if not torrent_hash:
+                owners = by_content_path.get(str(candidate))
+                if not owners:
                     continue
-                _add(torrent_hash)
+                if len(owners) == 1:
+                    _add(owners[0])
                 break
         return hashes
 
@@ -2920,13 +3018,9 @@ class SpaceCleaner(_PluginBase):
         """收集该主种子及其辅种，返回 [(hash, name, is_cross, downloader), ...]（含主种子本身）。
 
         辅种定义：与主种子共享同一份磁盘文件但任务不同（通常来自不同站点）。
-        判断条件取并集：
-        1. 体积一致且名称一致（同名同内容，旧规则）；
-        2. 体积一致且内容路径一致（content_path 相同）：不同站点添加辅种时常保留
-           各自的原始命名，仅靠同名会漏；共享同一目录即共享同一份文件。
-
-        保存目录相同不能证明两个任务共享文件；同一目录下的不同资源可能恰好具有
-        相同总体积，因此不再把 save_path + size 作为辅种匹配条件。
+        仅在体积一致且下载器提供相同内容路径时认定为辅种。
+        名称和体积相同、或保存目录相同都不足以证明共享文件；缺少内容路径时
+        保守地不自动删除辅种，避免删除其他资源。
 
         删除时必须一并处理辅种，否则残留的辅种会重新占用/锁定文件。用于删种与
         试运行统计（不执行删除）。
@@ -2946,9 +3040,8 @@ class SpaceCleaner(_PluginBase):
         if not main_size:
             return result
         candidates: set = set()
-        # 规则 1：同名同体积
-        candidates.update(((index or {}).get("by_content") or {}).get((main_size, main_name), []))
-        # 规则 2：同内容路径且体积一致。保存目录相同不足以证明共享文件，不能据此删种。
+        # 同名同体积不能证明同一文件；重名资源在不同路径下必须保留。
+        # 仅在下载器报告相同内容路径且体积一致时判定为辅种。
         for attr, bucket in (("content_path", "by_content_path"),):
             value = str(getattr(main_t, attr, None) or "").strip()
             if not value:
@@ -2966,7 +3059,7 @@ class SpaceCleaner(_PluginBase):
         return result
 
     def _delete_downloader_torrents(self, chain, download_hash, display_name, index,
-                                    owner_downloader: str = "") -> int:
+                                    owner_downloader: str = "", unit_paths: Optional[set] = None) -> int:
         """删除主种子及其辅种（cross-seed），返回实际删除的种子数量。
 
         返回负数表示至少一个删除请求失败。调用方必须在继续处理文件和整理记录前
@@ -2977,10 +3070,21 @@ class SpaceCleaner(_PluginBase):
         扫描范围为「扫描下载器」选中的下载器，其中包含非 MP 管理的种子。
         主种子不在扫描范围时，优先按整理记录归属的下载器（owner_downloader）定向下发，
         避免退回默认下载器造成「删除不存在的 hash 却返回成功」的静默漏删。
+
+        unit_paths 为本次删除单元自己的文件路径。只有当种子内容是「单个文件且该文件
+        正属于本单元」时才允许 delete_file=True；多文件（目录型）种子可能同时包含
+        其他未观看的资源，连带删文件会误删，此时只删任务、由本单元显式删除自己的文件。
         """
         if not download_hash:
             logger.warning(f"SC 无 download_hash，跳过删种: {display_name}")
             return 0
+        ambiguous = set((index or {}).get("ambiguous") or ())
+        if download_hash in ambiguous:
+            # 同一 infohash 在多台下载器上同时存在：只删一台会留下另一台继续占用文件，
+            # 却已删除整理记录，因此整体放弃该单元，等待用户在下载器侧处理。
+            logger.error(f"SC 种子 {download_hash} 同时存在于多个下载器，"
+                         f"为避免留下残留种子并误删文件，跳过该资源: {display_name}")
+            return -1
         to_delete = self._collect_torrents_to_delete(download_hash, index)
         if not ((index or {}).get("by_hash") or {}).get(download_hash):
             # 种子不在扫描范围内（未选中的下载器 / 已被移除 / 原始种子已不存在）。
@@ -2996,19 +3100,37 @@ class SpaceCleaner(_PluginBase):
                 h, name, is_cross, downloader = to_delete[0]
                 if not downloader and owner_downloader:
                     to_delete[0] = (h, name, is_cross, owner_downloader)
+        # 辅种同样可能跨下载器重复：逐个核对，任一 hash 歧义即整体放弃，
+        # 否则会只删一端却继续清理共享文件与整理记录。
+        blocked_cross = sorted({h for h, _n, _c, _d in to_delete if h in ambiguous})
+        if blocked_cross:
+            logger.error(f"SC 辅种 {', '.join(blocked_cross)} 同时存在于多个下载器，"
+                         f"为避免留下残留种子并误删文件，跳过该资源: {display_name}")
+            return -1
         cross_cnt = sum(1 for item in to_delete if item[2])
         main_cnt = len(to_delete) - cross_cnt
         logger.info(f"SC 准备删种 [{display_name}]: 主种子 {main_cnt} 个" +
                     (f"，辅种 {cross_cnt} 个" if cross_cnt else "，无辅种"))
+        by_hash = (index or {}).get("by_hash") or {}
+        owned_paths = {str(Path(p)) for p in (unit_paths or set())}
         deleted = 0
         failed = False
         deleted_hashes = set()
         for h, name, is_cross, downloader in to_delete:
             role = "辅种" if is_cross else "主种子"
             dl_label = f" @{downloader}" if downloader else ""
+            # 只有「单文件种子」才连带删文件：单文件种子整体就是本资源，删掉是安全的；
+            # 多文件（目录型）种子可能同时包含其他资源，改为只删任务，文件由本单元
+            # 逐条显式删除。若本单元能给出文件清单，还要求该文件确属本单元。
+            content_path = str(getattr(by_hash.get(h), "content_path", "") or "").strip()
+            looks_single = bool(content_path) and Path(content_path).suffix != ""
+            owned = str(Path(content_path)) in owned_paths
+            delete_files = looks_single and (owned or not owned_paths)
+            if not delete_files:
+                logger.info(f"SC   {role} {name} ({h}) 非本单元单文件，仅删任务不连带删文件")
             try:
                 # remove_torrents 返回布尔，失败时不能计入删除数，否则统计虚高且失败被静默
-                if chain.remove_torrents(hashs=h, delete_file=True, downloader=downloader or None):
+                if chain.remove_torrents(hashs=h, delete_file=delete_files, downloader=downloader or None):
                     logger.info(f"SC   已删除{role}: {name} ({h}){dl_label}")
                     deleted += 1
                     deleted_hashes.add(h)
@@ -3050,45 +3172,134 @@ class SpaceCleaner(_PluginBase):
             return ""
         return str(getattr(t, "downloader", None) or "").strip()
 
-    def _safe_delete_path(self, path: Path) -> bool:
-        """删除文件或目录，返回是否确实删除成功。"""
+    def _safe_delete_path(self, path: Path, unit_stems: Optional[set] = None) -> bool:
+        """只删除文件或经过确认的浅层元数据目录，不递归删除未知内容。"""
         try:
-            if path.is_file() or path.is_symlink():
+            if path.is_symlink() or path.is_file():
                 path.unlink()
             elif path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            return not path.exists()
+                if self._dir_is_protected(path, self._configured_dirs()):
+                    return False
+                if not self._dir_is_leftover_metadata(path, unit_stems):
+                    return False
+                for item in path.iterdir():
+                    if item.is_symlink() or item.is_dir() or not self._is_metadata_file(item, unit_stems):
+                        return False
+                    item.unlink()
+                path.rmdir()  # 若期间出现新文件，则失败而非递归误删
+            return not path.exists() and not path.is_symlink()
         except Exception as e:
             logger.warning(f"SC 删除路径失败 {path}: {e}")
             return False
 
-    # 判定「残留元数据目录」时使用的视频扩展名（目录内含这些文件则不删除）
-    _LEFTOVER_VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv",
-                            ".iso", ".rmvb", ".rm", ".mpg", ".mpeg", ".m4v", ".webm", ".vob", ".strm"}
+    # 刮削产物、字幕、随片音轨的扩展名；仅凭扩展名不足以证明文件属于本资源，
+    # 还需要文件名与本单元媒体文件相关（见 _is_metadata_file）。
+    _SCRAPE_EXTS = {".nfo", ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif",
+                    ".sfv", ".md5", ".sha1", ".sha256", ".url", ".xml", ".txt"}
+    _SUB_EXTS = {".srt", ".ass", ".ssa", ".sup", ".sub", ".idx", ".vtt"}
+    _AUDIO_EXTS = {".aac", ".ac3", ".amr", ".m4a", ".flac", ".mka", ".dts",
+                   ".mp3", ".wav", ".ogg", ".ape"}
+    # 刮削器固定文件名中语义明确、不会与其他资源混淆的部分
+    _SCRAPE_STEMS = {"poster", "fanart", "backdrop", "banner", "thumb", "logo",
+                     "clearlogo", "clearart", "discart", "landscape", "folder",
+                     "keyart", "character", "actors"}
+    # 仅在图片扩展名上才是刮削约定的通用名（Kodi/Emby 的 art.jpg）
+    _SCRAPE_IMAGE_STEMS = {"art"}
+    # 仅在 .nfo 上才是刮削约定的通用名（movie.nfo / tvshow.nfo / season.nfo / episode.nfo / metadata.nfo）
+    _SCRAPE_NFO_STEMS = {"tvshow", "season", "movie", "episode", "show", "metadata"}
+    # 文件名以「本资源名 + 分隔符」开头时，允许的分隔符后缀（刮削常见的缩略图/字幕标记）
+    _SCRAPE_SUFFIX_TOKENS = {"thumb", "poster", "fanart", "backdrop", "banner", "logo",
+                             "clearlogo", "clearart", "landscape", "disc", "discart",
+                             "keyart", "theme", "sample", "trailer", "preview"}
+    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+    # 连字符后的语言码：E01-zh.srt / E01-chs.srt / E01-zh-Hans.srt
+    _LANG_SUFFIX_RE = re.compile(r"^(?:[a-z]{2,3}|chs|cht|sc|tc)(?:[-.].*)?$")
 
-    def _dir_is_leftover_metadata(self, path: Path, ignore_paths: Optional[set] = None) -> bool:
+    @classmethod
+    def _stem_matches_unit(cls, stem: str, unit_stems: Optional[set], suffix: str = "") -> bool:
+        """文件名是否与本单元某个媒体文件相关（同名、或「同名 + 分隔符 + 标记」）。
+
+        点分隔允许语言/质量等任意后缀（``E01.zh.srt``、``E01.1080p.nfo``）；
+        连字符分隔只接受刮削器惯用的标记（``E01-thumb.jpg``）或字幕的语言码
+        （``E01-zh.srt``），且标记必须完整，因此 ``E01-备份说明.txt``、
+        ``E01-thumb-2.jpg`` 都不会被判为刮削产物。
+        """
+        if not unit_stems:
+            return False
+        for base in unit_stems:
+            if stem == base:
+                return True
+            if stem.startswith(f"{base}."):
+                return True
+            if stem.startswith(f"{base}-"):
+                token = stem[len(base) + 1:].split(".", 1)[0]
+                if token in cls._SCRAPE_SUFFIX_TOKENS:
+                    return True
+                # 字幕的语言码后缀（仅在字幕扩展名上放行，避免 .txt 等被误判）
+                if suffix in cls._SUB_EXTS and cls._LANG_SUFFIX_RE.match(token):
+                    return True
+        return False
+
+    @classmethod
+    def _is_metadata_file(cls, path: Path, unit_stems: Optional[set] = None) -> bool:
+        """判断文件是否为「可随本资源一起清理的残留文件」。
+
+        仅扩展名命中白名单不够：同目录下用户自建的 ``notes.txt``、独立音乐文件
+        与随片音轨扩展名相同。因此除语义明确的刮削文件名外，还要求文件名与本单元
+        的媒体文件相关（同名或以分隔符接刮削标记）。
+
+        unit_stems 为本单元媒体文件的主文件名集合；为空时只认可语义明确的刮削命名，
+        宁可残留也不误删用户文件。
+        """
+        if not path.is_file() or path.is_symlink():
+            return False
+        if path.name in {".DS_Store", "Thumbs.db", "desktop.ini"}:
+            return True
+        suffix = path.suffix.lower()
+        if suffix not in cls._SCRAPE_EXTS and suffix not in cls._SUB_EXTS \
+                and suffix not in cls._AUDIO_EXTS:
+            return False
+        stem = path.stem.lower()
+        # 音轨必须能对应到本单元的媒体文件：刮削器本身不会产出音频文件，
+        # 仅凭文件名「像」不足以证明它是随片音轨而不是用户独立保留的音频。
+        if suffix in cls._AUDIO_EXTS:
+            return cls._stem_matches_unit(stem, unit_stems, suffix)
+        if stem in cls._SCRAPE_STEMS:
+            return True
+        if suffix in cls._IMAGE_EXTS and stem in cls._SCRAPE_IMAGE_STEMS:
+            return True
+        if suffix == ".nfo" and stem in cls._SCRAPE_NFO_STEMS:
+            return True
+        return cls._stem_matches_unit(stem, unit_stems, suffix)
+
+    @staticmethod
+    def _unit_stems(unit_paths: Optional[set]) -> set:
+        """从本单元的文件路径提取主文件名集合，用于判断残留文件是否属于本资源。"""
+        stems = set()
+        for p in unit_paths or set():
+            name = Path(str(p)).name
+            if not name:
+                continue
+            stems.add(Path(name).stem.lower())
+        return {s for s in stems if s}
+
+    def _dir_is_leftover_metadata(self, path: Path, unit_stems: Optional[set] = None) -> bool:
         """目录是否为「资源删除后残留的元数据目录」——可安全删除。
 
-        判定为 True 的条件：目录内不含任何子目录，且不含任何视频文件；
-        即只剩 nfo、海报/背景图、字幕、系统垃圾等刮削/元数据文件。
+        判定为 True 的条件：目录内每一项都属于可清理的刮削产物、字幕或随片音轨，
+        即不含子目录，也不含视频、压缩包等任何其他文件。
         这类目录（如某剧删除全部季后仅剩 tvshow.nfo、poster.jpg 的剧名根目录）
-        应连同删除。若目录内仍有子目录（如同类目录下的其他剧集、其他季）
-        或仍存在视频文件，则返回 False 以停止上溯，避免误删。
+        可连同删除；只要出现子目录（同目录下的其他剧集/其他季）或未知文件就返回
+        False 以停止上溯，避免误删无关内容。
 
-        ignore_paths 为「本次删除单元自己的文件路径」集合：下载器 delete_file
-        为异步操作，删种后源文件可能仍短暂存在，这类文件本就属于本次删除范围，
-        判定时应视为已删除，否则单文件种子的专属目录会被误判为「仍有视频文件」
-        而永久残留。
+        本单元自己的文件也必须等到真正删除后才算消失：调用方在清理目录前会短暂等待
+        下载器的异步删除完成（见 _wait_paths_gone），因此这里不再把「期望已删」
+        当作「已删」。
         """
         try:
-            ignore = ignore_paths or set()
             for e in path.iterdir():
-                if e.is_dir():
-                    return False  # 存在子目录（其他剧集/其他季），保留
-                if e.is_file() and e.suffix.lower() in self._LEFTOVER_VIDEO_EXTS:
-                    if str(e) in ignore:
-                        continue  # 本单元自己的文件（下载器异步删除中），视为已删
-                    return False  # 仍有其他视频文件，保留
+                if not self._is_metadata_file(e, unit_stems):
+                    return False
             return True
         except Exception:
             return False
@@ -3111,7 +3322,8 @@ class SpaceCleaner(_PluginBase):
             return True
         return False
 
-    def _delete_media_dir(self, media_dir: Path, max_levels: int = 3, ignore_paths: Optional[set] = None):
+    def _delete_media_dir(self, media_dir: Path, max_levels: int = 3,
+                          unit_stems: Optional[set] = None):
         """删除媒体库中该资源所在目录（MP 软链接/硬链接、重命名、刮削生成的成品目录）。
 
         MP 通常为每部电影/每季电视剧建立独立目录，目录内除媒体文件外还含
@@ -3119,8 +3331,8 @@ class SpaceCleaner(_PluginBase):
         电视剧的季目录（如 .../剧名 (2026) {tmdbid=x}/Season 1）删除后，
         若上层剧名目录随之变空，也一并向上清理（最多 max_levels 层），
         遇到仍有内容的目录（如同类目录下的其他剧集）、挂载点或根目录即停止。
-        目标目录必须只剩元数据文件，且不能是配置的下载/媒体库目录或其上级目录，
-        否则只记录日志并跳过，避免整目录误删。
+        目标目录必须只剩属于本资源的刮削/字幕/音轨文件，且不能是配置的下载/媒体库
+        目录或其上级目录，否则只记录日志并跳过，避免整目录误删。
         """
         try:
             if not media_dir or not media_dir.exists() or not media_dir.is_dir():
@@ -3129,10 +3341,10 @@ class SpaceCleaner(_PluginBase):
             if self._dir_is_protected(media_dir, configured_dirs):
                 logger.debug(f"SC 跳过删除目录（挂载点/根目录/配置的下载或媒体库目录）: {media_dir}")
                 return
-            if not self._dir_is_leftover_metadata(media_dir, ignore_paths):
-                logger.info(f"SC 目录仍有子目录或视频文件，跳过删除: {media_dir}")
+            if not self._dir_is_leftover_metadata(media_dir, unit_stems):
+                logger.info(f"SC 目录仍有子目录、视频或不属于本资源的文件，跳过删除: {media_dir}")
                 return
-            if self._safe_delete_path(media_dir):
+            if self._safe_delete_path(media_dir, unit_stems):
                 logger.info(f"SC 已删除媒体库目录: {media_dir}")
             else:
                 logger.warning(f"SC 删除媒体库目录未成功: {media_dir}")
@@ -3144,33 +3356,51 @@ class SpaceCleaner(_PluginBase):
                     break
                 if self._dir_is_protected(cur, configured_dirs):
                     break
-                if not self._dir_is_leftover_metadata(cur, ignore_paths):
+                if not self._dir_is_leftover_metadata(cur, unit_stems):
                     break  # 仍有子目录或视频文件（如同目录下别的剧集），停止上溯
                 parent = cur.parent
-                if self._safe_delete_path(cur):
+                if self._safe_delete_path(cur, unit_stems):
                     logger.info(f"SC 已删除残留空目录: {cur}")
                 cur = parent
         except Exception as e:
             logger.error(f"SC 删除媒体库目录失败 {media_dir}: {e}")
 
-    def _cleanup_download_dir(self, download_dir: Path, ignore_paths: Optional[set] = None):
+    def _wait_paths_gone(self, paths: set, timeout: float = 6.0, interval: float = 1.0) -> set:
+        """等待给定路径消失（下载器异步删文件），返回超时后仍存在的路径集合。
+
+        只做等待与检测，不主动删除任何路径：返回非空表示这些文件仍在，调用方应据此
+        保留整理记录、暂不清目录——绝不把「期望已删除」当成「已删除」。
+        """
+        pending = {Path(p) for p in paths}
+        if not pending:
+            return set()
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            pending = {p for p in pending if p.exists() or p.is_symlink()}
+            if not pending:
+                return set()
+            if time.time() >= deadline:
+                logger.info(f"SC 等待文件删除超时，仍有 {len(pending)} 个路径存在")
+                return pending
+            time.sleep(min(interval, max(0.0, deadline - time.time())))
+
+    def _cleanup_download_dir(self, download_dir: Path, unit_stems: Optional[set] = None):
         """清理下载目录中残留的空目录。
 
-        下载器删种时 delete_file=True 只删除种子对应的文件，不会删除种子所在的
-        父目录（如 qBittorrent 为每个种子创建的独立子目录）。此方法仅删除该目录
-        本身（若已空），不向上追溯，避免误删下载根目录或媒体库目录。
-        ignore_paths 为本次删除单元自己的文件路径，下载器异步删除尚未完成时
-        也视为已删除。
+        下载器删种时只删除种子对应的文件，不会删除种子所在的父目录
+        （如 qBittorrent 为每个种子创建的独立子目录）。此方法仅删除该目录本身
+        （若已只剩属于本资源的刮削/字幕/音轨文件），不向上追溯，避免误删下载根目录
+        或媒体库目录。
         """
         try:
             if not download_dir or not download_dir.exists() or not download_dir.is_dir():
                 return
             if self._dir_is_protected(download_dir, self._configured_dirs()):
                 return
-            # 检查目录是否为空（或仅剩元数据/垃圾文件、本单元待删文件）
-            if not self._dir_is_leftover_metadata(download_dir, ignore_paths):
-                return  # 目录内仍有子目录或其他视频文件，不清理
-            if self._safe_delete_path(download_dir):
+            # 检查目录是否为空（或仅剩属于本资源的残留文件）
+            if not self._dir_is_leftover_metadata(download_dir, unit_stems):
+                return  # 目录内仍有子目录、视频或不属于本资源的文件，不清理
+            if self._safe_delete_path(download_dir, unit_stems):
                 logger.info(f"SC 已清理下载残留目录: {download_dir}")
         except Exception as e:
             logger.error(f"SC 清理下载残留目录失败 {download_dir}: {e}")
@@ -3341,9 +3571,9 @@ class SpaceCleaner(_PluginBase):
                 with self._rss_lk:
                     if e in self._rss_seen or e in self._rss_skipped:
                         continue
-                if self._rss_inc and not re.search(self._rss_inc, t, re.IGNORECASE):
+                if self._rss_inc and not self._rss_regex_search(self._rss_inc, t):
                     continue
-                if self._rss_exc and re.search(self._rss_exc, t, re.IGNORECASE):
+                if self._rss_exc and self._rss_regex_search(self._rss_exc, t):
                     continue
                 if self._rss_sz:
                     sz = item.get("size", 0) or 0
@@ -3418,7 +3648,7 @@ class SpaceCleaner(_PluginBase):
                     se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}" if s_episode is not None else f"S{int(s_season):02d}"
                     # 同一 TMDB 已有播放缓存但季号不一致时，先尝试种子文件名兜底识别，仍不一致才跳过。
                     cached_seasons = self._rss_cached_seasons(m.tmdb_id)
-                    if cached_seasons and int(s_season) not in cached_seasons:
+                    if cached_seasons and int(s_season) not in cached_seasons and int(s_season) < max(cached_seasons):
                         cached_text = "、".join(f"S{season:02d}" for season in cached_seasons)
                         fb_m, fb_meta, fb_name = self._rss_filename_fallback(
                             item, t, f"报文季号 {se_fmt} 与播放缓存季（{cached_text}）不一致")
@@ -3447,9 +3677,8 @@ class SpaceCleaner(_PluginBase):
                                     self._rss_log("智能助手兜底命中", m.title, f"改用智能助手识别结果 {se_fmt}")
                                     fb_ok = True
                         if not fb_ok:
-                            # 分季策略差异是标题的稳定属性：记录跳过，同一报文不再每轮重跑兜底识别
-                            with self._rss_lk:
-                                self._rss_skipped[e] = None
+                            # 季号差异也可能由尚未播放的新季度造成；仅本轮暂缓，
+                            # 不持久化跳过，避免纠正识别词或更新播放缓存后仍永久漏下。
                             self._rss_log("跳过季号不一致", m.title,
                                           f"RSS={se_fmt}，播放缓存季={cached_text}，疑似分季策略不同")
                             if self._rss_ntf and self._rss_notify_once(f"mismatch:{m.tmdb_id}:{se_fmt}"):
@@ -3531,37 +3760,97 @@ class SpaceCleaner(_PluginBase):
                     self._rss_log("洗版跳过", m.title, f"{se_fmt} 已洗版下载过")
                     continue
                 ts = self._rss_pubts(item)
-                if dedup_key in all_candidates:
-                    # 同一集有多个版本时，只保留发布时间最早的版本
-                    if self._rss_earlier(ts, all_candidates[dedup_key][5]):
-                        all_candidates[dedup_key] = (item, m, meta, s_season, se_fmt, ts)
-                        self._rss_log("洗版替换", m.title, f"{se_fmt} 选用更早发布版本")
-                    else:
-                        self._rss_log("洗版去重跳过", m.title, f"{se_fmt} 已有更早版本")
-                    continue
-                all_candidates[dedup_key] = (item, m, meta, s_season, se_fmt, ts)
-        logger.info(f"SC-RSS 报文处理完成：获取 {total_items} 条，过滤后剩余 {len(all_candidates)} 条待处理")
-        # 统一下载去重后的条目
+                # 同一集保留全部候选并按发布时间升序排列：最早发布的版本取种失败
+                # （404/失效）时仍可回退到稍晚的有效版本，不会被永久卡死。
+                bucket = all_candidates.setdefault(dedup_key, [])
+                bucket.append((item, m, meta, s_season, se_fmt, ts))
+                bucket.sort(key=lambda cand: cand[5])
+                if len(bucket) > 1:
+                    self._rss_log("洗版备选", m.title, f"{se_fmt} 已有 {len(bucket)} 个候选，按发布时间依次尝试")
+        logger.info(f"SC-RSS 报文处理完成：获取 {total_items} 条，"
+                    f"过滤后剩余 {len(all_candidates)} 个待处理资源")
+        # 统一下载去重后的条目：同一集按发布时间从早到晚依次尝试，成功即停止
         dc = 0
-        for dedup_key, payload in all_candidates.items():
-            item, m, meta, s_season, se_fmt, ts = payload
-            if self._rss_dl_add(item, m, meta):
-                dc += 1
-                with self._rss_lk:
-                    self._rss_seen[item.get("enclosure", "") or item.get("link", "")] = None
-                ep_key = self._rss_wash_key(dedup_key)
-                if ep_key:
-                    self._rss_washed[ep_key] = None
-                self._rss_log("下载", m.title)
-                if self._rss_ntf:
-                    self.post_message(title="SC-RSS 已添加下载",
-                                      text=self._rss_notify_text(item, meta, m, se_fmt))
+        now_ts = time.time()
+        for dedup_key, bucket in all_candidates.items():
+            ep_key = self._rss_wash_key(dedup_key)
+            last_item, last_m, last_se = bucket[0][0], bucket[0][1], bucket[0][4]
+            attempted = 0  # 本轮实际尝试推送的候选数（冷却中的不计）
+            for index, (item, m, meta, s_season, se_fmt, ts) in enumerate(bucket):
+                enc = item.get("enclosure", "") or item.get("link", "")
+                failed_at = self._rss_failed_enc.get(enc)
+                if failed_at and now_ts - failed_at < self._rss_failed_cooldown:
+                    # 该候选刚失败过：跳过重取，避免每轮重复下载失效种子文件
+                    self._rss_log("候选冷却中", m.title, f"{se_fmt}（第 {index + 1}/{len(bucket)} 个候选）")
+                    continue
+                last_item, last_m, last_se = item, m, se_fmt
+                attempted += 1
+                status = self._rss_dl_add(item, m, meta)
+                if status == "ok":
+                    dc += 1
+                    with self._rss_lk:
+                        self._rss_seen[enc] = None
+                    self._rss_failed_enc.pop(enc, None)
+                    if ep_key:
+                        self._rss_washed[ep_key] = None
+                    self._rss_log("下载", m.title, se_fmt if index == 0 else f"{se_fmt}（第 {index + 1} 个候选）")
+                    if self._rss_ntf:
+                        self.post_message(title="SC-RSS 已添加下载",
+                                          text=self._rss_notify_text(item, meta, m, se_fmt))
+                    break
+                if status == "rule":
+                    # 被优先级规则组拒绝属于预期过滤：不记冷却、不计失败，
+                    # 同集的其他候选（可能规则组更匹配）继续尝试。
+                    self._rss_log("规则组跳过", m.title, f"{se_fmt}（第 {index + 1}/{len(bucket)} 个候选）")
+                    continue
+                # 推送失败：写入冷却，冷却期内不再重复取种；先继续尝试同集的后续候选
+                self._rss_failed_enc[enc] = now_ts
+                self._rss_log("下载失败", item.get("title", ""),
+                              f"推送下载器失败（{index + 1}/{len(bucket)}），"
+                              f"{self._rss_failed_cooldown // 3600} 小时内不再重取该候选")
             else:
-                self._rss_log("下载失败", item.get("title", ""), "推送下载器失败")
+                if attempted == 0:
+                    # 全部候选都在冷却期内：本轮没有实际尝试推送，不再重复报警
+                    self._rss_log("候选全部冷却中", last_m.title, f"{last_se} 本轮未尝试推送")
+                    continue
+                self._rss_log("下载失败", last_item.get("title", ""), "全部候选版本均推送失败")
                 if self._rss_ntf:
                     self.post_message(title="SC-RSS 添加失败",
-                                      text=f"名称: {m.title} {se_fmt}")
+                                      text=f"名称: {last_m.title} {last_se}")
         self._rss_save_dedup()
+
+    @staticmethod
+    def _qbt_field(torrent: Any, field: str) -> Any:
+        """读取 qBittorrent 种子字段，兼容 SDK 返回 dict 或属性对象两种形态。"""
+        if torrent is None:
+            return None
+        if isinstance(torrent, dict):
+            return torrent.get(field)
+        return getattr(torrent, field, None)
+
+    @staticmethod
+    def _rss_regex_search(pattern: str, text: str) -> bool:
+        """安全执行用户正则：表达式非法时按「不匹配」处理，绝不让异常中断整轮 RSS。
+
+        非法表达式只影响该条过滤规则本身，避免 re.error 冒泡导致本轮所有 RSS 源中断。
+        """
+        if not pattern:
+            return False
+        try:
+            return re.search(pattern, text, re.IGNORECASE) is not None
+        except re.error:
+            return False
+
+    @staticmethod
+    def _rss_regex_valid(pattern: str) -> bool:
+        """校验用户填写的正则是否可编译。"""
+        if not pattern:
+            return True
+        try:
+            re.compile(pattern)
+            return True
+        except re.error:
+            return False
 
     @staticmethod
     def _rss_wash_key(dedup_key) -> Optional[str]:
@@ -3603,11 +3892,6 @@ class SpaceCleaner(_PluginBase):
             except (ValueError, TypeError):
                 continue
         return float("inf")
-
-    @staticmethod
-    def _rss_earlier(ts_a: float, ts_b: float) -> bool:
-        """ts_a 是否比 ts_b 更早发布。"""
-        return ts_a < ts_b
 
     def _rss_notify_once(self, key: str) -> bool:
         """同一轮 RSS 内相同 key 的跳过/失败只通知一次：多个 RSS 源常带同一集的不同报文。"""
@@ -3653,9 +3937,9 @@ class SpaceCleaner(_PluginBase):
             with self._rss_lk:
                 if e in self._rss_seen:
                     continue
-            if self._rss_inc and not re.search(self._rss_inc, t, re.IGNORECASE):
+            if self._rss_inc and not self._rss_regex_search(self._rss_inc, t):
                 continue
-            if self._rss_exc and re.search(self._rss_exc, t, re.IGNORECASE):
+            if self._rss_exc and self._rss_regex_search(self._rss_exc, t):
                 continue
             if self._rss_sz:
                 sz = item.get("size", 0) or 0
@@ -3675,7 +3959,8 @@ class SpaceCleaner(_PluginBase):
             url_filtered += 1
             # 未开启洗版：跳过 TMDB 识别，仅本地解析标题用于通知的类别/质量（不调用 TMDB）
             meta = MetaInfo(title=t)
-            if self._rss_add_direct(item):
+            status = self._rss_add_direct(item)
+            if status == "ok":
                 with self._rss_lk:
                     self._rss_seen[e] = None
                 url_new += 1
@@ -3683,6 +3968,9 @@ class SpaceCleaner(_PluginBase):
                 if self._rss_ntf:
                     self.post_message(title="SC-RSS 已添加下载",
                                       text=self._rss_notify_text(item, meta))
+            elif status == "rule":
+                # 被优先级规则组拒绝属于预期过滤，不是失败，也不占用去重位
+                self._rss_log("规则组跳过", t)
             else:
                 # 下载失败不写入 _rss_seen，允许下一轮重试；过滤跳过的条目同样不占用去重位。
                 self._rss_log("下载失败", t, "添加下载器失败")
@@ -3938,13 +4226,22 @@ class SpaceCleaner(_PluginBase):
         entry_year = str(entry.get("year") or "").strip()
         if meta_year and entry_year and meta_year != entry_year:
             return None
+        entry_type = entry.get("media_type")
+        if isinstance(entry_type, str):
+            try:
+                entry_type = MediaType(entry_type)
+            except (TypeError, ValueError):
+                entry_type = MediaType.UNKNOWN
+        # 同名不同作品（如电影《Fargo》与剧集《Fargo》）不能共用标题级缓存：
+        # 缓存键只含标题，类型冲突时视为未命中，避免把剧集集数关联到同名电影。
+        if entry_type in (MediaType.TV, MediaType.MOVIE):
+            meta_is_tv = (getattr(meta, "type", None) == MediaType.TV
+                          or getattr(meta, "begin_season", None) is not None
+                          or getattr(meta, "begin_episode", None) is not None)
+            if (entry_type == MediaType.TV) != meta_is_tv:
+                return None
         try:
-            media_type = entry.get("media_type")
-            if isinstance(media_type, str):
-                try:
-                    media_type = MediaType(media_type)
-                except (TypeError, ValueError):
-                    media_type = MediaType.UNKNOWN
+            media_type = entry_type
             media = MediaInfo(
                 media_source=MediaSource.TMDB,
                 media_id=str(int(entry.get("tmdb_id"))),
@@ -4362,8 +4659,8 @@ class SpaceCleaner(_PluginBase):
         流程：把原始命名、MoviePilot 解析结果、本地已有季交给「设定-智能助手」配置的
         LLM，要求返回 JSON（标题/类型/TMDB ID/季集 + 一条自定义识别词）；随后
         1) 校验识别词（现有识别词 + 新词实际解析一次原始标题，季集/TMDB 必须符合预期），
-           校验通过则写入「设定-自定义识别词」，下次由 MoviePilot 自行识别；
-        2) 按 TMDB ID 查询完整媒体信息，季集以识别词解析结果为准，缺失时用 LLM 结果补齐；
+        1) 按 TMDB ID 查询完整媒体信息，季集以识别词解析结果为准，缺失时用 LLM 结果补齐；
+        2) 只有在 TMDB 确认媒体身份后才校验并写入「设定-自定义识别词」，避免失败结果污染全局配置；
         3) 清掉该标题的独立负缓存并写入独立正缓存。
 
         返回 (media, meta, name)，失败返回 (None, None, "")。
@@ -4430,41 +4727,20 @@ class SpaceCleaner(_PluginBase):
             self._rss_log("智能助手识别失败", rt, "电视剧未给出集号")
             self._rss_ai_mark_failed(key, "缺少集号")
             return None, None, ""
-        if cached_seasons and is_tv and season is not None and int(season) not in cached_seasons:
+        if cached_seasons and is_tv and season is not None and int(season) not in cached_seasons and int(season) < max(cached_seasons):
             cached_text = "、".join(f"S{s:02d}" for s in cached_seasons)
             self._rss_log("智能助手结果不采用", rt,
                           f"S{int(season):02d} 仍与播放缓存季（{cached_text}）不一致")
             self._rss_ai_mark_failed(key, "季号仍不一致")
             return None, None, ""
 
-        # 生成并校验自定义识别词：优先用智能助手给出的，无效时自造窄匹配规则
-        word_saved = ""
-        if self._rss_ai_add_words:
-            candidates = [str(guess.get("word") or "").strip(),
-                          self._rss_ai_build_word(rt, title, season, episode, tmdb_id, is_tv)]
-            for cand in candidates:
-                if not cand:
-                    continue
-                if self._rss_ai_word_verify(cand, rt, season, episode, tmdb_id, is_tv):
-                    if self._rss_ai_save_word(cand):
-                        word_saved = cand
-                    break
-
-        # 识别词生效后重新解析原始标题；未写入识别词时直接用智能助手给出的季集
-        meta = None
-        if word_saved:
-            try:
-                meta = MetaInfo(title=rt)
-                self._rss_log_meta("识别词生效后重解析", rt, meta)
-            except Exception:
-                meta = None
-        if meta is None:
-            try:
-                meta = MetaInfo(title=rt)
-            except Exception:
-                self._rss_log("智能助手识别失败", rt, "标题解析异常")
-                self._rss_ai_mark_failed(key, "标题解析异常")
-                return None, None, ""
+        # 校验媒体身份之前只在内存中解析；不能把未验证的识别词写进全局配置。
+        try:
+            meta = MetaInfo(title=rt)
+        except Exception:
+            self._rss_log("智能助手识别失败", rt, "标题解析异常")
+            self._rss_ai_mark_failed(key, "标题解析异常")
+            return None, None, ""
         if is_tv:
             if getattr(meta, "begin_season", None) is None or int(meta.begin_season) != int(season):
                 meta.begin_season = int(season)
@@ -4484,6 +4760,20 @@ class SpaceCleaner(_PluginBase):
                 meta.begin_episode = int(episode)
             if getattr(meta, "begin_season", None) is None:
                 meta.begin_season = int(season)
+        # TMDB 已确认媒体身份，此时才允许写入全局自定义识别词，避免污染全局配置。
+        word_saved = ""
+        if self._rss_ai_add_words:
+            candidates = [str(guess.get("word") or "").strip(),
+                          self._rss_ai_build_word(rt, title, season, episode,
+                                                  getattr(media, "tmdb_id", None) or tmdb_id, is_tv)]
+            for cand in candidates:
+                if not cand:
+                    continue
+                if self._rss_ai_word_verify(cand, rt, season, episode,
+                                            getattr(media, "tmdb_id", None) or tmdb_id, is_tv):
+                    if self._rss_ai_save_word(cand):
+                        word_saved = cand
+                    break
         self._drop_api_negative_cache_by_title(rt)
         if key:
             # 识别成功即解除该标题的失败冷却
@@ -4849,13 +5139,19 @@ class SpaceCleaner(_PluginBase):
             logger.warning(f"SC-RSS 优先级规则组过滤失败（{group}）: {e}，本条不过滤")
             return True
 
-    def _rss_dl_add(self, item: dict, m, meta: MetaInfo) -> bool:
+    def _rss_dl_add(self, item: dict, m, meta: MetaInfo) -> str:
+        """推送单条候选到下载器，返回状态字符串。
+
+        - ``"ok"``：已成功加入下载器；
+        - ``"rule"``：被优先级规则组过滤，属预期跳过，不是失败，不应触发重试冷却；
+        - ``"fail"``：推送失败（取种/下载器异常），可冷却后重试。
+        """
         try:
             enc = item.get("enclosure", "") or item.get("link", "")
             if not enc:
-                return False
+                return "fail"
             if not self._rss_rule_pass(item, m):
-                return False
+                return "rule"
             ti = TorrentInfo(title=item.get("title", ""), description="",
                              enclosure=enc, page_url=item.get("link", ""), size=item.get("size", 0))
             ctx = Context(meta_info=meta, media_info=m, torrent_info=ti)
@@ -4880,7 +5176,7 @@ class SpaceCleaner(_PluginBase):
             h, err = _do_download(content)
             if h:
                 self._rss_schedule_rename(h, m, meta, item.get("title", ""))
-                return True
+                return "ok"
             if content is not None:
                 # 代理路径失败：关闭代理回退直连再试一次
                 logger.warning(f"SC-RSS 下载失败: {m.title} {err}，关闭代理回退直连重试")
@@ -4888,25 +5184,29 @@ class SpaceCleaner(_PluginBase):
                 if h2:
                     logger.info(f"SC-RSS 直连重试下载成功: {m.title}")
                     self._rss_schedule_rename(h2, m, meta, item.get("title", ""))
-                    return True
+                    return "ok"
                 logger.warning(f"SC-RSS 直连重试下载仍失败: {m.title} {err2}")
-                return False
+                return "fail"
             if err:
                 logger.warning(f"SC-RSS 下载失败: {m.title} {err}")
-            return False
+            return "fail"
         except Exception as e:
             logger.error(f"RSS dl err {e}")
-            return False
+            return "fail"
 
-    def _rss_add_direct(self, item: dict) -> bool:
+    def _rss_add_direct(self, item: dict) -> str:
         """未开启洗版模式：不做 TMDB 识别，直接把种子添加到下载器。
-        通过下载器实例添加：磁链直接传 URL，种子文件先下载内容再添加。"""
+
+        返回与 _rss_dl_add 一致的三态：``"ok"`` 已添加、``"rule"`` 被优先级规则组
+        过滤（预期跳过，不是失败）、``"fail"`` 添加失败。通过下载器实例添加：
+        磁链直接传 URL，种子文件先下载内容再添加。
+        """
         try:
             enc = item.get("enclosure", "") or item.get("link", "")
             if not enc:
-                return False
+                return "fail"
             if not self._rss_rule_pass(item):
-                return False
+                return "rule"
             helper = DownloaderHelper()
             if self._rss_dl:
                 svc = helper.get_service(name=self._rss_dl)
@@ -4919,14 +5219,14 @@ class SpaceCleaner(_PluginBase):
                         break
             if not svc or not svc.instance:
                 logger.warning("SC-RSS 未找到可用下载器，无法直接添加种子")
-                return False
+                return "fail"
             downloader = svc.instance
             content = enc
             # 非磁链：先下载 .torrent 文件内容
             if not enc.lower().startswith("magnet:"):
                 content = self._rss_fetch_torrent(enc, tag=f"（{item.get('title', '')}）")
                 if not content:
-                    return False
+                    return "fail"
             r = downloader.add_torrent(content=content, download_dir=self._rss_save_path or None)
             # add_torrent 约定返回 (是否成功, 新增种子ID列表)，兼容旧版返回 bool/str
             ok, ids = False, []
@@ -4938,10 +5238,10 @@ class SpaceCleaner(_PluginBase):
                 ok = bool(r)
             if ok and ids:
                 self._rss_schedule_rename(ids[0], orig_name=item.get("title", ""))
-            return ok
+            return "ok" if ok else "fail"
         except Exception as e:
             logger.error(f"RSS direct add err {e}")
-            return False
+            return "fail"
 
     @staticmethod
     def _rss_size_str(item: dict) -> str:
@@ -5216,12 +5516,13 @@ class SpaceCleaner(_PluginBase):
                     continue
                 for t in torrents or []:
                     try:
-                        thash = t.get("hash")
-                        cur_name = (t.get("name") or "").strip()
+                        # qBittorrent SDK 可能返回 dict 或属性对象，两种形态都要能读
+                        thash = self._qbt_field(t, "hash")
+                        cur_name = str(self._qbt_field(t, "name") or "").strip()
                         if not thash or not cur_name:
                             continue
                         if self._rename_skip_tagged and tag:
-                            cur_tags = [x.strip() for x in str(t.get("tags") or "").split(",") if x.strip()]
+                            cur_tags = [x.strip() for x in str(self._qbt_field(t, "tags") or "").split(",") if x.strip()]
                             if tag in cur_tags:
                                 skipped += 1
                                 continue
@@ -5252,7 +5553,7 @@ class SpaceCleaner(_PluginBase):
                         self._rename_log("重命名", cur_name, f"-> {new_name}")
                     except Exception as exc:
                         failed += 1
-                        self._rename_log("重命名失败", (t.get("name") if isinstance(t, dict) else "") or "", str(exc))
+                        self._rename_log("重命名失败", str(self._qbt_field(t, "name") or ""), str(exc))
                         continue
             self._rename_log("完成", "", f"重命名 {renamed}，跳过 {skipped}，失败 {failed}")
         except Exception as exc:
@@ -5312,12 +5613,11 @@ class SpaceCleaner(_PluginBase):
             if not info:
                 continue
             try:
-                cur_name = (info.get("name") if isinstance(info, dict) else getattr(info, "name", "")) or ""
-                cur_name = cur_name.strip()
+                cur_name = str(self._qbt_field(info, "name") or "").strip()
                 if not cur_name:
                     return
                 if self._rename_skip_tagged and tag:
-                    cur_tags = [x.strip() for x in str(info.get("tags") or "").split(",") if x.strip()]
+                    cur_tags = [x.strip() for x in str(self._qbt_field(info, "tags") or "").split(",") if x.strip()]
                     if tag in cur_tags:
                         return
                 m, mt = media, meta
