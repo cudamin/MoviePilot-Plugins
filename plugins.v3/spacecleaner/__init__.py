@@ -45,9 +45,9 @@ class RawTorrent:
 
 class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理＆RSS过滤"
-    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由智能助手接管识别并自动写入自定义识别词；识别集号比播放缓存中该季最新集数大出阈值时视为识别异常，自动跳过下载（开启智能助手后先由智能助手复核）。"
+    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由 AniBT 识别补强、智能助手接管识别并自动写入自定义识别词；识别集号比播放缓存中该季最新集数大出阈值时视为识别异常，自动跳过下载（开启智能助手后先由智能助手复核）。"
     plugin_icon = "delete.png"
-    plugin_version = "5.5.0"
+    plugin_version = "5.6.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -84,6 +84,9 @@ class SpaceCleaner(_PluginBase):
     _rss_th = 85
     _rss_wash_mode = False  # 洗版模式：播放进度低于阈值时触发洗版，只下载最早版本
     _rss_fname_identify = False  # 种子文件名兜底识别：报文识别失败/无集号/季号不一致时下载种子用文件名再识别
+    _rss_anibt_match = False  # AniBT 识别补强：报文与文件名都识别失败时，用 AniBT torrent-match 解析番剧官方标题再识别
+    _rss_anibt_base = "https://anibt.net"  # AniBT 站点地址（固定值，不开放配置）
+    _rss_anibt_max = 10  # 单轮最多调用 AniBT 匹配的次数（固定值，不开放配置）
     _rss_ai_identify = False  # 智能助手识别兜底：识别失败/无集号/季号不一致时交给 LLM 接管识别
     _rss_ai_add_words = True  # 智能助手识别成功后自动写入自定义识别词，避免下次再失败
     _rss_ai_max = 5  # 单轮 RSS 刷新最多调用智能助手的次数
@@ -139,6 +142,8 @@ class SpaceCleaner(_PluginBase):
     _api_recognize_success_cache: List[dict] = []  # TMDB API 识别成功后的独立正缓存
     _api_recognize_success_cache_max = 100
     _api_recognize_cache_lock = threading.Lock()
+    # AniBT 标题匹配兜底的单轮调用计数
+    _rss_anibt_calls = 0
     # 智能助手识别兜底的单轮状态：调用计数与本轮已失败标题（避免同一轮重复烧 token）
     _rss_ai_calls = 0
     _rss_ai_failed: Dict[str, str] = {}
@@ -180,6 +185,9 @@ class SpaceCleaner(_PluginBase):
         self._rss_th = 85
         self._rss_wash_mode = False
         self._rss_fname_identify = False
+        self._rss_anibt_match = False
+        self._rss_anibt_base = "https://anibt.net"
+        self._rss_anibt_max = 10
         self._rss_ai_identify = False
         self._rss_ai_add_words = True
         self._rss_ai_max = 5
@@ -254,6 +262,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_washed = dict.fromkeys(self.get_data("rss_washed") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
         self._rss_fname_identify = bool(config.get("rss_fname_identify"))
+        self._rss_anibt_match = bool(config.get("rss_anibt_match"))
         self._rss_ai_identify = bool(config.get("rss_ai_identify"))
         self._rss_ai_add_words = bool(config.get("rss_ai_add_words", True))
         self._rss_ai_max = self._to_int(config.get("rss_ai_max"), 5, 1, 50)
@@ -339,6 +348,7 @@ class SpaceCleaner(_PluginBase):
             "rss_exc": self._rss_exc, "rss_once": self._rss_once, "rss_ntf": self._rss_ntf,
             "rss_th": self._rss_th, "rss_wash_mode": self._rss_wash_mode,
             "rss_fname_identify": self._rss_fname_identify,
+            "rss_anibt_match": self._rss_anibt_match,
             "rss_ai_identify": self._rss_ai_identify,
             "rss_ai_add_words": self._rss_ai_add_words,
             "rss_ai_max": self._rss_ai_max,
@@ -907,8 +917,11 @@ class SpaceCleaner(_PluginBase):
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "rss_ai_max", "label": "智能助手单轮调用上限", "type": "number", "min": 1, "max": 50, "hint": "每轮刷新最多调用次数", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
                         {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mb-0 h-100"},
-                         "content": [{"component": "div", "props": {"class": "text-caption"}, "text": "识别顺序：RSS报文标题 → 种子文件名 → 智能助手。智能助手使用「设定-智能助手」里配置的模型，识别成功后会按 TMDB ID 校验，并（可选）把识别词写入「设定-自定义识别词」，下次相同命名由 MoviePilot 自行识别，不再消耗智能助手额度。"}]}
+                         "content": [{"component": "div", "props": {"class": "text-caption"}, "text": "识别顺序：RSS报文标题 → 种子文件名 → AniBT 识别补强 → 智能助手。智能助手使用「设定-智能助手」里配置的模型，识别成功后会按 TMDB ID 校验，并（可选）把识别词写入「设定-自定义识别词」，下次相同命名由 MoviePilot 自行识别，不再消耗智能助手额度。"}]}
                     ]},
+                ]},
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_anibt_match", "label": "AniBT 识别补强", "hint": "报文与文件名都识别失败时，用 AniBT 的 torrent-match 解析番剧官方标题再走一遍识别", "persistent-hint": True}}]},
                 ]},
                 {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "rss_ep_gap", "label": "集号跨度保护阈值（集）", "type": "number", "min": 0, "max": 999, "hint": "识别集号超过该季已缓最新集数达到此值即视为识别异常，0 表示关闭", "persistent-hint": True}}]},
@@ -1006,6 +1019,7 @@ class SpaceCleaner(_PluginBase):
             "rss_dl": "", "rss_rule_group": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
             "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False,
             "rss_fname_identify": False, "rss_ai_identify": False, "rss_ai_add_words": True, "rss_ai_max": 5,
+            "rss_anibt_match": False,
             "rss_ep_gap": 12,
             "rss_proxy_retry": True, "rss_save_path": "",
             "rename_on": False, "rename_cron": "0 */12 * * *", "rename_downloader": [],
@@ -1663,6 +1677,8 @@ class SpaceCleaner(_PluginBase):
         ]
         if self._rss_ep_gap > 0:
             info_chips.append(self._chip(f"集号跨度保护 ≥{self._rss_ep_gap} 集", icon="mdi-skip-forward"))
+        if self._rss_anibt_match:
+            info_chips.append(self._chip("AniBT 识别补强", color="info", icon="mdi-magnify-scan"))
         if self._rss_ai_identify:
             info_chips.append(self._chip(f"智能助手单轮上限 {self._rss_ai_max} 次", color="info",
                                          icon="mdi-robot-outline"))
@@ -3224,7 +3240,8 @@ class SpaceCleaner(_PluginBase):
                 return
             self._rss_busy = True
         logger.info("SC-RSS 开始运行...")
-        # 重置智能助手兜底的单轮预算与失败标题记录
+        # 重置 AniBT 匹配与智能助手兜底的单轮预算及失败标题记录
+        self._rss_anibt_calls = 0
         self._rss_ai_calls = 0
         self._rss_ai_failed = {}
         try:
@@ -3312,27 +3329,36 @@ class SpaceCleaner(_PluginBase):
                         m, meta, video_name = fb_m, fb_meta, fb_name
                         self._rss_log("文件名回退命中", getattr(m, "title", t), "改用种子文件名识别结果")
                     else:
-                        # 报文与文件名都失败：交给智能助手接管识别（并尝试写入自定义识别词）
-                        ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "报文与种子文件名均识别失败")
+                        # 报文与文件名都失败：先试 AniBT 标题匹配兜底，再交给智能助手接管识别
+                        ab_m, ab_meta, ab_name = self._rss_anibt_fallback(item, t, "报文与种子文件名均识别失败")
+                        if ab_m and ab_meta:
+                            m, meta, video_name = ab_m, ab_meta, ab_name
+                        else:
+                            # AniBT 也未命中：交给智能助手接管识别（并尝试写入自定义识别词）
+                            ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "报文与种子文件名均识别失败")
+                            if ai_m and ai_meta:
+                                m, meta, video_name = ai_m, ai_meta, ai_name
+                            else:
+                                self._rss_log("识别失败", t)
+                                if self._rss_ntf:
+                                    self.post_message(title="SC-RSS识别失败",
+                                                      text=f"资源无法识别: {t}")
+                                continue
+                # 跳过无 TMDB ID 的识别结果
+                if not m.tmdb_id:
+                    ab_m, ab_meta, ab_name = self._rss_anibt_fallback(item, t, "TMDB API 未识别到媒体（无 TMDB ID）")
+                    if ab_m and ab_meta:
+                        m, meta, video_name = ab_m, ab_meta, ab_name
+                    else:
+                        ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "TMDB API 未识别到媒体（无 TMDB ID）")
                         if ai_m and ai_meta:
                             m, meta, video_name = ai_m, ai_meta, ai_name
                         else:
-                            self._rss_log("识别失败", t)
+                            self._rss_log("跳过无TMDB", t, "未识别到 TMDB ID")
                             if self._rss_ntf:
-                                self.post_message(title="SC-RSS识别失败",
-                                                  text=f"资源无法识别: {t}")
+                                self.post_message(title="SC-RSS跳过",
+                                                  text=f"未识别到 TMDB ID: {t}")
                             continue
-                # 跳过无 TMDB ID 的识别结果
-                if not m.tmdb_id:
-                    ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "TMDB API 未识别到媒体（无 TMDB ID）")
-                    if ai_m and ai_meta:
-                        m, meta, video_name = ai_m, ai_meta, ai_name
-                    else:
-                        self._rss_log("跳过无TMDB", t, "未识别到 TMDB ID")
-                        if self._rss_ntf:
-                            self.post_message(title="SC-RSS跳过",
-                                              text=f"未识别到 TMDB ID: {t}")
-                        continue
                 # 判断电视剧 / 电影，电视剧用 MP 剧集解析引擎重新提取季/集
                 is_tv = (getattr(m, "type", None) == MediaType.TV) or (m.season is not None) or (meta.begin_episode is not None)
                 if is_tv:
@@ -3977,6 +4003,81 @@ class SpaceCleaner(_PluginBase):
             return None, None, ""
         self._rss_log("文件名回退", rt, reason)
         return self._rss_id(item, rt, filename_only=True)
+
+    # ==================== AniBT 识别补强 ====================
+
+    def _rss_anibt_titles(self, rt: str) -> List[str]:
+        """用发布标题调用 AniBT 的 torrent-match，返回可用于 TMDB 识别的候选标题。
+
+        只接受 auto/manual 两种决定：auto 表示 AniBT 已判定唯一番剧，manual 表示有候选但需
+        调用方确认，两者都保留候选标题。标题按中文 → 日文原名 → 英文 → 罗马音排序，便于 TMDB
+        命中。未开启、站点不可达、无匹配或已达单轮调用上限时返回空列表。
+        """
+        if not self._rss_anibt_match or not rt:
+            return []
+        if self._rss_anibt_calls >= self._rss_anibt_max:
+            self._rss_log("AniBT 匹配跳过", rt, f"已达本轮调用上限 {self._rss_anibt_max} 次")
+            return []
+        base = (self._rss_anibt_base or "").strip().rstrip("/") or "https://anibt.net"
+        url = f"{base}/api/animes/torrent-match"
+        self._rss_anibt_calls += 1
+        try:
+            # 必须显式指定 JSON Content-Type：requests 不会用 json= 覆盖已设置的 Content-Type，
+            # 而 RequestUtils 默认带的是 form-urlencoded，AniBT 会因此读不到请求体。
+            resp = RequestUtils(timeout=15, content_type="application/json").post_json(
+                url, json={"rawTitle": rt, "limit": 5})
+        except Exception as exc:  # noqa: BLE001 - 外部站点异常不能中断整轮刷新
+            self._rss_log("AniBT 匹配异常", rt, str(exc))
+            return []
+        if not isinstance(resp, dict):
+            return []
+        decision = resp.get("decision") or {}
+        if decision.get("kind") not in ("auto", "manual"):
+            self._rss_log("AniBT 无匹配", rt, f"decision={decision.get('kind')}")
+            return []
+        candidates = resp.get("candidates") or []
+        hit_id = decision.get("animeId")
+        # decision 命中的 animeId 提到最前，其余保持接口返回的相关度顺序
+        ordered = sorted(
+            candidates,
+            key=lambda c: 0 if (c.get("animeId") or (c.get("anime") or {}).get("_id")) == hit_id else 1,
+        )
+        titles: List[str] = []
+        for cand in ordered[:3]:
+            anime = cand.get("anime") or {}
+            localized = anime.get("title") or {}
+            for name in (localized.get("chinese"), localized.get("native"),
+                         localized.get("english"), localized.get("romaji"),
+                         anime.get("titleRomaji")):
+                text = name.strip() if isinstance(name, str) else ""
+                if text and text not in titles:
+                    titles.append(text)
+        return titles[:4]
+
+    def _rss_anibt_fallback(self, item: dict, rt: str, reason: str):
+        """AniBT 标题匹配兜底：报文与种子文件名均识别失败时，用 AniBT 解析出的番剧官方标题
+        重新走一遍 MoviePilot 识别。
+
+        返回 (media, meta, rt)；未开启、无匹配或候选标题仍识别不到 TMDB 媒体时返回
+        (None, None, None)。AniBT 官方标题不含集号，命中后用原始发布标题补回季集。
+        """
+        if not self._rss_anibt_match:
+            return None, None, None
+        titles = self._rss_anibt_titles(rt)
+        if not titles:
+            return None, None, None
+        self._rss_log("AniBT 匹配兜底", rt, f"{reason}，候选标题：{' / '.join(titles)}")
+        for name in titles:
+            m, meta, _matched = self._rss_id(item, name)
+            if not m or not meta or not getattr(m, "tmdb_id", None):
+                continue
+            # AniBT 官方标题不含集号，用原始发布标题补回季集
+            meta = self._rss_merge_episode_from_title(meta, rt)
+            self._rss_log("AniBT 匹配命中", rt,
+                          f"改用 AniBT 标题「{name}」→ {getattr(m, 'title', name)}")
+            return m, meta, rt
+        self._rss_log("AniBT 匹配未命中", rt, "候选标题均未识别到 TMDB 媒体")
+        return None, None, None
 
     # ==================== 智能助手识别兜底 ====================
 
