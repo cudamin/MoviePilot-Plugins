@@ -1,10 +1,11 @@
 """
-SpaceCleaner: 空间清理 + 智能RSS下载，共用播放进度缓存。
+SpaceCleaner: 空间清理 + AniBT/RSS 洗版下载，共用播放进度缓存。
 """
 import asyncio, json, os, re, time, threading, shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlsplit
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from app.chain.download import DownloadChain
@@ -44,10 +45,10 @@ class RawTorrent:
 
 
 class SpaceCleaner(_PluginBase):
-    plugin_name = "空间清理＆RSS过滤"
-    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；智能RSS下载自动跳过已看完剧集，识别失败或季号不一致时可由 AniBT 识别补强、智能助手接管识别并自动写入自定义识别词；识别集号比播放缓存中该季最新集数大出阈值时视为识别异常，自动跳过下载（开启智能助手后先由智能助手复核）。"
+    plugin_name = "空间清理&AniBT洗版"
+    plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；AniBT/RSS 洗版下载自动跳过已看完剧集：AniBT 源优先用 RSS 链接里的 bgmId 与 episode 锁定番剧与集号，识别失败时依次由 AniBT 识别补强、智能助手接管识别并自动写入自定义识别词；识别集号比播放缓存中该季最新集数大出阈值时视为识别异常，自动跳过下载（开启智能助手后先由智能助手复核）。"
     plugin_icon = "delete.png"
-    plugin_version = "5.6.0"
+    plugin_version = "5.7.1"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -73,7 +74,8 @@ class SpaceCleaner(_PluginBase):
     # === RSS 下载配置 ===
     _rss_on = False
     _rss_cron = ""
-    _rss_urls = ""
+    _rss_urls = ""  # 其他 RSS 链接（一行一个）
+    _rss_urls_anibt = ""  # AniBT RSS 链接（一行一个，识别优先使用链接中的 bgmId/episode）
     _rss_dl = ""
     _rss_rule_group = ""  # RSS 下载使用的优先级规则组
     _rss_sz = ""
@@ -83,16 +85,21 @@ class SpaceCleaner(_PluginBase):
     _rss_ntf = False
     _rss_th = 85
     _rss_wash_mode = False  # 洗版模式：播放进度低于阈值时触发洗版，只下载最早版本
-    _rss_fname_identify = False  # 种子文件名兜底识别：报文识别失败/无集号/季号不一致时下载种子用文件名再识别
-    _rss_anibt_match = False  # AniBT 识别补强：报文与文件名都识别失败时，用 AniBT torrent-match 解析番剧官方标题再识别
+    _rss_anibt_match = False  # AniBT 识别补强：AniBT 源优先用 torrent-match 解析番剧（含 bgmId）再识别
     _rss_anibt_base = "https://anibt.net"  # AniBT 站点地址（固定值，不开放配置）
     _rss_anibt_max = 10  # 单轮最多调用 AniBT 匹配的次数（固定值，不开放配置）
     _rss_ai_identify = False  # 智能助手识别兜底：识别失败/无集号/季号不一致时交给 LLM 接管识别
     _rss_ai_add_words = True  # 智能助手识别成功后自动写入自定义识别词，避免下次再失败
-    _rss_ai_max = 5  # 单轮 RSS 刷新最多调用智能助手的次数
+    _rss_ai_max = 1  # 单轮 RSS 刷新最多调用智能助手的次数（固定值，不开放配置）
     _rss_ep_gap = 12  # 集号跨度保护：识别集号比播放缓存中该季最新集数大出此值时视为识别异常，跳过下载（开启智能助手时先复核，0 关闭）
     _rss_proxy_retry = True  # 优先使用代理：RSS 刷新与种子获取优先走系统代理，失败自动回退直连
     _rss_save_path = ""  # RSS 下载自定义保存路径
+    # AniBT 链接参数 / 集号定位
+    _ANIBT_EP_TOLERANCE_DAYS = 45  # 按发布时间定位 TMDB 集号的最大容差（天）
+    _ANIBT_PACK_MAX = 300  # AniBT 番剧信息缓存上限
+    _ANIBT_SHOW_MAX = 300  # bgmId → TMDB 剧集 映射缓存上限
+    _ANIBT_TMDB_SEASON_MAX = 200  # TMDB 季清单缓存上限
+    _ANIBT_TMDB_EP_MAX = 300  # TMDB 季集清单缓存上限
 
     # === 种子自动重命名配置 ===
     _rename_on = False  # 启用种子自动重命名
@@ -101,7 +108,7 @@ class SpaceCleaner(_PluginBase):
     _rename_format = ("{{ title }}{% if year %} ({{ year }}){% endif %}"
                       "{% if season_episode %} - {{season_episode}}{% endif %}")
     _rename_once = False  # 立即运行一次
-    _rss_rename_listen = False  # 监听RSS下载：BT动漫RSS下载/洗版板块添加种子到下载器时自动触发重命名
+    _rss_rename_listen = False  # 监听RSS下载：AniBT下载与洗版板块添加种子到下载器时自动触发重命名
     _rename_listen_native = False  # 监听本地下载：MoviePilot 搜索/订阅等添加下载时自动触发重命名（识别不写入独立缓存）
     _rename_skip_tagged = True  # 跳过已打标签的种子，避免重复重命名与重复识别
     _rename_tag = "SC-renamed"  # 重命名成功后打的标签
@@ -142,8 +149,17 @@ class SpaceCleaner(_PluginBase):
     _api_recognize_success_cache: List[dict] = []  # TMDB API 识别成功后的独立正缓存
     _api_recognize_success_cache_max = 100
     _api_recognize_cache_lock = threading.Lock()
-    # AniBT 标题匹配兜底的单轮调用计数
+    # AniBT 匹配（torrent-match）的单轮调用计数
     _rss_anibt_calls = 0
+    _rss_anibt_dirty = False  # AniBT 映射缓存是否有变动待落盘
+    # AniBT 番剧信息缓存：bgm:<bgmId> 或 rt:<规范化标题> -> 番剧包（bgmId/标题/季年份/首播日）
+    _rss_anibt_packs: Dict[str, dict] = {}
+    # bgmId -> TMDB 剧集身份（tmdb_id/标题）
+    _rss_anibt_shows: Dict[str, dict] = {}
+    # TMDB 剧集 -> 季清单（季号/首播日/集数）
+    _rss_tmdb_seasons: Dict[str, List[dict]] = {}
+    # TMDB 剧集+季 -> 集清单（集号/首播日）
+    _rss_tmdb_episodes: Dict[str, List[dict]] = {}
     # 智能助手识别兜底的单轮状态：调用计数与本轮已失败标题（避免同一轮重复烧 token）
     _rss_ai_calls = 0
     _rss_ai_failed: Dict[str, str] = {}
@@ -178,19 +194,18 @@ class SpaceCleaner(_PluginBase):
         self._delete_count = 1
         self._check_cron = "0 */6 * * *"
         self._clean_downloader = []
-        self._rss_cron = self._rss_urls = self._rss_sz = self._rss_inc = self._rss_exc = ""
+        self._rss_cron = self._rss_urls = self._rss_urls_anibt = self._rss_sz = self._rss_inc = self._rss_exc = ""
         self._rss_dl = ""
         self._rss_rule_group = ""
         self._rss_once = self._rss_ntf = False
         self._rss_th = 85
         self._rss_wash_mode = False
-        self._rss_fname_identify = False
         self._rss_anibt_match = False
         self._rss_anibt_base = "https://anibt.net"
         self._rss_anibt_max = 10
         self._rss_ai_identify = False
         self._rss_ai_add_words = True
-        self._rss_ai_max = 5
+        self._rss_ai_max = 1
         self._rss_ep_gap = 12
         self._rss_proxy_retry = True
         self._rss_save_path = ""
@@ -210,6 +225,8 @@ class SpaceCleaner(_PluginBase):
         self._rss_washed = {}
         self._api_recognize_cache = self._load_api_recognize_cache()
         self._api_recognize_success_cache = self._load_api_recognize_success_cache()
+        self._load_anibt_cache()
+        self._rss_anibt_dirty = False
         self._stop_rss_scheduler()
 
         if not config:
@@ -250,6 +267,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_on = bool(config.get("rss_on"))
         self._rss_cron = str(config.get("rss_cron") or "")
         self._rss_urls = str(config.get("rss_urls") or "")
+        self._rss_urls_anibt = str(config.get("rss_urls_anibt") or "")
         self._rss_dl = str(config.get("rss_dl") or "")
         self._rss_rule_group = str(config.get("rss_rule_group") or "")
         self._rss_sz = str(config.get("rss_sz") or "")
@@ -261,11 +279,11 @@ class SpaceCleaner(_PluginBase):
         self._rss_seen = dict.fromkeys(self.get_data("rss_seen") or [])
         self._rss_washed = dict.fromkeys(self.get_data("rss_washed") or [])
         self._rss_wash_mode = bool(config.get("rss_wash_mode"))
-        self._rss_fname_identify = bool(config.get("rss_fname_identify"))
         self._rss_anibt_match = bool(config.get("rss_anibt_match"))
         self._rss_ai_identify = bool(config.get("rss_ai_identify"))
         self._rss_ai_add_words = bool(config.get("rss_ai_add_words", True))
-        self._rss_ai_max = self._to_int(config.get("rss_ai_max"), 5, 1, 50)
+        # 单轮智能助手调用次数固定为 1（不再开放配置）
+        self._rss_ai_max = 1
         self._rss_ep_gap = self._to_int(config.get("rss_ep_gap"), 12, 0, 999)
         self._rss_proxy_retry = bool(config.get("rss_proxy_retry", True))
         self._rss_save_path = str(config.get("rss_save_path") or "")
@@ -288,6 +306,11 @@ class SpaceCleaner(_PluginBase):
         self._rename_tag = str(config.get("rename_tag") or "SC-renamed").strip() or "SC-renamed"
         rename_once = bool(config.get("rename_once"))
 
+        # 旧版只有一个 RSS 链接框：配置里仍有 AniBT 链接（或链接填在 AniBT 栏之外）时
+        # 自动拆到「AniBT RSS」栏并落盘。必须放在所有配置读取之后，否则会把未读取的字段写成默认值。
+        if self._rss_split_urls():
+            self._update_config()
+
         if self._enabled:
             self._start_scheduler()
         if run_now:
@@ -298,9 +321,9 @@ class SpaceCleaner(_PluginBase):
         if self._rss_once:
             self._rss_once = False
             self._update_config()
-            if self._rss_on and self._rss_urls:
+            if self._rss_on and self._rss_sources():
                 threading.Thread(target=self._rss_run, daemon=True, name="SC-RssOnce").start()
-        if self._rss_on and self._rss_cron and self._rss_urls:
+        if self._rss_on and self._rss_cron and self._rss_sources():
             # 重新注册前先停掉上一轮调度器，避免重复保存配置后多个调度器并发跑 RSS
             self._stop_rss_scheduler()
             try:
@@ -343,15 +366,14 @@ class SpaceCleaner(_PluginBase):
             "run_now": False,
             "pb_filter_watched": self._pb_filter_watched, "watched_threshold": self._watched_threshold,
             "rss_on": self._rss_on, "rss_cron": self._rss_cron, "rss_urls": self._rss_urls,
+            "rss_urls_anibt": self._rss_urls_anibt,
             "rss_dl": self._rss_dl, "rss_rule_group": self._rss_rule_group,
             "rss_sz": self._rss_sz, "rss_inc": self._rss_inc,
             "rss_exc": self._rss_exc, "rss_once": self._rss_once, "rss_ntf": self._rss_ntf,
             "rss_th": self._rss_th, "rss_wash_mode": self._rss_wash_mode,
-            "rss_fname_identify": self._rss_fname_identify,
             "rss_anibt_match": self._rss_anibt_match,
             "rss_ai_identify": self._rss_ai_identify,
             "rss_ai_add_words": self._rss_ai_add_words,
-            "rss_ai_max": self._rss_ai_max,
             "rss_ep_gap": self._rss_ep_gap,
             "rss_proxy_retry": self._rss_proxy_retry,
             "rss_save_path": self._rss_save_path,
@@ -738,7 +760,7 @@ class SpaceCleaner(_PluginBase):
         """立即刷新一次 RSS。"""
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False)
-        if not (self._rss_on and self._rss_urls):
+        if not (self._rss_on and self._rss_sources()):
             self._set_notice("RSS 未启用或未配置链接", "warning")
             return schemas.Response(success=True)
         with self._run_lock:
@@ -895,7 +917,7 @@ class SpaceCleaner(_PluginBase):
             ],
         }
 
-        # ---------- BT动漫RSS下载/洗版 ----------
+        # ---------- AniBT下载与洗版 ----------
         rss_form = {
             "component": "VForm",
             "content": [
@@ -907,21 +929,17 @@ class SpaceCleaner(_PluginBase):
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_wash_mode", "label": "洗版模式", "hint": "播放进度低于阈值或无播放缓存时触发洗版，只下载最早发布的版本", "persistent-hint": True}}]},
                 ]},
                 divider,
-                section("识别兜底"),
+                section("识别"),
                 {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_fname_identify", "label": "种子文件名兜底识别", "hint": "报文识别失败、无集号或季号不一致时，下载种子用视频文件名再识别", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_ai_identify", "label": "智能助手识别兜底", "hint": "以上手段仍失败或季号不一致时，交给智能助手（LLM）接管识别", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_anibt_match", "label": "AniBT 识别补强", "hint": "AniBT 源优先用 AniBT 的 torrent-match 解析番剧（含 bgmId 与官方标题）再识别", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_ai_identify", "label": "智能助手识别兜底", "hint": "识别失败、无集号或季号不一致时，交给智能助手（LLM）接管识别", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_ai_add_words", "label": "自动添加自定义识别词", "hint": "智能助手识别成功后写入识别词，下次由 MoviePilot 自行识别", "persistent-hint": True}}]},
                 ]},
                 {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "rss_ai_max", "label": "智能助手单轮调用上限", "type": "number", "min": 1, "max": 50, "hint": "每轮刷新最多调用次数", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
-                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mb-0 h-100"},
-                         "content": [{"component": "div", "props": {"class": "text-caption"}, "text": "识别顺序：RSS报文标题 → 种子文件名 → AniBT 识别补强 → 智能助手。智能助手使用「设定-智能助手」里配置的模型，识别成功后会按 TMDB ID 校验，并（可选）把识别词写入「设定-自定义识别词」，下次相同命名由 MoviePilot 自行识别，不再消耗智能助手额度。"}]}
+                    {"component": "VCol", "props": {"cols": 12}, "content": [
+                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mb-0"},
+                         "content": [{"component": "div", "props": {"class": "text-caption"}, "text": "识别顺序：AniBT 源先用 RSS 链接里的 bgmId 锁定番剧（Bangumi 每季一个条目，等于锁定到哪一季）与 episode 集号，没有再调用 AniBT 识别补强解析番剧，随后按季年份/发布时间把番剧锁定到 TMDB 季集；其他源用 RSS 报文标题识别。全都失败才交给智能助手（每轮最多调用一次）。智能助手使用「设定-智能助手」里配置的模型，识别成功后会按 TMDB ID 校验，并（可选）把识别词写入「设定-自定义识别词」，下次相同命名由 MoviePilot 自行识别，不再消耗智能助手额度。"}]}
                     ]},
-                ]},
-                {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "rss_anibt_match", "label": "AniBT 识别补强", "hint": "报文与文件名都识别失败时，用 AniBT 的 torrent-match 解析番剧官方标题再走一遍识别", "persistent-hint": True}}]},
                 ]},
                 {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "rss_ep_gap", "label": "集号跨度保护阈值（集）", "type": "number", "min": 0, "max": 999, "hint": "识别集号超过该季已缓最新集数达到此值即视为识别异常，0 表示关闭", "persistent-hint": True}}]},
@@ -946,7 +964,10 @@ class SpaceCleaner(_PluginBase):
                 divider,
                 section("RSS 源与过滤"),
                 {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "rss_urls", "label": "RSS链接", "rows": 4, "hint": "支持多个RSS链接，一行一个", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "rss_urls_anibt", "label": "AniBT RSS", "rows": 4, "hint": "AniBT 番剧/订阅 RSS，一行一个。识别优先使用链接里的 bgmId 与 episode（如 /rss/anime.xml?bgmId=515759）", "persistent-hint": True}}]},
+                ]},
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "rss_urls", "label": "其他 RSS", "rows": 4, "hint": "其他站点的 RSS，一行一个", "persistent-hint": True}}]},
                 ]},
                 {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "rss_inc", "label": "包含(正则)", "hint": "示例：字幕组A|字幕组B；| 表示“或”，不区分大小写", "persistent-hint": True}}]},
@@ -962,7 +983,7 @@ class SpaceCleaner(_PluginBase):
                 section("基本设置", first=True),
                 {"component": "VRow", "props": {"dense": True}, "content": [
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rename_on", "label": "启用"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_rename_listen", "label": "监听RSS下载", "hint": "开启后 BT动漫RSS下载/洗版板块添加种子到下载器时自动触发重命名", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rss_rename_listen", "label": "监听RSS下载", "hint": "开启后 AniBT下载与洗版板块添加种子到下载器时自动触发重命名", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rename_listen_native", "label": "监听本地下载", "hint": "开启后 MoviePilot 搜索/订阅等添加下载时自动触发重命名（识别结果不写入插件独立缓存）", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rename_once", "label": "立即运行一次"}}]},
                     {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "rename_skip_tagged", "label": "跳过已处理种子", "hint": "重命名成功后打标签，下次跳过，避免重复识别与改名", "persistent-hint": True}}]},
@@ -994,7 +1015,7 @@ class SpaceCleaner(_PluginBase):
                 "props": {"model": "_active_tab", "color": "primary", "grow": True, "class": "mb-4"},
                 "content": [
                     {"component": "VTab", "props": {"value": "clean"}, "text": "空间清理"},
-                    {"component": "VTab", "props": {"value": "rss"}, "text": "BT动漫RSS下载/洗版"},
+                    {"component": "VTab", "props": {"value": "rss"}, "text": "AniBT下载与洗版"},
                     {"component": "VTab", "props": {"value": "rename"}, "text": "种子自动重命名"},
                 ],
             },
@@ -1015,10 +1036,10 @@ class SpaceCleaner(_PluginBase):
             "dry_run": False, "delete_other_versions": True, "delete_by_record": False, "notify": True,
             "clean_downloader": [], "run_now": False,
             "pb_filter_watched": True, "watched_threshold": 85,
-            "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "",
+            "rss_on": False, "rss_cron": "*/30 * * * *", "rss_urls": "", "rss_urls_anibt": "",
             "rss_dl": "", "rss_rule_group": "", "rss_sz": "", "rss_inc": "", "rss_exc": "",
             "rss_once": False, "rss_ntf": True, "rss_th": 85, "rss_wash_mode": False,
-            "rss_fname_identify": False, "rss_ai_identify": False, "rss_ai_add_words": True, "rss_ai_max": 5,
+            "rss_ai_identify": False, "rss_ai_add_words": True,
             "rss_anibt_match": False,
             "rss_ep_gap": 12,
             "rss_proxy_retry": True, "rss_save_path": "",
@@ -1387,7 +1408,7 @@ class SpaceCleaner(_PluginBase):
             self._chip(f"RSS {'启用' if self._rss_on else '停用'} · 下次 {rss_next}",
                        color="primary" if self._rss_on else "default", icon="mdi-rss"),
             self._chip(f"{'洗版模式' if self._rss_wash_mode else '普通模式'}"
-                       f"{' · 文件名兜底' if self._rss_fname_identify else ''}"
+                       f"{' · AniBT补强' if self._rss_anibt_match else ''}"
                        f"{' · 智能助手' if self._rss_ai_identify else ''}", icon="mdi-magnify-scan"),
             self._chip(f"扫描下载器 {'、'.join(self._clean_downloader) if self._clean_downloader else '全部'}",
                        icon="mdi-harddisk"),
@@ -1404,7 +1425,7 @@ class SpaceCleaner(_PluginBase):
             self._btn("刷新数据", "refresh", icon="mdi-refresh"),
             self._danger_btn(view, "clean", "quick_clean", "立即清理", "mdi-delete-sweep"),
             self._btn("刷新RSS", "rss_run_once", color="primary", icon="mdi-rss",
-                      disabled=not (self._rss_on and bool(self._rss_urls))),
+                      disabled=not (self._rss_on and bool(self._rss_sources()))),
             self._btn("种子重命名", "rename_run_once", color="primary", icon="mdi-rename-box",
                       disabled=not self._rename_on),
         ]})
@@ -1668,9 +1689,12 @@ class SpaceCleaner(_PluginBase):
             self._tile("下载器", self._rss_dl or "默认",
                        f"规则组 {self._rss_rule_group or '不过滤'}"),
         ]
-        url_count = len([u for u in (self._rss_urls or "").split("\n") if u.strip()])
+        sources = self._rss_sources()
+        anibt_count = len([1 for _url, flag in sources if flag])
+        other_count = len(sources) - anibt_count
         info_chips = [
-            self._chip(f"RSS 链接 {url_count} 个", icon="mdi-link-variant"),
+            self._chip(f"AniBT RSS {anibt_count} 个", icon="mdi-link-variant"),
+            self._chip(f"其他 RSS {other_count} 个", icon="mdi-link-variant"),
             self._chip(f"保存路径 {self._rss_save_path or '默认'}", icon="mdi-folder-outline"),
             self._chip(f"体积过滤 {self._rss_sz or '不限'} GB", icon="mdi-scale"),
             self._chip(f"洗版阈值 {self._rss_th}%", icon="mdi-percent-outline"),
@@ -1680,13 +1704,13 @@ class SpaceCleaner(_PluginBase):
         if self._rss_anibt_match:
             info_chips.append(self._chip("AniBT 识别补强", color="info", icon="mdi-magnify-scan"))
         if self._rss_ai_identify:
-            info_chips.append(self._chip(f"智能助手单轮上限 {self._rss_ai_max} 次", color="info",
+            info_chips.append(self._chip("智能助手兜底（每轮 1 次）", color="info",
                                          icon="mdi-robot-outline"))
         toolbar = {"component": "div",
                    "props": {"class": "d-flex flex-wrap align-center ga-2 px-3 py-2"},
                    "content": [
                        self._btn("立即刷新RSS", "rss_run_once", color="primary", icon="mdi-rss",
-                                 disabled=not (self._rss_on and bool(self._rss_urls))),
+                                 disabled=not (self._rss_on and bool(sources))),
                        self._danger_btn(view, "clear_seen", "rss_ca", "清除已处理报文", "mdi-broom"),
                        self._danger_btn(view, "clear_washed", "rss_wash_clear", "清除洗版记录",
                                         "mdi-playlist-remove"),
@@ -1744,7 +1768,8 @@ class SpaceCleaner(_PluginBase):
             {"component": "div", "props": {"class": "pa-3"}, "content": [
                 {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact"},
                  "content": [self._caption("识别顺序：MoviePilot 本地缓存 → 识别成功缓存 → 识别失败缓存（命中则跳过）→ "
-                                           "TMDB API → 种子文件名兜底 → 智能助手。新增自定义识别词后建议清空识别失败缓存，"
+                                           "TMDB API → AniBT 识别 → 智能助手（每轮最多 1 次）。"
+                                           "新增自定义识别词后建议清空识别失败缓存，"
                                            "让对应报文重新识别。")]},
             ]},
         ]
@@ -3229,17 +3254,16 @@ class SpaceCleaner(_PluginBase):
     # ==================== RSS 下载 ====================
 
     def _rss_run(self):
-        if not self._rss_urls:
-            return
-        urls = [u.strip() for u in self._rss_urls.split("\n") if u.strip()]
-        if not urls:
+        sources = self._rss_sources()
+        if not sources:
             return
         with self._run_lock:
             if self._rss_busy:
                 logger.info("SC-RSS 上一轮刷新仍在进行，跳过本次触发")
                 return
             self._rss_busy = True
-        logger.info("SC-RSS 开始运行...")
+        anibt_count = len([1 for _url, is_anibt in sources if is_anibt])
+        logger.info(f"SC-RSS 开始运行...（AniBT 源 {anibt_count} 个 / 其他源 {len(sources) - anibt_count} 个）")
         # 重置 AniBT 匹配与智能助手兜底的单轮预算及失败标题记录
         self._rss_anibt_calls = 0
         self._rss_ai_calls = 0
@@ -3247,16 +3271,19 @@ class SpaceCleaner(_PluginBase):
         try:
             if self._rss_wash_mode:
                 # 洗版模式：先收集所有 URL 的条目，统一去重后再下载
-                self._rss_run_dedup(urls)
+                self._rss_run_dedup(sources)
             else:
                 # 普通模式：逐个 URL 处理
-                for url in urls:
+                for url, _is_anibt in sources:
                     try:
                         self._rss_proc(url)
                     except Exception as e:
                         logger.error(f"RSS url err {url} {e}")
         finally:
             self._rss_busy = False
+            # 运行期间只标记的 AniBT 映射缓存在这里统一落盘
+            if getattr(self, "_rss_anibt_dirty", False):
+                self._save_anibt_cache(force=True)
         logger.info("SC-RSS 运行完成")
 
     def _rss_parse(self, url: str):
@@ -3282,13 +3309,19 @@ class SpaceCleaner(_PluginBase):
             logger.warning(f"SC-RSS 解析 RSS 异常（直连）[{url}]: {e}")
             return False
 
-    def _rss_run_dedup(self, urls: List[str]):
+    def _rss_run_dedup(self, sources: List[Tuple[str, bool]]):
         """洗版模式（一集一个槽位）：收集所有 URL 的 RSS 条目，播放进度低于阈值时触发洗版；
-        同一集有多个版本时只下载最早发布的版本，已洗版下载过的集在后续刷新中不再重复下载。"""
+        同一集有多个版本时只下载最早发布的版本，已洗版下载过的集在后续刷新中不再重复下载。
+
+        AniBT 源（RSS 链接里带 bgmId 的番剧 RSS、或站点在 anibt.net 的订阅 RSS）优先走
+        `_rss_id_anibt`：先用链接里的 bgmId/episode 锁定番剧与集号，必要时由「AniBT 识别补强」
+        先调 torrent-match 解析番剧，再交给 TMDB 识别；失败才回退通用标题识别。
+        """
         from collections import OrderedDict
         all_candidates = OrderedDict()  # dedup_key -> (item, m, meta, s_season, se_fmt, ts)
         total_items = 0
-        for url in urls:
+        for url, is_anibt in sources:
+            feed = self._rss_feed_params(url)
             items = self._rss_parse(url)
             if not items:
                 logger.info(f"SC-RSS 未获取到新报文: {url}")
@@ -3322,28 +3355,29 @@ class SpaceCleaner(_PluginBase):
                         gb = sz / (1024 ** 3)
                         if gb < lo or gb > hi:
                             continue
-                m, meta, video_name = self._rss_id(item, t)
+                m, meta, video_name = None, None, ""
+                if is_anibt:
+                    # AniBT 源：优先用链接里的 bgmId/episode 锁定番剧与季集，
+                    # 未取到 bgmId 时由「AniBT 识别补强」优先调 torrent-match 解析番剧。
+                    m, meta, video_name = self._rss_id_anibt(item, t, feed)
                 if not m or not meta:
-                    fb_m, fb_meta, fb_name = self._rss_filename_fallback(item, t, "报文标题识别失败")
-                    if fb_m and fb_meta:
-                        m, meta, video_name = fb_m, fb_meta, fb_name
-                        self._rss_log("文件名回退命中", getattr(m, "title", t), "改用种子文件名识别结果")
+                    m, meta, video_name = self._rss_id(item, t)
+                if not m or not meta:
+                    # 通用识别失败：非 AniBT 源可由 AniBT 标题匹配兜底，最后交给智能助手
+                    ab_m, ab_meta, ab_name = self._rss_anibt_fallback(item, t, "报文标题识别失败")
+                    if ab_m and ab_meta:
+                        m, meta, video_name = ab_m, ab_meta, ab_name
                     else:
-                        # 报文与文件名都失败：先试 AniBT 标题匹配兜底，再交给智能助手接管识别
-                        ab_m, ab_meta, ab_name = self._rss_anibt_fallback(item, t, "报文与种子文件名均识别失败")
-                        if ab_m and ab_meta:
-                            m, meta, video_name = ab_m, ab_meta, ab_name
+                        # AniBT 也未命中：交给智能助手接管识别（并尝试写入自定义识别词）
+                        ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "报文标题识别失败")
+                        if ai_m and ai_meta:
+                            m, meta, video_name = ai_m, ai_meta, ai_name
                         else:
-                            # AniBT 也未命中：交给智能助手接管识别（并尝试写入自定义识别词）
-                            ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "报文与种子文件名均识别失败")
-                            if ai_m and ai_meta:
-                                m, meta, video_name = ai_m, ai_meta, ai_name
-                            else:
-                                self._rss_log("识别失败", t)
-                                if self._rss_ntf:
-                                    self.post_message(title="SC-RSS识别失败",
-                                                      text=f"资源无法识别: {t}")
-                                continue
+                            self._rss_log("识别失败", t)
+                            if self._rss_ntf:
+                                self.post_message(title="SC-RSS识别失败",
+                                                  text=f"资源无法识别: {t}")
+                            continue
                 # 跳过无 TMDB ID 的识别结果
                 if not m.tmdb_id:
                     ab_m, ab_meta, ab_name = self._rss_anibt_fallback(item, t, "TMDB API 未识别到媒体（无 TMDB ID）")
@@ -3363,14 +3397,6 @@ class SpaceCleaner(_PluginBase):
                 is_tv = (getattr(m, "type", None) == MediaType.TV) or (m.season is not None) or (meta.begin_episode is not None)
                 if is_tv:
                     s_season, s_episode = self._rss_tv_season_episode(m, meta, video_name)
-                    if s_episode is None:
-                        # 报文未解析出集号时，按配置回退到种子文件名识别。
-                        fb_m, fb_meta, fb_name = self._rss_filename_fallback(item, t, "报文未识别到集号")
-                        if fb_m and fb_meta:
-                            m, meta, video_name = fb_m, fb_meta, fb_name
-                            s_season, s_episode = self._rss_tv_season_episode(m, meta, video_name)
-                            if s_episode is not None:
-                                self._rss_log("文件名回退命中", m.title, "改用种子文件名识别集号")
                     # 电视剧无集号则交给智能助手兜底，仍失败才跳过
                     if s_episode is None:
                         ai_m, ai_meta, ai_name = self._rss_ai_fallback(item, t, "电视剧未识别到集号")
@@ -3387,36 +3413,23 @@ class SpaceCleaner(_PluginBase):
                     s_season, s_episode = None, None
                 if is_tv:
                     se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}" if s_episode is not None else f"S{int(s_season):02d}"
-                    # 同一 TMDB 已有播放缓存但季号不一致时，先尝试种子文件名兜底识别，仍不一致才跳过。
+                    # 同一 TMDB 已有播放缓存但季号不一致时，交给智能助手复核季集，仍不一致才跳过。
                     cached_seasons = self._rss_cached_seasons(m.tmdb_id)
                     if cached_seasons and int(s_season) not in cached_seasons:
                         cached_text = "、".join(f"S{season:02d}" for season in cached_seasons)
-                        fb_m, fb_meta, fb_name = self._rss_filename_fallback(
-                            item, t, f"报文季号 {se_fmt} 与播放缓存季（{cached_text}）不一致")
                         fb_ok = False
-                        if fb_m and fb_meta:
-                            fb_season, fb_episode = self._rss_tv_season_episode(fb_m, fb_meta, fb_name)
-                            fb_cached = self._rss_cached_seasons(fb_m.tmdb_id) if fb_m.tmdb_id else []
-                            if fb_episode is not None and (not fb_cached or int(fb_season) in fb_cached):
-                                m, meta, video_name = fb_m, fb_meta, fb_name
-                                s_season, s_episode = fb_season, fb_episode
+                        ai_m, ai_meta, ai_name = self._rss_ai_fallback(
+                            item, t, f"报文季号 {se_fmt} 与播放缓存季（{cached_text}）不一致",
+                            cached_seasons=cached_seasons)
+                        if ai_m and ai_meta:
+                            ai_season, ai_episode = self._rss_tv_season_episode(ai_m, ai_meta, ai_name)
+                            ai_cached = self._rss_cached_seasons(ai_m.tmdb_id) if ai_m.tmdb_id else []
+                            if ai_episode is not None and (not ai_cached or int(ai_season) in ai_cached):
+                                m, meta, video_name = ai_m, ai_meta, ai_name
+                                s_season, s_episode = ai_season, ai_episode
                                 se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}"
-                                self._rss_log("文件名回退命中", m.title, f"改用文件名识别结果 {se_fmt}")
+                                self._rss_log("智能助手兜底命中", m.title, f"改用智能助手识别结果 {se_fmt}")
                                 fb_ok = True
-                        if not fb_ok:
-                            # 文件名兜底仍不一致：交给智能助手接管识别（并尝试写入自定义识别词）
-                            ai_m, ai_meta, ai_name = self._rss_ai_fallback(
-                                item, t, f"报文季号 {se_fmt} 与播放缓存季（{cached_text}）不一致",
-                                cached_seasons=cached_seasons)
-                            if ai_m and ai_meta:
-                                ai_season, ai_episode = self._rss_tv_season_episode(ai_m, ai_meta, ai_name)
-                                ai_cached = self._rss_cached_seasons(ai_m.tmdb_id) if ai_m.tmdb_id else []
-                                if ai_episode is not None and (not ai_cached or int(ai_season) in ai_cached):
-                                    m, meta, video_name = ai_m, ai_meta, ai_name
-                                    s_season, s_episode = ai_season, ai_episode
-                                    se_fmt = f"S{int(s_season):02d}E{int(s_episode):02d}"
-                                    self._rss_log("智能助手兜底命中", m.title, f"改用智能助手识别结果 {se_fmt}")
-                                    fb_ok = True
                         if not fb_ok:
                             self._rss_log("跳过季号不一致", m.title,
                                           f"RSS={se_fmt}，播放缓存季={cached_text}，疑似分季策略不同")
@@ -3997,27 +4010,221 @@ class SpaceCleaner(_PluginBase):
         self.save_data("api_recognize_cache", snapshot)
         logger.info(f"SC-RSS 写入 TMDB API 失败独立缓存（{len(snapshot)}/{self._api_recognize_cache_max}）: {name}")
 
-    def _rss_filename_fallback(self, item: dict, rt: str, reason: str):
-        """在 RSS 报文识别失败或季号不一致时，按配置回退到种子文件名识别。"""
-        if not self._rss_fname_identify:
-            return None, None, ""
-        self._rss_log("文件名回退", rt, reason)
-        return self._rss_id(item, rt, filename_only=True)
+    # ==================== AniBT 源解析与识别（优先） ====================
 
-    # ==================== AniBT 识别补强 ====================
+    _ANIBT_URL_HINTS = ("anibt.net", "anibt.moe")
+    # 番剧标题里的季次标记与年份后缀，识别 TMDB 剧集主条目时先去掉
+    _ANIBT_SEASON_SUFFIX = re.compile(
+        r"\s*(?:第\s*[0-9一二三四五六七八九十]+\s*[季期部]"
+        r"|(?:the\s+)?\d{1,2}\s*(?:st|nd|rd|th)\s+season"
+        r"|season\s*\d{1,2}|part\s*\d{1,2}|cour\s*\d{1,2}"
+        r"|\(\s*(?:19|20)\d{2}\s*\))\s*$", re.IGNORECASE)
+    # AniBT 报文描述首行：<strong>中文名 / 原名</strong> · 集号 · v1
+    _ANIBT_DESC_RE = re.compile(
+        r"<strong>(?P<titles>.+?)</strong>\s*(?:·\s*(?P<ep>[^·<]+?)\s*·)?",
+        re.IGNORECASE | re.DOTALL)
 
-    def _rss_anibt_titles(self, rt: str) -> List[str]:
-        """用发布标题调用 AniBT 的 torrent-match，返回可用于 TMDB 识别的候选标题。
+    @classmethod
+    def _is_anibt_url(cls, url: str) -> bool:
+        """判断 RSS 链接是否属于 AniBT（用于自动分栏与 AniBT 专用识别）。"""
+        raw = (url or "").strip()
+        if not raw:
+            return False
+        try:
+            host = (urlsplit(raw).hostname or "").lower()
+        except Exception:
+            host = ""
+        if not host:
+            low = raw.lower()
+            return any(h in low for h in cls._ANIBT_URL_HINTS)
+        return any(host == h or host.endswith("." + h) for h in cls._ANIBT_URL_HINTS)
 
-        只接受 auto/manual 两种决定：auto 表示 AniBT 已判定唯一番剧，manual 表示有候选但需
-        调用方确认，两者都保留候选标题。标题按中文 → 日文原名 → 英文 → 罗马音排序，便于 TMDB
-        命中。未开启、站点不可达、无匹配或已达单轮调用上限时返回空列表。
+    @staticmethod
+    def _rss_feed_params(url: str) -> dict:
+        """解析 RSS 链接里的查询参数。
+
+        AniBT 番剧 RSS 形如 `/rss/anime.xml?bgmId=515759&episode=3`：
+        bgmId 锁定番剧（Bangumi 每季一个条目，等于锁定到哪一季），episode 是数字集数精确匹配。
+        """
+        params: Dict[str, Any] = {}
+        try:
+            pairs = parse_qs(urlsplit(url or "").query, keep_blank_values=False)
+        except Exception:
+            return params
+
+        def _first(*names: str) -> str:
+            for name in names:
+                values = pairs.get(name) or []
+                if values and str(values[0]).strip():
+                    return str(values[0]).strip()
+            return ""
+
+        bgm = _first("bgmId", "bangumiId")
+        if bgm.isdigit():
+            params["bgmId"] = int(bgm)
+        ep = _first("episode")
+        if ep.isdigit():
+            params["episode"] = int(ep)
+        group = _first("groupSlug", "subgroupSlug", "subgroupid")
+        if group:
+            params["groupSlug"] = group
+        return params
+
+    def _rss_split_urls(self) -> bool:
+        """把「其他 RSS」里残留的 AniBT 链接迁移到「AniBT RSS」栏，返回是否发生迁移。"""
+        other = [u.strip() for u in (self._rss_urls or "").split("\n") if u.strip()]
+        anibt = [u.strip() for u in (self._rss_urls_anibt or "").split("\n") if u.strip()]
+        moved = [u for u in other if self._is_anibt_url(u)]
+        if not moved:
+            return False
+        remain = [u for u in other if not self._is_anibt_url(u)]
+        for url in moved:
+            if url not in anibt:
+                anibt.append(url)
+        self._rss_urls = "\n".join(remain)
+        self._rss_urls_anibt = "\n".join(anibt)
+        logger.info(f"SC-RSS 已把 {len(moved)} 个 AniBT 链接拆分到「AniBT RSS」栏")
+        return True
+
+    def _rss_sources(self) -> List[Tuple[str, bool]]:
+        """返回 [(RSS 链接, 是否 AniBT 源)]，AniBT 源排在最前（识别优先、先下先洗版）。"""
+        sources: List[Tuple[str, bool]] = []
+        for raw, field_is_anibt in ((self._rss_urls_anibt, True), (self._rss_urls, False)):
+            for line in (raw or "").split("\n"):
+                url = line.strip()
+                if not url:
+                    continue
+                sources.append((url, True if field_is_anibt or self._is_anibt_url(url) else False))
+        return sources
+
+    # ---------- 映射缓存 ----------
+
+    def _load_anibt_cache(self) -> None:
+        """载入 AniBT/TMDB 映射缓存（番剧包、bgmId→TMDB 剧集、TMDB 季/集清单）。"""
+        raw = self.get_data("rss_anibt_cache") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        def _slice(key: str, limit: int) -> Dict[str, Any]:
+            value = raw.get(key)
+            if not isinstance(value, dict):
+                return {}
+            return dict(list(value.items())[-limit:])
+
+        self._rss_anibt_packs = _slice("packs", self._ANIBT_PACK_MAX)
+        self._rss_anibt_shows = _slice("shows", self._ANIBT_SHOW_MAX)
+        self._rss_tmdb_seasons = _slice("seasons", self._ANIBT_TMDB_SEASON_MAX)
+        self._rss_tmdb_episodes = _slice("eps", self._ANIBT_TMDB_EP_MAX)
+
+    def _save_anibt_cache(self, force: bool = False) -> None:
+        """落盘 AniBT/TMDB 映射缓存，超出上限时丢弃最早的条目。
+
+        一轮 RSS 刷新里映射缓存可能被更新几十次，运行中只标记待落盘（避免每条报文
+        都写一次插件数据），在 `_rss_run` 结束时统一保存一次。
+        """
+        self._rss_anibt_dirty = True
+        if not force and self._rss_busy:
+            return
+        try:
+            self.save_data("rss_anibt_cache", {
+                "packs": dict(list(self._rss_anibt_packs.items())[-self._ANIBT_PACK_MAX:]),
+                "shows": dict(list(self._rss_anibt_shows.items())[-self._ANIBT_SHOW_MAX:]),
+                "seasons": dict(list(self._rss_tmdb_seasons.items())[-self._ANIBT_TMDB_SEASON_MAX:]),
+                "eps": dict(list(self._rss_tmdb_episodes.items())[-self._ANIBT_TMDB_EP_MAX:]),
+            })
+            self._rss_anibt_dirty = False
+        except Exception as exc:
+            logger.warning(f"SC-RSS 保存 AniBT 映射缓存失败: {exc}")
+
+    # ---------- AniBT 番剧信息 ----------
+
+    @staticmethod
+    def _pack_from_anibt_anime(anime: dict) -> dict:
+        """把 AniBT 的番剧对象整理成识别用的番剧包（bgmId/标题/季年份/首播日）。"""
+        localized = anime.get("title") if isinstance(anime.get("title"), dict) else {}
+        titles: List[str] = []
+        for key in ("chinese", "primary", "chineseTraditional", "japanese", "native",
+                    "english", "romaji"):
+            text = localized.get(key)
+            if isinstance(text, str) and text.strip() and text.strip() not in titles:
+                titles.append(text.strip())
+        romaji = anime.get("titleRomaji")
+        if isinstance(romaji, str) and romaji.strip() and romaji.strip() not in titles:
+            titles.append(romaji.strip())
+        # 首播日在不同接口里的形态不同：torrent-match 是嵌套 premiere{date,precision}，
+        # seasons/anime 是扁平的 premiereDate/premierePrecision，两种都要兼容。
+        premiere = anime.get("premiere") if isinstance(anime.get("premiere"), dict) else {}
+        premiere_date = premiere.get("date") or anime.get("premiereDate")
+        premiere_precision = premiere.get("precision") or anime.get("premierePrecision")
+        bgm_raw = str(anime.get("bgmId") or "")
+        return {
+            "bgmId": int(bgm_raw) if bgm_raw.isdigit() else None,
+            "animeId": anime.get("_id"),
+            "titles": titles,
+            "season": anime.get("season"),
+            "seasonYear": anime.get("seasonYear"),
+            "premiere": str(premiere_date)[:10] if premiere_date else None,
+            "premierePrecision": premiere_precision,
+            "episodes": anime.get("episodes"),
+            "format": anime.get("format"),
+        }
+
+    def _rss_anibt_bgm_pack(self, bgm_id: int) -> Optional[dict]:
+        """按 bgmId 查询 AniBT 番剧信息（官方标题、季年份、首播日），结果落缓存。
+
+        Bangumi 每季一个独立条目、各有 bgmId，所以这里的 seasonYear/premiereDate 就是
+        「该 bgmId 对应哪一季」的权威依据，用于把番剧锁定到正确的 TMDB 季。
+        """
+        try:
+            bgm_id = int(bgm_id)
+        except (TypeError, ValueError):
+            return None
+        key = f"bgm:{bgm_id}"
+        cached = self._rss_anibt_packs.get(key)
+        if cached:
+            return cached
+        base = (self._rss_anibt_base or "").strip().rstrip("/") or "https://anibt.net"
+        try:
+            resp = RequestUtils(timeout=15).get_json(f"{base}/api/seasons/anime?bgmId={bgm_id}")
+        except Exception as exc:  # noqa: BLE001 - 外部站点异常不能中断整轮刷新
+            self._rss_log("AniBT 番剧查询异常", str(bgm_id), str(exc))
+            return None
+        if not isinstance(resp, dict):
+            return None
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+        anime = None
+        for week in (data.get("byWeekday") or []):
+            for item in (week.get("animes") or []):
+                if str(item.get("bgmId")) == str(bgm_id):
+                    anime = item
+                    break
+            if anime:
+                break
+        if anime is None:
+            self._rss_log("AniBT 番剧未收录", str(bgm_id), "该 bgmId 没有可用的番剧信息")
+            return None
+        pack = self._pack_from_anibt_anime(anime)
+        self._rss_anibt_packs[key] = pack
+        self._save_anibt_cache()
+        return pack
+
+    def _rss_anibt_match_pack(self, rt: str) -> Optional[dict]:
+        """用发布标题调用 AniBT torrent-match 解析番剧，返回番剧包（含 bgmId 与官方标题）。
+
+        AniBT 源的识别优先使用该结果：先解析出番剧身份（bgmId + 官方标题），再交给 TMDB
+        识别并按季年份/发布时间锁定季集，而不是等标题识别失败后才兜底。结果按原始标题
+        缓存，同一轮内重复询问不再消耗调用次数；未开启、站点不可达、无匹配或已达单轮
+        调用上限时返回 None。
         """
         if not self._rss_anibt_match or not rt:
-            return []
+            return None
+        cache_key = f"rt:{self._normalize_api_media_name(rt)}"
+        cached = self._rss_anibt_packs.get(cache_key)
+        if cached:
+            return cached
         if self._rss_anibt_calls >= self._rss_anibt_max:
             self._rss_log("AniBT 匹配跳过", rt, f"已达本轮调用上限 {self._rss_anibt_max} 次")
-            return []
+            return None
         base = (self._rss_anibt_base or "").strip().rstrip("/") or "https://anibt.net"
         url = f"{base}/api/animes/torrent-match"
         self._rss_anibt_calls += 1
@@ -4028,13 +4235,13 @@ class SpaceCleaner(_PluginBase):
                 url, json={"rawTitle": rt, "limit": 5})
         except Exception as exc:  # noqa: BLE001 - 外部站点异常不能中断整轮刷新
             self._rss_log("AniBT 匹配异常", rt, str(exc))
-            return []
+            return None
         if not isinstance(resp, dict):
-            return []
+            return None
         decision = resp.get("decision") or {}
         if decision.get("kind") not in ("auto", "manual"):
             self._rss_log("AniBT 无匹配", rt, f"decision={decision.get('kind')}")
-            return []
+            return None
         candidates = resp.get("candidates") or []
         hit_id = decision.get("animeId")
         # decision 命中的 animeId 提到最前，其余保持接口返回的相关度顺序
@@ -4042,9 +4249,12 @@ class SpaceCleaner(_PluginBase):
             candidates,
             key=lambda c: 0 if (c.get("animeId") or (c.get("anime") or {}).get("_id")) == hit_id else 1,
         )
+        pack: Optional[dict] = None
         titles: List[str] = []
         for cand in ordered[:3]:
             anime = cand.get("anime") or {}
+            if pack is None and anime:
+                pack = self._pack_from_anibt_anime(anime)
             localized = anime.get("title") or {}
             for name in (localized.get("chinese"), localized.get("native"),
                          localized.get("english"), localized.get("romaji"),
@@ -4052,11 +4262,411 @@ class SpaceCleaner(_PluginBase):
                 text = name.strip() if isinstance(name, str) else ""
                 if text and text not in titles:
                     titles.append(text)
-        return titles[:4]
+        if pack is None and not titles:
+            return None
+        pack = pack or {}
+        merged = list(dict.fromkeys(list(pack.get("titles") or []) + titles))
+        pack["titles"] = merged
+        if str(decision.get("bgmId") or "").isdigit() and not pack.get("bgmId"):
+            pack["bgmId"] = int(decision["bgmId"])
+        self._rss_anibt_packs[cache_key] = pack
+        self._save_anibt_cache()
+        return pack
+
+    def _rss_anibt_titles(self, rt: str) -> List[str]:
+        """用发布标题调用 AniBT torrent-match，返回可用于 TMDB 识别的候选番剧标题。"""
+        pack = self._rss_anibt_match_pack(rt)
+        return list(pack.get("titles") or [])[:4] if pack else []
+
+    # ---------- 报文提示 / TMDB 识别 / 季集映射 ----------
+
+    @classmethod
+    def _rss_anibt_item_hint(cls, item: dict) -> dict:
+        """从 AniBT 报文描述里提取番剧标题、集号与 TMDB 链接提示。
+
+        AniBT 描述首行固定为 `<strong>中文名 / 原名</strong> · 集号 · v1`；站点已匹配到
+        TMDB 时会附带 `themoviedb.org/tv/<id>` 链接（可直接拿到 TMDB ID）。
+        """
+        desc = str(item.get("description") or "")
+        hint: Dict[str, Any] = {}
+        if not desc:
+            return hint
+        match = cls._ANIBT_DESC_RE.search(desc)
+        if match:
+            titles = [t.strip() for t in re.split(r"\s*/\s*", match.group("titles") or "") if t.strip()]
+            if titles:
+                hint["titles"] = titles
+            ep_text = (match.group("ep") or "").strip()
+            if ep_text:
+                ep_match = re.match(r"^(\d{1,4})", ep_text)
+                if ep_match:
+                    hint["episode"] = int(ep_match.group(1))
+        tmdb_match = re.search(r"themoviedb\.org/(tv|movie)/(\d+)", desc, re.IGNORECASE)
+        if tmdb_match:
+            hint["media_type"] = "tv" if tmdb_match.group(1).lower() == "tv" else "movie"
+            hint["tmdb_id"] = int(tmdb_match.group(2))
+        return hint
+
+    @classmethod
+    def _strip_season_suffix(cls, name: str) -> str:
+        """去掉番剧标题里的季次标记与年份后缀，便于 TMDB 按标题识别剧集主条目。"""
+        text = str(name or "").strip()
+        if not text:
+            return ""
+        previous = None
+        while text and text != previous:
+            previous = text
+            text = cls._ANIBT_SEASON_SUFFIX.sub("", text).strip()
+        return text or str(name or "").strip()
+
+    def _rss_tmdb_api(self):
+        """取正在运行的 TMDB 模块内部 API（用于查季/集清单）。"""
+        try:
+            module = self.chain.modulemanager.get_running_module("TheMovieDbModule")
+        except Exception:
+            module = None
+        return getattr(module, "tmdb", None) if module else None
+
+    def _rss_anibt_show(self, bgm_id: Optional[int], titles: List[str],
+                        tmdb_id: Optional[int] = None) -> Optional[MediaInfo]:
+        """把 AniBT 番剧（bgmId + 官方标题）识别成 TMDB 剧集，结果按 bgmId/标题落缓存。"""
+        if not titles and not tmdb_id:
+            return None
+        if bgm_id:
+            key = f"bgm:{int(bgm_id)}"
+        elif titles:
+            key = f"t:{self._normalize_api_media_name(titles[0])}"
+        else:
+            key = f"tmdb:{int(tmdb_id)}"
+        probe_title = titles[0] if titles else (str(bgm_id) if bgm_id else str(tmdb_id))
+        cached = self._rss_anibt_shows.get(key)
+        if cached and cached.get("tmdb_id"):
+            return MediaInfo(media_source=MediaSource.TMDB, media_id=str(int(cached["tmdb_id"])),
+                             type=MediaType.TV, title=cached.get("title") or probe_title,
+                             tmdb_id=int(cached["tmdb_id"]))
+        tmdb_module = self.chain.modulemanager.get_running_module("TheMovieDbModule")
+        if not tmdb_module:
+            self._rss_log("AniBT识别异常", probe_title, "TMDB 官方识别模块未运行")
+            return None
+        if tmdb_id:
+            try:
+                media = tmdb_module.recognize_media(meta=MetaInfo(title=probe_title), mtype=MediaType.TV,
+                                                    media_source=MediaSource.TMDB,
+                                                    media_id=str(int(tmdb_id)))
+                if media and getattr(media, "tmdb_id", None):
+                    self._rss_anibt_shows[key] = {"tmdb_id": int(media.tmdb_id), "title": media.title}
+                    self._save_anibt_cache()
+                    return media
+            except Exception as exc:
+                self._rss_log("AniBT识别异常", probe_title, f"按 TMDB ID 查询失败: {exc}")
+        cands: List[str] = []
+        for name in titles:
+            base = self._strip_season_suffix(name)
+            if base and base not in cands:
+                cands.append(base)
+        for base in cands:
+            try:
+                probe = MetaInfo(title=base)
+                probe.type = MediaType.TV
+                media = tmdb_module.recognize_media(meta=probe, cache=False)
+            except Exception as exc:
+                self._rss_log("AniBT识别异常", base, f"TMDB 查询失败: {exc}")
+                continue
+            if media and getattr(media, "tmdb_id", None) and getattr(media, "type", None) == MediaType.TV:
+                self._rss_anibt_shows[key] = {"tmdb_id": int(media.tmdb_id), "title": media.title}
+                self._save_anibt_cache()
+                self._rss_log("AniBT番剧命中", base, f"TMDB={media.tmdb_id} 《{media.title}》")
+                return media
+        return None
+
+    def _rss_tmdb_show_seasons(self, tmdb_id: int) -> List[dict]:
+        """取 TMDB 剧集的季清单（季号/首播日/集数），结果落缓存。"""
+        key = str(int(tmdb_id))
+        if key in self._rss_tmdb_seasons:
+            return self._rss_tmdb_seasons[key]
+        seasons: List[dict] = []
+        tmdb = self._rss_tmdb_api()
+        if tmdb:
+            try:
+                info = tmdb.get_info(MediaType.TV, int(tmdb_id))
+            except Exception as exc:
+                info = None
+                self._rss_log("TMDB 季清单异常", key, str(exc))
+            for item in ((info or {}).get("seasons") or []):
+                try:
+                    number = int(item.get("season_number"))
+                except (TypeError, ValueError):
+                    continue
+                seasons.append({"season": number,
+                                "air_date": str(item.get("air_date") or "")[:10],
+                                "episodes": item.get("episode_count") or 0})
+        self._rss_tmdb_seasons[key] = seasons
+        self._save_anibt_cache()
+        return seasons
+
+    def _rss_tmdb_season_episodes(self, tmdb_id: int, season: int) -> List[dict]:
+        """取 TMDB 某一季的集清单（集号/首播日），结果落缓存。"""
+        key = f"{int(tmdb_id)}:{int(season)}"
+        if key in self._rss_tmdb_episodes:
+            return self._rss_tmdb_episodes[key]
+        episodes: List[dict] = []
+        tmdb = self._rss_tmdb_api()
+        if tmdb:
+            try:
+                detail = tmdb.get_tv_season_detail(int(tmdb_id), int(season))
+            except Exception as exc:
+                detail = None
+                self._rss_log("TMDB 季集清单异常", key, str(exc))
+            for ep in ((detail or {}).get("episodes") or []):
+                try:
+                    number = int(ep.get("episode_number"))
+                except (TypeError, ValueError):
+                    continue
+                air_date = str(ep.get("air_date") or "")[:10]
+                if air_date:
+                    episodes.append({"episode": number, "air_date": air_date})
+        self._rss_tmdb_episodes[key] = episodes
+        self._save_anibt_cache()
+        return episodes
+
+    def _rss_match_premiere(self, tmdb_id: int, main: List[dict], premiere: str,
+                            hint_ep: Optional[int]
+                            ) -> Optional[Tuple[int, Optional[int], str]]:
+        """用「番剧第 1 集首播日」把 AniBT 的 bgmId 锁定到 TMDB 季，并算出集号偏移。
+
+        只在首播年份相近的季里查找（通常 1-2 个季），避免为每季都请求一次逐集清单；
+        匹配到最接近 premiere 的 TMDB 集后，偏移 = 该集号 - 1，即 Bangumi 集号 + 偏移
+        就是 TMDB 集号。结果不是有效集号时返回 None，由调用方继续用其他策略。
+        """
+        try:
+            pdate = datetime.strptime(str(premiere)[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+        cands: List[dict] = []
+        for season_info in main:
+            air = str(season_info.get("air_date") or "")[:4]
+            if air.isdigit() and abs(int(air) - pdate.year) <= 1:
+                cands.append(season_info)
+        if not cands:
+            # TMDB 把多季合并进同一季时，该季首播年份会明显早于本 bgmId 的首播年份；
+            # 这里放宽为「季首播不晚于本番剧首播」的季，按最近首播优先，最多探测 3 个季。
+            earlier = [s for s in main if str(s.get("air_date") or "9999-99-99") <= premiere]
+            cands = sorted(earlier, key=lambda item: item.get("air_date") or "", reverse=True)[:3]
+        if not cands:
+            return None
+        best: Optional[Tuple[int, int, str, int]] = None
+        for season_info in cands[:4]:
+            for ep in self._rss_tmdb_season_episodes(tmdb_id, int(season_info["season"])):
+                air_date = ep.get("air_date") or ""
+                if not air_date:
+                    continue
+                try:
+                    delta = abs((datetime.strptime(air_date, "%Y-%m-%d") - pdate).days)
+                except ValueError:
+                    continue
+                if delta > self._ANIBT_EP_TOLERANCE_DAYS:
+                    continue
+                if best is None or delta < best[3]:
+                    best = (int(season_info["season"]), int(ep["episode"]), air_date, delta)
+        if not best:
+            return None
+        season_num, tmdb_first, air_date, _delta = best
+        note = (f"番剧第 1 集首播 {premiere} 对齐 TMDB "
+                f"S{season_num:02d}E{tmdb_first:02d}（首播 {air_date}）")
+        offset = tmdb_first - 1
+        if hint_ep is None:
+            return int(season_num), tmdb_first, note
+        note += f"，集号偏移 {offset:+d}"
+        target = hint_ep + offset
+        if target < 1:
+            return None
+        return int(season_num), target, note
+
+    def _rss_pick_tmdb_season(self, tmdb_id: int, pack: Optional[dict],
+                              pub_ts: Optional[float], episode: Optional[int]
+                              ) -> Optional[Tuple[int, Optional[int], str]]:
+        """把 AniBT 番剧（bgmId 锁定的那一季）映射到 TMDB 的季/集。
+
+        返回 (季号, 集号, 说明)；无法可靠映射时返回 None（此时沿用标题解析出的季集）。
+
+        首选「番剧第 1 集首播日」锚点：AniBT 给出的 premiereDate 就是该 bgmId 第 1 集的首播日，
+        在 TMDB 中查到该日期对应的集号即可得到稳定偏移（TMDB 集号 - Bangumi 集号）。这样既处理
+        「TMDB 与 Bangumi 一样逐季拆分」的情形，也处理「TMDB 把多季合并进同一季」的情形
+        （例如芙莉莲 TMDB S01 有 38 集，Bangumi 第二季的 E01 对应 TMDB S01E29），
+        而且不受字幕组延迟发布（同一集几天后才放出）影响。
+        首播日缺失或对不上时，退回用资源发布时间对齐，再退回季年份/单季对齐。
+        """
+        seasons = self._rss_tmdb_show_seasons(tmdb_id)
+        main = [s for s in seasons if int(s.get("season") or 0) >= 1]
+        if not main:
+            return None
+        year = str((pack or {}).get("seasonYear") or "").strip()
+        hint_ep = int(episode) if episode is not None else None
+        season_total = {int(s["season"]): int(s.get("episodes") or 0) for s in main}
+        declare_eps = int((pack or {}).get("episodes") or 0)
+        # 同一 bgmId 下的资源集号语义不统一：WEB 放送用季内集号（1..N），BD 合集/单集常用
+        # 跨季连续编号（如芙莉莲第二季的 29-38）。报文集号超出 AniBT 声明的该季集数时按
+        # 连续编号处理，不再叠加偏移，沿用标题解析结果更安全。
+        if hint_ep is not None and declare_eps and hint_ep > declare_eps:
+            self._rss_log("AniBT集号超出番剧集数", f"bgmId={self._anibt_pack_bgm(pack)}",
+                          f"报文集号 E{hint_ep:02d} 超出 AniBT 声明集数 {declare_eps}"
+                          "（疑似跨季连续编号），沿用标题解析结果")
+            return None
+
+        def _keep(season: int, ep: Optional[int], note: str):
+            total = season_total.get(int(season)) or 0
+            if ep is not None and total and int(ep) > total:
+                self._rss_log("AniBT季映射越界", f"bgmId={self._anibt_pack_bgm(pack)}",
+                              f"映射结果 S{int(season):02d}E{int(ep):02d} 超出 TMDB 该季集数 "
+                              f"{total}，沿用标题解析结果")
+                return None
+            return int(season), ep, note
+
+        premiere = str((pack or {}).get("premiere") or "")[:10]
+        # 只有精确到日的首播日才用作锚点（AniBT 的 premierePrecision 可能是季/月）
+        if premiere and str((pack or {}).get("premierePrecision") or "day").lower() == "day":
+            anchored = self._rss_match_premiere(tmdb_id, main, premiere, hint_ep)
+            if anchored:
+                return _keep(anchored[0], anchored[1], anchored[2])
+
+        if pub_ts:
+            pub_date = datetime.fromtimestamp(float(pub_ts)).strftime("%Y-%m-%d")
+            ordered = sorted([s for s in main if s.get("air_date")],
+                             key=lambda item: item["air_date"])
+            if ordered:
+                started = [s for s in ordered if s["air_date"] <= pub_date]
+                later = [s for s in ordered if s["air_date"] > pub_date]
+                probe = started[-2:] + later[:1]
+                # 候选排序键：优先「首播日不晚于发布日且最接近发布日」的集（delta 最小且非负），
+                # 只有不存在这样的候选时才用「发布日略早于首播日」的集，避免提早放出时选到更晚的集。
+                best: Optional[Tuple[int, int, str, Tuple[int, int]]] = None
+                for season_info in probe:
+                    for ep in self._rss_tmdb_season_episodes(tmdb_id, int(season_info["season"])):
+                        air_date = ep.get("air_date") or ""
+                        if not air_date:
+                            continue
+                        try:
+                            delta = (datetime.strptime(pub_date, "%Y-%m-%d")
+                                     - datetime.strptime(air_date, "%Y-%m-%d")).days
+                        except ValueError:
+                            continue
+                        # 允许发布日略早于首播日（资源提早放出），但不接受超前太多
+                        if delta < -3 or delta > self._ANIBT_EP_TOLERANCE_DAYS:
+                            continue
+                        if hint_ep is not None and int(ep["episode"]) - hint_ep < 0:
+                            continue
+                        rank = (0 if delta >= 0 else 1, abs(delta))
+                        if best is None or rank < best[3]:
+                            best = (int(season_info["season"]), int(ep["episode"]), air_date, rank)
+                if best:
+                    season_num, tmdb_ep, air_date, _rank = best
+                    note = f"按发布时间 {pub_date} 对齐 TMDB S{season_num:02d}E{tmdb_ep:02d}（首播 {air_date}）"
+                    if hint_ep is not None:
+                        offset = tmdb_ep - hint_ep
+                        if 0 <= offset <= 200:
+                            note += f"，集号偏移 {offset:+d}"
+                            return _keep(season_num, hint_ep + offset, note)
+                    return _keep(season_num, tmdb_ep, note)
+        if year:
+            same = [s for s in main if str(s.get("air_date") or "")[:4] == year]
+            if len(same) == 1:
+                season_num = int(same[0]["season"])
+                return _keep(season_num, hint_ep, f"番剧季年份 {year} → TMDB S{season_num:02d}")
+            if len(same) > 1:
+                # 同一年有多个季，无法判定 bgmId 对应哪一季，交给调用方沿用标题解析结果
+                return None
+        if len(main) == 1:
+            season_num = int(main[0]["season"])
+            declare_eps = int((pack or {}).get("episodes") or 0)
+            tmdb_eps = int(main[0].get("episodes") or 0)
+            # TMDB 只有一季、但集数与该 bgmId 的集数不一致时（常见于 TMDB 把多个 Bangumi
+            # 条目合并进同一季），无法可靠推断集号偏移，返回 None 让调用方沿用标题解析结果，
+            # 避免按错误季集入库。
+            if declare_eps and tmdb_eps and declare_eps != tmdb_eps:
+                self._rss_log("AniBT季映射未定", f"bgmId={self._anibt_pack_bgm(pack)}",
+                              f"AniBT 声明的集数 {declare_eps} 与 TMDB 单季集数 {tmdb_eps} 不一致，"
+                              "沿用标题解析结果")
+                return None
+            return _keep(season_num, hint_ep, f"TMDB 仅一季 → S{season_num:02d}")
+        return None
+
+    @staticmethod
+    def _anibt_pack_bgm(pack: Optional[dict]) -> str:
+        """取番剧包里的 bgmId 文本，仅用于日志展示。"""
+        return str((pack or {}).get("bgmId") or "-")
+
+    def _rss_id_anibt(self, item: dict, rt: str, feed: Optional[dict] = None):
+        """AniBT 源专用识别（优先于通用标题识别）。
+
+        识别顺序：RSS 链接参数（bgmId 锁番剧/季、episode 精确集号）→ AniBT 识别补强
+        （torrent-match，优先调用取官方标题与 bgmId）→ 报文描述里的番剧标题/集号提示
+        → TMDB 识别番剧 → 按季年份/发布时间把番剧锁定到 TMDB 季集。任一步拿不到 TMDB
+        媒体时返回 (None, None, "")，由调用方回退到通用标题识别。
+        """
+        feed = feed or {}
+        hint = self._rss_anibt_item_hint(item)
+        if hint.get("media_type") == "movie":
+            return None, None, ""
+        bgm_id = feed.get("bgmId")
+        pack = self._rss_anibt_bgm_pack(bgm_id) if bgm_id else None
+        if not pack and self._rss_anibt_match:
+            # AniBT 识别补强：先用 torrent-match 解析番剧（不再是兜底）
+            pack = self._rss_anibt_match_pack(rt)
+        if pack and pack.get("bgmId") and not bgm_id:
+            bgm_id = int(pack["bgmId"])
+            bgm_pack = self._rss_anibt_bgm_pack(bgm_id)
+            if bgm_pack:
+                merged = {**pack, **{k: v for k, v in bgm_pack.items() if v}}
+                merged["titles"] = list(dict.fromkeys(list(bgm_pack.get("titles") or [])
+                                                      + list(pack.get("titles") or [])))
+                pack = merged
+        titles = list(pack.get("titles") or []) if pack else []
+        for name in (hint.get("titles") or []):
+            if name not in titles:
+                titles.append(name)
+        tmdb_hint = hint.get("tmdb_id") if hint.get("media_type") in (None, "tv") else None
+        if not titles and not tmdb_hint:
+            self._rss_log("AniBT识别跳过", rt, "未取得番剧标题，回退通用识别")
+            return None, None, ""
+        if bgm_id:
+            first_title = ((pack or {}).get("titles") or [""])[0]
+            self._rss_log("AniBT识别", rt,
+                          f"bgmId={bgm_id}"
+                          + (f"，番剧《{first_title}》" if first_title else "")
+                          + (f"，季年份 {pack.get('seasonYear')}" if pack and pack.get("seasonYear") else ""))
+        media = self._rss_anibt_show(bgm_id, titles, tmdb_hint)
+        if not media or not getattr(media, "tmdb_id", None):
+            self._rss_log("AniBT识别未命中", rt,
+                          f"候选番剧标题未识别到 TMDB 媒体：{' / '.join(titles[:4])}")
+            return None, None, ""
+        meta = MetaInfo(title=rt)
+        episode = feed.get("episode") or hint.get("episode")
+        if episode is None:
+            meta = self._rss_merge_episode_from_title(meta, rt)
+            episode = meta.begin_episode
+        pub_ts = self._rss_pubts(item)
+        season = None
+        note = ""
+        mapped = self._rss_pick_tmdb_season(int(media.tmdb_id), pack, pub_ts, episode)
+        if mapped:
+            season, mapped_ep, note = mapped
+            if mapped_ep is not None:
+                episode = mapped_ep
+        if episode is None:
+            self._rss_log("AniBT识别未取到集号", rt, "回退通用识别")
+            return None, None, ""
+        if season is None:
+            season = getattr(meta, "begin_season", None) or 1
+        meta.begin_season = int(season)
+        meta.begin_episode = int(episode)
+        self._rss_log("AniBT识别命中", rt,
+                      f"《{media.title}》 TMDB={media.tmdb_id} S{int(season):02d}E{int(episode):02d}"
+                      + (f"（{note}）" if note else "（沿用标题解析季号）"))
+        return media, meta, rt
 
     def _rss_anibt_fallback(self, item: dict, rt: str, reason: str):
-        """AniBT 标题匹配兜底：报文与种子文件名均识别失败时，用 AniBT 解析出的番剧官方标题
-        重新走一遍 MoviePilot 识别。
+        """AniBT 标题匹配兜底（用于非 AniBT 源）：用 AniBT 解析出的番剧官方标题重新走一遍
+        MoviePilot 识别。
 
         返回 (media, meta, rt)；未开启、无匹配或候选标题仍识别不到 TMDB 媒体时返回
         (None, None, None)。AniBT 官方标题不含集号，命中后用原始发布标题补回季集。
@@ -4136,8 +4746,7 @@ class SpaceCleaner(_PluginBase):
             return None
         return data if isinstance(data, dict) else None
 
-    def _rss_ai_prompt(self, rt: str, reason: str, meta, cached_seasons: Optional[List[int]],
-                       file_names: Optional[List[str]] = None) -> str:
+    def _rss_ai_prompt(self, rt: str, reason: str, meta, cached_seasons: Optional[List[int]]) -> str:
         """构造智能助手识别提示词：给出原始命名、MoviePilot 解析结果与识别词格式说明。"""
         hint_lines = []
         if meta is not None:
@@ -4146,11 +4755,9 @@ class SpaceCleaner(_PluginBase):
             hint_lines.append(f"解析集号: {getattr(meta, 'begin_episode', None)}")
             hint_lines.append(f"套用的自定义识别词: {getattr(meta, 'apply_words', None) or '无'}")
         cached_text = "、".join(f"S{s:02d}" for s in (cached_seasons or [])) or "无"
-        files_text = "\n".join(f"- {n}" for n in (file_names or [])[:8]) or "（未获取）"
         return (
             "你是 MoviePilot 的媒体识别专家。下面是一条 BT/RSS 资源的原始命名，MoviePilot 未能正确识别，请你判断它到底是哪部影视作品的第几季第几集。\n\n"
             f"【原始报文标题】\n{rt}\n\n"
-            f"【种子内视频文件名】\n{files_text}\n\n"
             f"【MoviePilot 当前解析结果】\n" + ("\n".join(hint_lines) or "（无）") + "\n\n"
             f"【本地媒体库/播放缓存中该剧已有的季】\n{cached_text}\n\n"
             f"【触发原因】\n{reason}\n\n"
@@ -4343,9 +4950,8 @@ class SpaceCleaner(_PluginBase):
                          cached_seasons: Optional[List[int]] = None):
         """智能助手识别兜底。
 
-        触发场景：RSS 报文与种子文件名都识别失败、未识别到 TMDB ID、电视剧无集号，
-        识别出的季号与本地播放缓存的分季策略不一致，或识别集号超出播放缓存该季
-        最新集数达到「集号跨度保护」阈值。
+        触发场景：报文标题识别失败、未识别到 TMDB ID、电视剧无集号、识别出的季号与本地
+        播放缓存的分季策略不一致，或识别集号超出播放缓存该季最新集数达到「集号跨度保护」阈值。
 
         流程：把原始命名、MoviePilot 解析结果、本地已有季交给「设定-智能助手」配置的
         LLM，要求返回 JSON（标题/类型/TMDB ID/季集 + 一条自定义识别词）；随后
@@ -4357,6 +4963,7 @@ class SpaceCleaner(_PluginBase):
         集号跨度保护：智能助手给出的季集若仍比播放缓存中该季最新集数大出阈值，
         说明复核没有得到可信的季集，此时直接拒绝（同时不写入自定义识别词）。
 
+        单轮最多调用一次（`_rss_ai_max` 固定为 1），避免一轮刷新里反复烧 token。
         返回 (media, meta, name)，失败返回 (None, None, "")。
         """
         if not self._rss_ai_identify:
@@ -4376,15 +4983,9 @@ class SpaceCleaner(_PluginBase):
             base_meta = MetaInfo(title=rt)
         except Exception:
             pass
-        file_names = []
-        if self._rss_fname_identify:
-            try:
-                file_names = self._rss_fnames(item.get("enclosure", "") or item.get("link", ""))
-            except Exception:
-                file_names = []
 
         try:
-            reply = self._rss_ai_ask(self._rss_ai_prompt(rt, reason, base_meta, cached_seasons, file_names))
+            reply = self._rss_ai_ask(self._rss_ai_prompt(rt, reason, base_meta, cached_seasons))
         except Exception as exc:
             self._rss_log("智能助手调用失败", rt, str(exc))
             if key:
@@ -4504,11 +5105,8 @@ class SpaceCleaner(_PluginBase):
             )
         return media, meta, rt
 
-    def _rss_id(self, item: dict, rt: str, filename_only: bool = False):
-        """洗版模式：优先识别 RSS 报文，必要时用种子文件名回退识别。
-
-        默认先使用 RSS 报文标题识别；filename_only 为 True 时仅下载种子并使用视频文件名识别，
-        供报文识别失败、缺少集号或季号与播放缓存不一致时回退使用。
+    def _rss_id(self, item: dict, rt: str):
+        """洗版模式：用 RSS 报文标题识别（AniBT 源由 _rss_id_anibt 优先处理）。
 
         识别时统一走 MoviePilot 的 MetaInfo()，它在解析前会自动套用用户在
         “设定-自定义识别词”里配置的识别词（屏蔽/替换/集偏移等），套用结果记录在
@@ -4523,9 +5121,6 @@ class SpaceCleaner(_PluginBase):
         以及最终 TMDB 命中结果，便于排查识别错误。
 
         返回 (media, meta, title_name)，title_name 为用于识别的候选名称。"""
-        # 仅 filename_only 回退分支下载种子；默认报文识别不下载种子。
-        enc = item.get("enclosure", "") or item.get("link", "")
-        fns = self._rss_fnames(enc) if filename_only and self._rss_fname_identify else []
         # 当前 RSS 资源内暂存所有失败候选；所有候选全部失败时才落盘负缓存。
         failed_candidates: Dict[str, str] = {}
 
@@ -4588,46 +5183,6 @@ class SpaceCleaner(_PluginBase):
             self._rss_log("识别未命中", title, "TMDB 官方 API 未匹配到媒体，暂存失败候选")
             return None, meta, False
 
-        file_media, file_meta, file_base = None, None, ""
-        # 仅在回退分支使用种子内视频文件名识别。
-        if filename_only and fns:
-            self._rss_log("识别", rt, f"种子含 {len(fns)} 个文件，优先用视频文件名识别")
-            best_file_media, best_file_meta, best_file_base = None, None, ""
-            for fn in fns:
-                try:
-                    base = fn.rsplit("/", 1)[-1]
-                    media, meta, ok = _try_recognize(base, source_label="文件名候选")
-                    if not ok:
-                        continue
-                    # 优先选用带集号的识别结果
-                    if meta.begin_episode is not None:
-                        return media, meta, base
-                    if best_file_media is None:
-                        best_file_media, best_file_meta, best_file_base = media, meta, base
-                except Exception as ex:
-                    self._rss_log("识别异常", fn, str(ex))
-                    continue
-            # 所有文件名候选都无集号，保留第一个成功的，从原始标题补充集号
-            if best_file_media is not None:
-                media, meta, base = best_file_media, best_file_meta, best_file_base
-                meta = self._rss_merge_episode_from_title(meta, rt)
-                if meta.begin_episode is not None:
-                    return media, meta, base
-                # 文件名识别无集号且标题补充失败：继续回退标题识别兜底
-                self._rss_log("文件名无集号", rt, "视频文件名无法解析集号，回退标题识别")
-                file_media, file_meta, file_base = media, meta, base
-            else:
-                file_media, file_meta, file_base = None, None, ""
-        if filename_only:
-            # 电视剧回退只接受带集号的结果，避免把整季文件误当作单集下载；电影没有集号，直接接受。
-            if file_media is not None and file_meta is not None:
-                is_movie = getattr(file_media, "type", None) == MediaType.MOVIE
-                if file_meta.begin_episode is not None or is_movie:
-                    return file_media, file_meta, file_base
-            for failed_key, failed_name in failed_candidates.items():
-                self._save_api_negative_cache(failed_key, failed_name)
-            return None, None, ""
-
         # 直接使用 RSS 报文标题识别：按 "/" 拆分的不同译名逐个作为候选
         # （每个候选 = 译名 + 集号/质量标记，避免多个译名合并识别导致失败）。
         cands = self._rss_title_candidates(rt)
@@ -4646,9 +5201,6 @@ class SpaceCleaner(_PluginBase):
             self._rss_log("识别回退", best_c, "所有候选均无集号，从原始标题补充")
             meta = self._rss_merge_episode_from_title(best_meta, rt)
             return best_media, meta, best_c
-        # 标题识别全部失败：若文件名识别有成功结果（仅缺集号），返回该结果避免误写负缓存
-        if file_media is not None:
-            return file_media, file_meta, file_base
 
         # 所有标题候选均失败后，才写入负缓存；同一标题只写一条。
         for failed_key, failed_name in failed_candidates.items():
@@ -4686,10 +5238,6 @@ class SpaceCleaner(_PluginBase):
                 cands.append(cand)
         return cands or [rt]
 
-    # 视频文件扩展名（种子文件名识别时按这些扩展名筛选文件）
-    _VIDEO_EXTS_TORRENT = (".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".wmv", ".mov",
-                   ".flv", ".rmvb", ".rm", ".mpg", ".mpeg", ".webm", ".iso")
-
     @staticmethod
     def _rss_http_torrent(enc: str, proxies: Optional[dict] = None) -> Tuple[Optional[bytes], str]:
         """请求 .torrent 文件内容，返回 (内容, 错误信息)。"""
@@ -4721,40 +5269,6 @@ class SpaceCleaner(_PluginBase):
             return content
         logger.warning(f"SC-RSS 下载种子文件失败{tag}: {enc} {err}")
         return None
-
-    def _rss_fnames(self, enc: str) -> List[str]:
-        """下载种子文件并解析文件列表，仅返回视频文件（按体积从大到小），
-        无视频文件时回退到全部文件名。"""
-        if not enc:
-            return []
-        try:
-            import bencode
-
-            content = self._rss_fetch_torrent(enc, tag="（文件名识别）")
-            if not content:
-                return []
-            t = bencode.bdecode(content)
-            info = t.get("info", {})
-            files = info.get("files", [])
-            if files:
-                all_files = []  # (path, length)
-                for f in files:
-                    parts = [p.decode("utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p in f.get("path", [])]
-                    if parts:
-                        all_files.append(("/".join(parts), f.get("length", 0) or 0))
-                # 优先取视频文件，按体积从大到小（正片通常最大）
-                videos = [(p, l) for p, l in all_files if p.lower().endswith(self._VIDEO_EXTS_TORRENT)]
-                if videos:
-                    videos.sort(key=lambda x: x[1], reverse=True)
-                    return [p for p, _ in videos]
-                return [p for p, _ in all_files]
-            name = info.get("name", "")
-            if isinstance(name, bytes):
-                name = name.decode("utf-8", errors="replace")
-            return [name] if name else []
-        except Exception as exc:
-            logger.warning(f"SC-RSS 解析种子文件失败: {enc} err={exc}")
-            return []
 
     def _rss_merge_episode_from_title(self, meta, rt: str):
         """当 MetaInfo 解析结果缺少集号时，从原始 RSS 标题中重新提取季集信息，
