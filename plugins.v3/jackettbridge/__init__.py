@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import copy
+import hashlib
 import re
 import sys
 import threading
@@ -7,10 +8,11 @@ import time
 import traceback
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, quote_plus, urlparse
+from urllib.parse import quote_plus, urlencode, urlparse
 
 import requests
 from apscheduler.triggers.cron import CronTrigger
@@ -18,12 +20,12 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.application.configuration import get_configured_system_config
 from app.db.oper.site import SiteOper
+from app.plugins import _PluginBase
+from app.schemas.types import EventType, MediaSource, MediaType, SystemConfigKey
 from app.sdk.config import settings
 from app.sdk.logging import logger
 from app.sdk.media import TorrentInfo
 from app.sdk.network import RequestUtils, SitesHelper
-from app.plugins import _PluginBase
-from app.schemas.types import EventType, MediaSource, MediaType, SystemConfigKey
 
 # Torznab 命名空间
 TORZNAB_NS = "http://torznab.com/schemas/2015/feed"
@@ -31,6 +33,8 @@ TORZNAB_NS = "http://torznab.com/schemas/2015/feed"
 DEFAULT_CRON = "0 0 * * *"
 # 默认检索超时（秒）
 DEFAULT_SEARCH_TIMEOUT = 30
+# 插件资源源整次检索默认总时限（秒），避免单个慢索引器拖住整次搜索
+DEFAULT_SEARCH_BUDGET = 15
 # 默认单个索引器返回条数
 DEFAULT_RESULT_NUM = 100
 # 插件资源源并发检索的索引器数量上限
@@ -82,7 +86,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.3.9"
+    plugin_version = "1.3.10"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -96,6 +100,14 @@ class JackettBridge(_PluginBase):
     # 可使用的用户级别
     auth_level = 1
 
+    def __init__(self) -> None:
+        """
+        初始化插件运行期资源。
+        """
+        super().__init__()
+        self._sync_stop_event = threading.Event()
+        self._sync_thread: Optional[threading.Thread] = None
+
     # 虚拟站点域名前缀与后缀
     domain_prefix = "jackett-"
     domain_suffix = "extend"
@@ -108,6 +120,7 @@ class JackettBridge(_PluginBase):
     _password = ""
     _cron = DEFAULT_CRON
     _search_timeout = DEFAULT_SEARCH_TIMEOUT
+    _search_budget = DEFAULT_SEARCH_BUDGET
     _result_num = DEFAULT_RESULT_NUM
     _indexers_authoritative = False
     # 以下列表在 init_plugin 中整体重新赋值，不做原地修改
@@ -125,6 +138,8 @@ class JackettBridge(_PluginBase):
         根据插件配置初始化运行状态，并在需要时后台同步索引器。
         """
         self.stop_service()
+        self._sync_stop_event = threading.Event()
+        self._sync_thread = None
         self.sites_helper = SitesHelper()
         self.site_oper = SiteOper()
         self._enabled = False
@@ -134,6 +149,7 @@ class JackettBridge(_PluginBase):
         self._password = ""
         self._cron = DEFAULT_CRON
         self._search_timeout = DEFAULT_SEARCH_TIMEOUT
+        self._search_budget = DEFAULT_SEARCH_BUDGET
         self._result_num = DEFAULT_RESULT_NUM
         self._selected_indexers: List[str] = []
         self._indexer_catalog: List[Dict[str, str]] = []
@@ -159,6 +175,7 @@ class JackettBridge(_PluginBase):
         self._password = str(config.get("password") or "")
         self._cron = str(config.get("cron") or "").strip() or DEFAULT_CRON
         self._search_timeout = self.__to_int(config.get("search_timeout"), DEFAULT_SEARCH_TIMEOUT, 5, 600)
+        self._search_budget = self.__to_int(config.get("search_budget"), DEFAULT_SEARCH_BUDGET, 5, 120)
         self._result_num = self.__to_int(config.get("result_num"), DEFAULT_RESULT_NUM, 10, 500)
         # 表单保存时可能不带多选快照，回退到已保存配置
         self._selected_indexers = self.__normalize_str_list(
@@ -169,30 +186,38 @@ class JackettBridge(_PluginBase):
             config.get("indexer_catalog")
         ) or self.__normalize_catalog(saved_config.get("indexer_catalog"))
 
+        if self._onlyonce:
+            # 关闭状态下也允许只刷新索引器目录，但不注册虚拟站点
+            self._onlyonce = False
+            self.__update_config()
+            if not self._enabled:
+                self.__cleanup_managed_sites()
+            logger.info(
+                f"【{self.plugin_name}】立即同步索引器"
+                f"{'（仅刷新目录）' if not self._enabled else ''}"
+            )
+            self.__start_sync_thread(register_sites=self._enabled)
+            return
+
         if not self._enabled:
             # 插件关闭：清理站点管理中的虚拟站点，保留索引器快照以便重新开启后自动恢复
             self.__cleanup_managed_sites()
-            return
-
-        if self._onlyonce:
-            self._onlyonce = False
-            self.__update_config()
-            logger.info(f"【{self.plugin_name}】立即同步索引器")
-            self.__start_sync_thread()
             return
 
         if self._enabled and self._host and self._api_key and not self._indexers:
             logger.info(f"【{self.plugin_name}】后台异步同步索引器，避免阻塞插件加载")
             self.__start_sync_thread()
         elif self._enabled and self._indexers:
-            # 使用本地快照先把虚拟站点注册回来；插件版本变化或快照缺媒体分类声明时
-            # 改走完整同步，确保站点索引助手中的注册结构更新到当前版本
+            # 使用本地快照先把虚拟站点注册回来；插件版本变化、配置签名变化或快照
+            # 缺媒体分类声明时改走完整同步，确保站点注册结构和地址/API Key 都是最新的
             last_version = self.get_data("synced_plugin_version")
-            if last_version != self.plugin_version or any(
-                    not item.get("category") for item in self._indexers):
+            last_signature = self.get_data("sync_signature")
+            if last_version != self.plugin_version \
+                    or last_signature != self.__sync_signature() \
+                    or any(not item.get("category") for item in self._indexers):
                 logger.info(
                     f"【{self.plugin_name}】插件版本 {last_version or '未知'} → "
-                    f"{self.plugin_version}，执行完整同步更新索引器注册结构"
+                    f"{self.plugin_version} 或同步配置已变化，执行完整同步"
                 )
                 self.__start_sync_thread()
             else:
@@ -266,6 +291,17 @@ class JackettBridge(_PluginBase):
             }
         ]
 
+    def __stop_sync_thread(self) -> None:
+        """
+        通知并等待当前同步线程退出，避免插件重载后旧线程继续写入站点。
+        """
+        event = getattr(self, "_sync_stop_event", None)
+        if event is not None:
+            event.set()
+        thread = getattr(self, "_sync_thread", None)
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5)
+
     def stop_service(self) -> None:
         """
         停止插件后台服务并释放资源。
@@ -273,6 +309,7 @@ class JackettBridge(_PluginBase):
         卸载流程会先从已安装列表移除本插件再执行停止，据此区分卸载与重载/关停：
         仅在卸载场景清理站点管理中由本插件托管的虚拟站点。
         """
+        self.__stop_sync_thread()
         if self.is_clone:
             return
         try:
@@ -362,11 +399,31 @@ class JackettBridge(_PluginBase):
             "password": self._password,
             "cron": self._cron,
             "search_timeout": self._search_timeout,
+            "search_budget": self._search_budget,
             "result_num": self._result_num,
             "selected_indexers": self._selected_indexers,
             "indexer_catalog": self._indexer_catalog,
         })
         self.update_config(config)
+
+    def __sync_signature(self) -> Dict[str, Any]:
+        """
+        生成影响虚拟站点注册结果的配置签名，供重启时判断能否只恢复快照。
+        """
+        return {
+            "plugin_version": self.plugin_version,
+            "host": self._host,
+            "api_key_hash": hashlib.sha256(self._api_key.encode("utf-8")).hexdigest(),
+            "selected_indexers": sorted(self._selected_indexers),
+            "result_num": self._result_num,
+        }
+
+    def __sync_stopped(self) -> bool:
+        """
+        判断当前插件实例是否已进入停止流程，避免旧同步线程在重载后继续写站点。
+        """
+        event = getattr(self, "_sync_stop_event", None)
+        return bool(event and event.is_set())
 
     # -------------------------------------------------------------- 站点选择
 
@@ -469,23 +526,35 @@ class JackettBridge(_PluginBase):
 
     # ------------------------------------------------------------------ 同步
 
-    def __start_sync_thread(self, restore_only: bool = False) -> None:
+    def __start_sync_thread(self, restore_only: bool = False, register_sites: bool = True) -> None:
         """
         在后台线程中同步索引器，避免阻塞插件加载。
         """
-        threading.Thread(
+        current = getattr(self, "_sync_thread", None)
+        if current is not None and current.is_alive():
+            logger.info(f"【{self.plugin_name}】已有同步线程运行，跳过本次启动")
+            return
+        if self.__sync_stopped():
+            logger.info(f"【{self.plugin_name}】插件已停止，跳过同步")
+            return
+        thread = threading.Thread(
             target=self.sync_indexers,
-            kwargs={"restore_only": restore_only},
+            kwargs={"restore_only": restore_only, "register_sites": register_sites},
             daemon=True,
             name="JackettBridgeSyncIndexers",
-        ).start()
+        )
+        self._sync_thread = thread
+        thread.start()
 
-    def sync_indexers(self, restore_only: bool = False) -> None:
+    def sync_indexers(self, restore_only: bool = False, register_sites: bool = True) -> None:
         """
         同步 Jackett 索引器到 MoviePilot 站点体系。
 
         :param restore_only: 仅使用本地快照恢复虚拟站点，不请求 Jackett
+        :param register_sites: 是否注册虚拟站点；关闭状态下的“立即同步”只刷新目录
         """
+        if self.__sync_stopped():
+            return
         if not self._sync_lock.acquire(blocking=False):
             logger.info(f"【{self.plugin_name}】已有同步任务在执行，跳过本次同步")
             return
@@ -498,17 +567,31 @@ class JackettBridge(_PluginBase):
                 if indexers is None:
                     logger.warn(f"【{self.plugin_name}】获取索引器失败，保留上次同步结果")
                     return
+                if self.__sync_stopped():
+                    logger.info(f"【{self.plugin_name}】同步已停止，放弃本次获取结果")
+                    return
                 self._indexers = indexers
                 self.save_data("indexers", indexers)
                 self.save_data("last_sync", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 self.save_data("synced_plugin_version", self.plugin_version)
                 self.__update_config()
 
+            if self.__sync_stopped():
+                return
+
             if not self._indexers:
                 logger.info(f"【{self.plugin_name}】没有可用索引器")
 
-            registered, updated = self.__sync_helper_indexers()
-            self.__sync_site_records()
+            if register_sites:
+                registered, updated = self.__sync_helper_indexers()
+                if self.__sync_stopped():
+                    logger.info(f"【{self.plugin_name}】同步已停止，跳过站点记录写入")
+                    return
+                self.__sync_site_records()
+            else:
+                registered = updated = 0
+                logger.info(f"【{self.plugin_name}】仅刷新索引器目录，未注册虚拟站点")
+            self.save_data("sync_signature", self.__sync_signature())
             logger.info(
                 f"【{self.plugin_name}】同步完成：索引器 {len(self._indexers)} 个，"
                 f"新注册 {registered} 个、更新 {updated} 个"
@@ -808,9 +891,19 @@ class JackettBridge(_PluginBase):
 
         :return: (新注册数量, 更新数量)
         """
+        if not self.__helper_authenticated():
+            logger.info(
+                f"【{self.plugin_name}】站点索引助手尚未完成用户认证，"
+                f"跳过虚拟索引器注册；认证后插件重载会自动恢复"
+            )
+            return 0, 0
+        if self.__sync_stopped():
+            return 0, 0
         registered = 0
         updated = 0
         for indexer in self._indexers:
+            if self.__sync_stopped():
+                break
             domain = indexer.get("domain")
             if not domain:
                 continue
@@ -823,21 +916,45 @@ class JackettBridge(_PluginBase):
                 updated += 1
         return registered, updated
 
+    def __helper_authenticated(self) -> bool:
+        """
+        判断站点索引助手是否已通过 MoviePilot 用户认证。
+        """
+        try:
+            return int(getattr(self.sites_helper, "auth_level", 0) or 0) >= 1
+        except Exception:
+            return False
+
     @staticmethod
     def __indexer_matches(exists: Any, indexer: Dict[str, Any]) -> bool:
         """
         判断已注册的索引器是否与目标结构一致。
+
+        宿主会把注册条目与数据库站点记录合并，id/name/url 往往被改写；这里只比较
+        插件真正拥有的稳定字段，避免每次同步都误判为“更新”。
         """
         if not isinstance(exists, dict):
             return False
-        for key in ("id", "name", "url", "rss", "domain", "public", "privacy", "proxy",
-                    "parser", "plugin", "result_num", "timeout", "category"):
-            if exists.get(key) != indexer.get(key):
-                return False
-        # search 只比较「是否可搜索」的真值形态：已注册条目可能被宿主补充额外键，
-        # 逐键比较会导致每次同步都重新注册。
-        if bool(exists.get("search")) != bool(indexer.get("search")):
+        exists_domain = exists.get("domain")
+        if isinstance(exists_domain, str) and "://" in exists_domain:
+            exists_domain = urlparse(exists_domain).hostname or exists_domain
+        if exists_domain is not None \
+                and str(exists_domain).strip("/").lower() != str(indexer.get("domain") or "").strip("/").lower():
             return False
+        for key in ("rss", "privacy", "parser", "plugin", "result_num", "timeout"):
+            if key in exists and exists.get(key) != indexer.get(key):
+                return False
+        for key in ("public", "proxy", "search"):
+            if key in exists and bool(exists.get(key)) != bool(indexer.get(key)):
+                return False
+        exists_category = exists.get("category")
+        indexer_category = indexer.get("category")
+        if "category" in exists:
+            if isinstance(exists_category, dict) and isinstance(indexer_category, dict):
+                if set(exists_category) != set(indexer_category):
+                    return False
+            elif bool(exists_category) != bool(indexer_category):
+                return False
         return True
 
     def __get_managed_site_records(self) -> List[Any]:
@@ -851,6 +968,54 @@ class JackettBridge(_PluginBase):
             return []
         return [site for site in sites if self.__is_managed_domain(getattr(site, "domain", ""))]
 
+    @staticmethod
+    def __site_event_payload(site: Any) -> Dict[str, Any]:
+        """
+        构造符合宿主 SiteEventData 的站点事件载荷。
+        """
+        if isinstance(site, dict):
+            return {
+                "site_id": site.get("id"),
+                "domain": site.get("domain"),
+                "name": site.get("name"),
+                "site_url": site.get("url"),
+            }
+        return {
+            "site_id": getattr(site, "id", None),
+            "domain": getattr(site, "domain", None),
+            "name": getattr(site, "name", None),
+            "site_url": getattr(site, "url", None),
+        }
+
+    def __remove_site_ids_from_system_config(self, site_ids: List[int]) -> None:
+        """
+        从系统搜索站点和订阅站点配置中移除已删除的虚拟站点 ID。
+
+        宿主 SiteDeleted 处理器只清理搜索站点，RssSites 需要插件自行收尾。
+        """
+        if not site_ids:
+            return
+        try:
+            config = get_configured_system_config()
+            removed_ids = {int(item) for item in site_ids}
+            for key in (SystemConfigKey.IndexerSites, SystemConfigKey.RssSites):
+                values = config.get(key) or []
+                if not isinstance(values, list):
+                    continue
+                kept = []
+                for item in values:
+                    try:
+                        item_id = int(item)
+                    except (TypeError, ValueError):
+                        kept.append(item)
+                        continue
+                    if item_id not in removed_ids:
+                        kept.append(item)
+                if kept != values:
+                    config.set(key, kept)
+        except Exception as e:
+            logger.warn(f"【{self.plugin_name}】清理系统站点配置失败：{str(e)}")
+
     def __cleanup_managed_sites(self) -> int:
         """
         清理站点管理中由本插件托管的全部虚拟站点。
@@ -861,19 +1026,29 @@ class JackettBridge(_PluginBase):
         :return: 被删除的站点数量
         """
         removed = 0
+        removed_payloads: List[Dict[str, Any]] = []
         for site in self.__get_managed_site_records():
             site_id = getattr(site, "id", None)
             if not site_id:
                 continue
             try:
+                payload = self.__site_event_payload(site)
                 self.site_oper.delete(site_id)
+                removed_payloads.append(payload)
                 removed += 1
             except Exception as e:
                 logger.warn(
                     f"【{self.plugin_name}】删除虚拟站点失败（id={site_id}）：{str(e)}"
                 )
-        if removed:
-            self.eventmanager.send_event(EventType.SiteDeleted, {"plugin_id": self.plugin_name})
+        if removed_payloads:
+            self.__remove_site_ids_from_system_config(
+                [payload.get("site_id") for payload in removed_payloads if payload.get("site_id")]
+            )
+            for payload in removed_payloads:
+                try:
+                    self.eventmanager.send_event(EventType.SiteDeleted, payload)
+                except Exception as e:
+                    logger.warn(f"【{self.plugin_name}】发送站点删除事件失败：{str(e)}")
             logger.info(
                 f"【{self.plugin_name}】插件已关闭，清理站点管理中的虚拟站点 {removed} 个"
             )
@@ -885,12 +1060,17 @@ class JackettBridge(_PluginBase):
 
         :return: (当前站点ID列表, 被删除的站点ID列表)
         """
+        if self.__sync_stopped():
+            return [], []
         current_domains = {item.get("domain") for item in self._indexers if item.get("domain")}
         site_ids: List[int] = []
         removed_site_ids: List[int] = []
+        removed_payloads: List[Dict[str, Any]] = []
         created = updated = removed = 0
 
         for indexer in self._indexers:
+            if self.__sync_stopped():
+                return site_ids, removed_site_ids
             domain = indexer.get("domain")
             if not domain:
                 continue
@@ -930,13 +1110,28 @@ class JackettBridge(_PluginBase):
 
         if self._indexers_authoritative:
             for site in self.__get_managed_site_records():
+                if self.__sync_stopped():
+                    return site_ids, removed_site_ids
                 site_id = getattr(site, "id", None)
                 if site_id and getattr(site, "domain", "") not in current_domains:
+                    payload = self.__site_event_payload(site)
                     self.site_oper.delete(site_id)
                     removed_site_ids.append(site_id)
+                    removed_payloads.append(payload)
                     removed += 1
 
+        if removed_payloads:
+            self.__remove_site_ids_from_system_config(
+                [payload.get("site_id") for payload in removed_payloads if payload.get("site_id")]
+            )
+            for payload in removed_payloads:
+                try:
+                    self.eventmanager.send_event(EventType.SiteDeleted, payload)
+                except Exception as e:
+                    logger.warn(f"【{self.plugin_name}】发送站点删除事件失败：{str(e)}")
+
         if created or updated or removed:
+            # 虚拟域名不可访问，不向宿主发送带 domain 的 SiteUpdated，避免它去抓图标/用户数据
             self.eventmanager.send_event(EventType.SiteUpdated, {"plugin_id": self.plugin_name})
             logger.info(
                 f"【{self.plugin_name}】同步站点记录：新增 {created} 个、更新 {updated} 个、清理 {removed} 个"
@@ -1094,27 +1289,30 @@ class JackettBridge(_PluginBase):
         started = time.monotonic()
         results: List[TorrentInfo] = []
         details: List[str] = []
+        timed_out = False
         max_workers = max(1, min(len(indexers), DEFAULT_PARALLEL_INDEXERS))
+        budget = max(1, int(getattr(self, "_search_budget", DEFAULT_SEARCH_BUDGET) or DEFAULT_SEARCH_BUDGET))
         logger.info(
             f"【{self.plugin_name}】插件资源源开始检索 {len(indexers)} 个索引器，"
             f"关键词：{keyword}，选中站点：{sites or '不限'}（来源：{self._last_sites_source}）"
         )
-        with ThreadPoolExecutor(
+        pool = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="JackettBridgeSearch",
-        ) as pool:
-            futures = {
-                pool.submit(
-                    self.__query_jackett,
-                    indexer_id=str(item.get("indexer_id")),
-                    site=self.__resolve_indexer_site(item),
-                    keyword=keyword,
-                    mtype=mtype,
-                    page=page,
-                ): item
-                for item in indexers
-            }
-            for future in as_completed(futures):
+        )
+        futures = {
+            pool.submit(
+                self.__query_jackett,
+                indexer_id=str(item.get("indexer_id")),
+                site=self.__resolve_indexer_site(item),
+                keyword=keyword,
+                mtype=mtype,
+                page=page,
+            ): item
+            for item in indexers
+        }
+        try:
+            for future in as_completed(futures, timeout=budget):
                 item = futures[future]
                 label = str(item.get("origin_name") or item.get("name") or item.get("indexer_id"))
                 try:
@@ -1127,12 +1325,25 @@ class JackettBridge(_PluginBase):
                     continue
                 results.extend(items)
                 details.append(f"{label} {len(items)} 条")
+        except FuturesTimeoutError:
+            timed_out = True
+            for future, item in futures.items():
+                if not future.done():
+                    future.cancel()
+                    label = str(item.get("origin_name") or item.get("name") or item.get("indexer_id"))
+                    details.append(f"{label} 超时")
+            logger.warn(
+                f"【{self.plugin_name}】插件资源源检索达到总时限 {budget}s，"
+                f"返回已完成结果 {len(results)} 条"
+            )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
         elapsed = int((time.monotonic() - started) * 1000)
         detail_text = "，".join(details)
         logger.info(
             f"【{self.plugin_name}】插件资源源检索完成：合计 {len(results)} 条，"
-            f"耗时 {elapsed}ms；{detail_text}"
+            f"耗时 {elapsed}ms{'（已超时）' if timed_out else ''}；{detail_text}"
         )
         return results
 
@@ -1148,7 +1359,7 @@ class JackettBridge(_PluginBase):
         """
         domain = indexer.get("domain")
         site: Dict[str, Any] = {}
-        if domain:
+        if domain and self.__helper_authenticated():
             try:
                 registered = self.sites_helper.get_indexer(domain)
             except Exception as e:
@@ -1353,54 +1564,64 @@ class JackettBridge(_PluginBase):
 
         # Jackett 一般部署在内网，取种直连，不使用代理
         site_proxy = bool(site.get("proxy"))
+        skipped = 0
 
         for item in root.iter("item"):
             title = (item.findtext("title") or "").strip()
             if not title:
                 continue
-            attrs = self.__torznab_attrs(item)
-            enclosure = self.__torrent_url(item, attrs)
-            if not enclosure:
-                continue
-            seeders = self.__to_number(attrs.get("seeders"), 0)
-            peers = attrs.get("peers")
-            leechers = self.__to_number(attrs.get("leechers"), None)
-            if leechers is None:
-                total_peers = self.__to_number(peers, 0)
-                leechers = max(0, total_peers - seeders) if total_peers else 0
-            # RSS 条目允许重复出现 <category> 元素，逐个收集并去重
-            categories = []
-            for node in item.findall("category"):
-                for text in (node.text or "").split(","):
-                    text = text.strip()
-                    if text and text not in categories:
-                        categories.append(text)
-            # MoviePilot V3 的 TorrentInfo 用 media_source/media_id 取代了 V2 的 imdbid 字段
-            imdb_id = self.__parse_imdbid(attrs.get("imdb") or attrs.get("imdbid"))
-            results.append(TorrentInfo(
-                site=site.get("id"),
-                site_name=site_name,
-                site_cookie=site.get("cookie"),
-                site_ua=site.get("ua") or settings.USER_AGENT,
-                site_proxy=site_proxy,
-                site_order=site.get("pri") or 0,
-                site_downloader=site.get("downloader"),
-                title=title,
-                description=(item.findtext("description") or "").strip() or None,
-                enclosure=enclosure,
-                page_url=(item.findtext("comments") or item.findtext("guid") or "").strip() or None,
-                size=self.__to_number(item.findtext("size") or attrs.get("size"), 0),
-                seeders=seeders,
-                peers=leechers,
-                grabs=self.__to_number(attrs.get("grabs"), 0),
-                pubdate=self.__parse_pubdate(item.findtext("pubDate")),
-                media_source=MediaSource.IMDb if imdb_id else None,
-                media_id=imdb_id,
-                labels=categories,
-                category=self.__infer_category(categories),
-                downloadvolumefactor=self.__to_number(attrs.get("downloadvolumefactor"), 1.0),
-                uploadvolumefactor=self.__to_number(attrs.get("uploadvolumefactor"), 1.0),
-            ))
+            try:
+                attrs = self.__torznab_attrs(item)
+                enclosure = self.__torrent_url(item, attrs)
+                if not enclosure:
+                    continue
+                seeders = self.__to_number(attrs.get("seeders"), 0)
+                peers = attrs.get("peers")
+                leechers = self.__to_number(attrs.get("leechers"), None)
+                if leechers is None:
+                    total_peers = self.__to_number(peers, 0)
+                    leechers = max(0, total_peers - seeders) if total_peers else 0
+                # RSS 条目允许重复出现 <category> 元素，逐个收集并去重
+                categories = []
+                for node in item.findall("category"):
+                    for text in (node.text or "").split(","):
+                        text = text.strip()
+                        if text and text not in categories:
+                            categories.append(text)
+                # MoviePilot V3 的 TorrentInfo 用 media_source/media_id 取代了 V2 的 imdbid 字段
+                imdb_id = self.__parse_imdbid(attrs.get("imdb") or attrs.get("imdbid"))
+                results.append(TorrentInfo(
+                    site=site.get("id"),
+                    site_name=site_name,
+                    site_cookie=site.get("cookie"),
+                    site_ua=site.get("ua") or settings.USER_AGENT,
+                    site_proxy=site_proxy,
+                    site_order=site.get("pri") or 0,
+                    site_downloader=site.get("downloader"),
+                    title=title,
+                    description=(item.findtext("description") or "").strip() or None,
+                    enclosure=enclosure,
+                    page_url=(item.findtext("comments") or item.findtext("guid") or "").strip() or None,
+                    size=self.__to_number(item.findtext("size") or attrs.get("size"), 0),
+                    seeders=seeders,
+                    peers=leechers,
+                    grabs=self.__to_number(attrs.get("grabs"), 0),
+                    pubdate=self.__parse_pubdate(item.findtext("pubDate")),
+                    media_source=MediaSource.IMDb if imdb_id else None,
+                    media_id=imdb_id,
+                    labels=categories,
+                    category=self.__infer_category(categories),
+                    downloadvolumefactor=self.__to_number(attrs.get("downloadvolumefactor"), 1.0),
+                    uploadvolumefactor=self.__to_number(attrs.get("uploadvolumefactor"), 1.0),
+                ))
+            except Exception as e:
+                skipped += 1
+                logger.warn(
+                    f"【{self.plugin_name}】{site_name} 跳过无效条目「{title}」："
+                    f"{type(e).__name__}: {str(e)}"
+                )
+        if skipped:
+            logger.warn(f"【{self.plugin_name}】{site_name} 本次响应共跳过 {skipped} 条无效条目")
         return results
 
     @staticmethod
@@ -1525,6 +1746,8 @@ class JackettBridge(_PluginBase):
 
         :return: 已声明返回 True，未声明返回 False，无法读取时返回 None
         """
+        if not self.__helper_authenticated():
+            return None
         for indexer in self._indexers or []:
             domain = indexer.get("domain")
             if not domain:
@@ -1688,12 +1911,12 @@ class JackettBridge(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
                                         "model": "search_timeout",
-                                        "label": "检索超时（秒）",
+                                        "label": "单索引器超时（秒）",
                                         "type": "number",
                                         "placeholder": "30"
                                     }
@@ -1701,7 +1924,20 @@ class JackettBridge(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "search_budget",
+                                        "label": "插件总检索时限（秒）",
+                                        "type": "number",
+                                        "placeholder": "15"
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
@@ -1745,6 +1981,7 @@ class JackettBridge(_PluginBase):
             "password": "",
             "cron": DEFAULT_CRON,
             "search_timeout": DEFAULT_SEARCH_TIMEOUT,
+            "search_budget": DEFAULT_SEARCH_BUDGET,
             "result_num": DEFAULT_RESULT_NUM,
             "selected_indexers": [],
         }
