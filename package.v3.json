@@ -28,7 +28,7 @@
     "name": "API聚合自动切换",
     "description": "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。",
     "labels": "智能助手",
-    "version": "2.7.0",
+    "version": "2.8.0",
     "icon": "agentresourceofficer.png",
     "author": "tafei",
     "author_url": "https://github.com/cudamin",
@@ -36,6 +36,7 @@
     "release": true,
     "system_version": ">=3.0.1",
     "history": {
+      "v2.8.0": "重绘数据详情页；修复重置后旧配置复活、同模型多密钥无法切换、并发写入串配置、过期健康状态接管与跨端点密钥复用；新增健康有效期与切换失败冷却。",
       "v2.7.0": "白名单合并为单框并支持 LLM 提供商多选；全局参数新增 API 协议/联网搜索/User-Agent/定时唤醒；修复探活中断后状态卡死等问题。",
       "v2.6.2": "修复BUG",
       "v2.6.0": "适配 MoviePilot V3：迁移配置、事件、日志与服务端上报接口路径。",
