@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+pytest.importorskip("libraryscraper")
+
 import libraryscraper
 from app.core.config import settings
 from app.schemas import MediaType

@@ -31,6 +31,8 @@ def _resolve_backend_path() -> Path:
     if env:
         candidates.append(Path(env).expanduser())
     candidates.append(_WORKSPACE_ROOT / "MoviePilot")
+    # 当前工作区把便携后端放在 server/MoviePilot-V3，而非同级 MoviePilot。
+    candidates.append(_WORKSPACE_ROOT / "server" / "MoviePilot-V3")
     for path in candidates:
         if (path / "app").is_dir():
             return path
@@ -47,12 +49,23 @@ if str(_BACKEND_PATH) not in sys.path:
     sys.path.insert(0, str(_BACKEND_PATH))
 
 _bootstrap = import_module("app.testing.bootstrap")
-block_real_network = import_module("app.testing.network_guard").block_real_network
+try:
+    block_real_network = import_module("app.testing.network_guard").block_real_network
+except ModuleNotFoundError:
+    # 兼容只有 app.testing.network 的宿主版本。
+    block_real_network = import_module("app.testing.network").block_real_network
 
 
 def isolate_config_dir() -> str:
     """隔离 ``CONFIG_DIR`` 到进程私有临时目录（委托主程序共享实现）。"""
     return _bootstrap.isolate_config_dir()
+
+
+def _prepend_plugin_path(generation_dir: str) -> None:
+    """把插件目录加入 sys.path，兼容测试中的顶层插件包导入。"""
+    path = str(_PLUGINS_REPO / generation_dir)
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 
 def prepare_backend() -> None:
@@ -63,8 +76,16 @@ def prepare_backend() -> None:
 def prepare_v2_backend() -> None:
     """v2 插件单测引导：后端 + 本仓 ``plugins.v2/``（委托主程序共享实现）。"""
     _bootstrap.prepare_v2_backend(_PLUGINS_REPO)
+    _prepend_plugin_path("plugins.v2")
+
+
+def prepare_v3_backend() -> None:
+    """v3 插件单测引导：后端 + 本仓 ``plugins.v3/``（委托主程序共享实现）。"""
+    _bootstrap.prepare_v3_backend(_PLUGINS_REPO)
+    _prepend_plugin_path("plugins.v3")
 
 
 def prepare_v1_backend() -> None:
     """v1 插件单测引导：后端 + 本仓 ``plugins/``（委托主程序共享实现，与 v2 互斥）。"""
     _bootstrap.prepare_v1_backend(_PLUGINS_REPO)
+    _prepend_plugin_path("plugins")

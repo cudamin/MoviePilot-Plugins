@@ -5,4 +5,18 @@ set -eu
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-python3 .github/scripts/check_plugin_versions.py package.json package.v2.json
+python_bin="${PYTHON:-}"
+if [ -z "$python_bin" ]; then
+    for candidate in python python3 "$repo_root/../runtime/venv/Scripts/python.exe" "$repo_root/../.venv/bin/python"; do
+        if "$candidate" -c "import sys" >/dev/null 2>&1; then
+            python_bin="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$python_bin" ]; then
+    echo "未找到可用的 Python 解释器" >&2
+    exit 1
+fi
+
+"$python_bin" .github/scripts/check_plugin_versions.py package.json package.v2.json

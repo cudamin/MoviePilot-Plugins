@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 
+import pytest
+pytest.importorskip("maoyanrank")
+
 import maoyanrank
 from app.core.metainfo import MetaInfo
 

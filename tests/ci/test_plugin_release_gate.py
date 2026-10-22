@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CHECKER = REPO_ROOT / ".github/scripts/check_plugin_versions.py"
@@ -43,7 +44,7 @@ def _write_fixture(repo: Path, package_version: str, source_version: str) -> Non
 
 def _run_checker(repo: Path, *package_files: Path | str) -> subprocess.CompletedProcess[str]:
     """从指定目录运行 checker，便于覆盖 cwd 与 package 路径组合。"""
-    args = ["python3", str(CHECKER)]
+    args = [sys.executable, str(CHECKER)]
     args.extend(str(package_file) for package_file in package_files)
     return subprocess.run(
         args,
@@ -89,7 +90,7 @@ def test_checker_reports_missing_release_plugin_dir(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "缺少插件目录" in result.stdout
-    assert "plugins.v2/missingplugin" in result.stdout
+    assert 'plugins.v2/missingplugin' in result.stdout.replace("\\", "/")
 
 
 def test_checker_reads_class_level_plugin_version_only(tmp_path: Path) -> None:
@@ -138,6 +139,7 @@ def test_pre_push_propagates_version_gate_failure(tmp_path: Path) -> None:
     result = subprocess.run(
         ["sh", ".githooks/pre-push"],
         cwd=tmp_path,
+        env={**os.environ, "PYTHON": sys.executable},
         text=True,
         capture_output=True,
         check=False,
@@ -158,6 +160,7 @@ def test_pre_push_accepts_matching_versions(tmp_path: Path) -> None:
     result = subprocess.run(
         ["sh", ".githooks/pre-push"],
         cwd=tmp_path,
+        env={**os.environ, "PYTHON": sys.executable},
         text=True,
         capture_output=True,
         check=False,
@@ -182,7 +185,7 @@ def test_pr_workflow_runs_gate_for_every_main_pull_request() -> None:
 def test_current_repository_passes_version_gate() -> None:
     """启用 Ruleset 前真实 main 基线必须通过，否则所有 PR 都无法合并。"""
     result = subprocess.run(
-        ["python3", str(CHECKER), "package.json", "package.v2.json"],
+        [sys.executable, str(CHECKER), "package.json", "package.v2.json"],
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
@@ -196,4 +199,4 @@ def test_full_test_runner_includes_ci_gate_tests() -> None:
     """push 前全量入口必须执行 CI 工具测试，防止门禁实现脱离常规回归。"""
     runner = TEST_RUNNER.read_text(encoding="utf-8")
 
-    assert 'for generation in ("ci", "v2", "v1"):' in runner
+    assert 'for generation in ("ci", "v3", "v2", "v1"):' in runner

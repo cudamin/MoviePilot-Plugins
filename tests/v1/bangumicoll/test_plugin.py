@@ -6,6 +6,9 @@ import importlib
 import sys
 import types
 
+import pytest
+pytest.importorskip("bangumicoll")
+
 
 def test_import_without_legacy_subscribe_helper() -> None:
     """新版 MoviePilot 已移除 app.helper.subscribe，插件导入不应再依赖旧模块。"""

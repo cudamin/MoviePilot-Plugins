@@ -12,6 +12,7 @@ from unittest.mock import patch, MagicMock, PropertyMock
 
 import pytest
 
+pytest.importorskip("brushflow")
 from brushflow import BrushFlow
 
 

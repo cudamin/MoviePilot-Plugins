@@ -48,7 +48,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理&AniBT洗版"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；AniBT/RSS 洗版下载自动跳过已看完剧集：AniBT 源优先用 RSS 链接里的 bgmId 与 episode 锁定番剧与集号，识别失败时依次由 AniBT 识别补强、智能助手接管识别并自动写入自定义识别词；识别集号比播放缓存中该季最新集数大出阈值时视为识别异常，自动跳过下载（开启智能助手后先由智能助手复核）。"
     plugin_icon = "delete.png"
-    plugin_version = "5.7.2"
+    plugin_version = "5.7.3"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -117,6 +117,9 @@ class SpaceCleaner(_PluginBase):
     _scheduler_thread = None
     _scheduler_running = False
     _scheduler_event = None
+    _stop_event = threading.Event()
+    _threads: set = set()
+    _thread_lock = threading.Lock()
     _chain = None
     _running = False
     _run_lock = threading.Lock()  # 保护 _running / _rss_busy 的检查与置位
@@ -189,7 +192,13 @@ class SpaceCleaner(_PluginBase):
         return result
 
     def init_plugin(self, config: dict = None) -> None:
-        self.stop_service()
+        stopped = self.stop_service()
+        if stopped is False:
+            logger.warning("SC 停止旧任务未完全收敛，仍将应用新配置；旧任务会在停止标志下尽快退出")
+        self._stop_event = threading.Event()
+        self._threads = set()
+        self._thread_lock = threading.Lock()
+        self._running = self._rss_busy = self._rename_busy = False
         self._enabled = self._rss_on = False
         self._min_free_percent = 10
         self._target_free_percent = 20
@@ -327,13 +336,13 @@ class SpaceCleaner(_PluginBase):
         if run_now:
             config["run_now"] = False
             self.update_config(config)
-            threading.Thread(target=self._run_now_task, daemon=True, name="SC-RunNow").start()
+            self._start_thread(self._run_now_task, "SC-RunNow")
 
         if self._rss_once:
             self._rss_once = False
             self._update_config()
             if self._rss_on and self._rss_sources():
-                threading.Thread(target=self._rss_run, daemon=True, name="SC-RssOnce").start()
+                self._start_thread(self._rss_run, "SC-RssOnce")
         if self._rss_on and self._rss_cron and self._rss_sources():
             # 重新注册前先停掉上一轮调度器，避免重复保存配置后多个调度器并发跑 RSS
             self._stop_rss_scheduler()
@@ -353,7 +362,7 @@ class SpaceCleaner(_PluginBase):
             self._rename_once = False
             self.update_config(config)
             if self._rename_on:
-                threading.Thread(target=self._rename_run, daemon=True, name="SC-RenameOnce").start()
+                self._start_thread(self._rename_run, "SC-RenameOnce")
         if self._rename_on and self._rename_cron:
             self._stop_rename_scheduler()
             try:
@@ -401,6 +410,77 @@ class SpaceCleaner(_PluginBase):
 
     # ==================== Webhook 共用播放缓存 ====================
 
+    @staticmethod
+    def _webhook_metadata(ev) -> dict:
+        """取媒体服务器原始事件里的 Metadata（Plex 的 TMDB/进度信息在这里）。"""
+        data = getattr(ev, "json_object", None) or {}
+        meta = data.get("Metadata") if isinstance(data, dict) else None
+        return meta if isinstance(meta, dict) else {}
+
+    @classmethod
+    def _webhook_media_type(cls, ev) -> str:
+        """统一 Jellyfin/Plex 的媒体类型；Plex 只提供 item_type。"""
+        raw = getattr(ev, "media_type", None) or getattr(ev, "item_type", None) or ""
+        value = str(raw).strip()
+        return {
+            "MOV": "Movie", "MOVIE": "Movie", "EPISODE": "Episode",
+            "SHOW": "TV", "SERIES": "TV", "TV": "TV",
+        }.get(value.upper(), value)
+
+    @classmethod
+    def _webhook_tmdb_id(cls, ev) -> Optional[str]:
+        """优先读统一媒体身份，缺失时从 Plex Metadata/Guid 或文件路径提取 TMDB ID。"""
+        tid = getattr(ev, "tmdb_id", None)
+        if tid:
+            return str(tid)
+        source = getattr(ev, "media_source", None)
+        source_value = getattr(source, "value", source)
+        media_id = getattr(ev, "media_id", None)
+        if str(source_value or "").strip().lower() == "themoviedb" and media_id:
+            return str(media_id)
+
+        meta = cls._webhook_metadata(ev)
+        guids = meta.get("Guid") or meta.get("guid") or []
+        if isinstance(guids, (str, dict)):
+            guids = [guids]
+        for guid in guids:
+            value = guid.get("id") if isinstance(guid, dict) else str(guid)
+            m = re.search(r"tmdb(?:id)?[=:/_-]+(\d+)", str(value or ""), re.IGNORECASE)
+            if m:
+                return m.group(1)
+
+        path = str(getattr(ev, "item_path", None) or "")
+        if not path:
+            for media in meta.get("Media") or []:
+                for part in (media.get("Part") or []) if isinstance(media, dict) else []:
+                    if isinstance(part, dict) and part.get("file"):
+                        path = str(part["file"])
+                        break
+                if path:
+                    break
+        m = re.search(r"tmdbid[=_-](\d+)", path, re.IGNORECASE)
+        return m.group(1) if m else None
+
+    @classmethod
+    def _webhook_percentage(cls, ev) -> float:
+        """读播放进度；Plex 只给 viewOffset/duration，scrobble 事件视为已看完。"""
+        pct = getattr(ev, "percentage", None)
+        try:
+            value = float(pct) if pct is not None else 0.0
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+        if "scrobble" in str(getattr(ev, "event", "") or "").lower():
+            return 100.0
+        meta = cls._webhook_metadata(ev)
+        try:
+            offset = float(meta.get("viewOffset") or 0)
+            duration = float(meta.get("duration") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return offset / duration * 100 if duration > 0 else 0.0
+
     @eventmanager.register(EventType.WebhookMessage)
     def on_webhook(self, event: Event) -> None:
         if not self._enabled and not self._rss_on:
@@ -413,18 +493,20 @@ class SpaceCleaner(_PluginBase):
             return
         if not ev:
             return
-        if ev.event not in ("playback.stop", "PlaybackStopped", "playback.pause", "PlaybackPaused", "media.stop"):
+        if ev.event not in ("playback.stop", "PlaybackStopped", "PlaybackStop",
+                            "playback.pause", "PlaybackPaused", "media.stop", "media.scrobble"):
             return
-        pct = ev.percentage or 0
-        logger.info(f"SC webhook: {ev.item_name} event={ev.event} media_type={ev.media_type} tmdb={ev.tmdb_id} s={ev.season_id} e={ev.episode_id} {pct:.1f}%")
-        if ev.media_type not in ("TV", "电视剧", "SHOW", "SERIES", "Episode", "episode", "Movie", "movie"):
+        media_type = self._webhook_media_type(ev)
+        pct = self._webhook_percentage(ev)
+        logger.info(f"SC webhook: {ev.item_name} event={ev.event} media_type={media_type} tmdb={self._webhook_tmdb_id(ev)} s={ev.season_id} e={ev.episode_id} {pct:.1f}%")
+        if media_type not in ("TV", "电视剧", "SHOW", "SERIES", "Episode", "episode", "Movie", "movie"):
             return
         if not ev.item_name:
             return
-        if ev.media_type in ("TV", "电视剧", "SHOW", "SERIES", "Episode", "episode"):
+        if media_type in ("TV", "电视剧", "SHOW", "SERIES", "Episode", "episode"):
             if not ev.season_id or not ev.episode_id:
                 return
-        tid = ev.tmdb_id
+        tid = self._webhook_tmdb_id(ev)
         if not tid and ev.item_path:
             m = re.search(r'tmdbid[=_](\d+)', ev.item_path)
             if m:
@@ -769,7 +851,7 @@ class SpaceCleaner(_PluginBase):
         if busy:
             self._set_notice("清理任务正在运行中，稍后刷新查看结果", "warning")
             return schemas.Response(success=True)
-        threading.Thread(target=self._run_now_task, daemon=True, name="SC-PageClean").start()
+        self._start_thread(self._run_now_task, "SC-PageClean")
         self._set_notice("已触发清理任务，稍后点击「刷新数据」查看删除记录", "success")
         return schemas.Response(success=True)
 
@@ -787,7 +869,7 @@ class SpaceCleaner(_PluginBase):
         if busy:
             self._set_notice("上一轮 RSS 刷新仍在进行，稍后再试", "warning")
             return schemas.Response(success=True)
-        threading.Thread(target=self._rss_run, daemon=True, name="SC-PageRss").start()
+        self._start_thread(self._rss_run, "SC-PageRss")
         self._set_notice("已触发 RSS 刷新，稍后点击「刷新数据」查看结果", "success")
         return schemas.Response(success=True)
 
@@ -831,7 +913,7 @@ class SpaceCleaner(_PluginBase):
         if busy:
             self._set_notice("上一轮种子重命名仍在进行，稍后再试", "warning")
             return schemas.Response(success=True)
-        threading.Thread(target=self._rename_run, daemon=True, name="SC-PageRename").start()
+        self._start_thread(self._rename_run, "SC-PageRename")
         self._set_notice("已触发种子重命名，稍后查看下载器与日志", "success")
         return schemas.Response(success=True)
 
@@ -1902,7 +1984,24 @@ class SpaceCleaner(_PluginBase):
         self._all_torrents_cache_time = now
         return all_t
 
-    def stop_service(self) -> None:
+    def _start_thread(self, target, name: str, *args, **kwargs) -> threading.Thread:
+        """启动并登记后台线程，stop_service 时可以等待其收敛。"""
+        def _runner():
+            try:
+                target(*args, **kwargs)
+            finally:
+                with self._thread_lock:
+                    self._threads.discard(threading.current_thread())
+
+        thread = threading.Thread(target=_runner, daemon=True, name=name)
+        with self._thread_lock:
+            self._threads.add(thread)
+        thread.start()
+        return thread
+
+    def stop_service(self) -> bool:
+        """停止调度与后台任务；仍有任务无法收敛时返回 False。"""
+        self._stop_event.set()
         self._scheduler_running = False
         if self._scheduler_event:
             self._scheduler_event.set()
@@ -1912,7 +2011,21 @@ class SpaceCleaner(_PluginBase):
         self._scheduler_event = None
         self._stop_rss_scheduler()
         self._stop_rename_scheduler()
+        deadline = time.time() + 10
+        while time.time() < deadline and (self._running or self._rss_busy or self._rename_busy):
+            time.sleep(0.1)
+        with self._thread_lock:
+            threads = list(self._threads)
+        for thread in threads:
+            thread.join(timeout=max(0.1, deadline - time.time()))
+        with self._thread_lock:
+            alive = [t for t in self._threads if t.is_alive()]
         self._invalidate_caches()
+        if alive:
+            logger.warning("SC 停止服务时仍有后台任务未退出: " +
+                           ", ".join(t.name for t in alive))
+            return False
+        return True
 
     def _stop_rss_scheduler(self):
         if self._rss_s:
@@ -2036,6 +2149,9 @@ class SpaceCleaner(_PluginBase):
                 return
             self._running = True
         try:
+            if self._stop_event.is_set():
+                logger.info("SC 已收到停止信号，跳过本次清理")
+                return
             si = self._get_cached_space_info()
             if not si:
                 return
@@ -2048,16 +2164,30 @@ class SpaceCleaner(_PluginBase):
             self._running = False
             self._invalidate_caches()
 
+    def _snapshot_run_options(self) -> dict:
+        """快照一轮清理使用的配置，防止运行中保存配置改变删除策略。"""
+        return {
+            "dry_run": bool(self._dry_run),
+            "delete_count": int(self._delete_count),
+            "delete_by_target": bool(self._delete_by_target),
+            "delete_other_versions": bool(self._delete_other_versions),
+            "notify": bool(self._notify),
+            "unit_delete_interval": float(self._unit_delete_interval),
+            "stop_event": self._stop_event,
+        }
+
     def _clean_resources(self, space_info: Dict[str, float]) -> None:
         # 先与插件数据对齐：详情页的删除/清空可能由另一个插件实例写库，
         # 调度线程若沿用旧的内存播放缓存会按已删除的记录继续删资源。
         self._sync_pb_from_data()
         # 清理无对应整理记录的失效播放缓存，避免其干扰后续判断
         self._prune_orphan_pb()
+        opts = self._snapshot_run_options()
+        stop_event = opts["stop_event"]
         chain = self._get_chain()
         dc = 0
         # 试运行不会真正释放空间，若按目标百分比删除会遍历全部单元，因此仍按单次数量限制
-        md = self._delete_count if (not self._delete_by_target or self._dry_run) else 0
+        md = opts["delete_count"] if (not opts["delete_by_target"] or opts["dry_run"]) else 0
         fr = ""
         # 删除单元的收集与排序逻辑与详情页「试运行」预览共用，保证预览顺序与真实清理一致
         delete_units = self._collect_delete_units()
@@ -2069,30 +2199,35 @@ class SpaceCleaner(_PluginBase):
         # 删种后由 _delete_downloader_torrents 从索引与缓存中剔除已删 hash，保持数据新鲜。
         torrent_index = self._build_torrent_index(self._get_cached_torrents(chain))
         for unit in delete_units:
+            if stop_event.is_set():
+                logger.info("SC 收到停止信号，结束本轮清理")
+                fr = "stopped"
+                break
             if md and dc >= md:
                 fr = "limit"
                 break
             # 完全删除上一个资源后强制刷新空间信息，再检查是否达到目标，避免缓存旧值导致多删
             cs = self._get_cached_space_info()
             # 试运行不会真正释放空间，跳过空间达标判断，否则首轮就会误判为已达标
-            if cs and not self._dry_run:
-                if self._delete_by_target and cs["free_percent"] >= self._target_free_percent:
+            if cs and not opts["dry_run"]:
+                if opts["delete_by_target"] and cs["free_percent"] >= self._target_free_percent:
                     logger.info(f"SC 空间已达到目标阈值 {self._target_free_percent}% (当前 {cs['free_percent']:.1f}%)，停止清理")
                     fr = "space_ok"
                     break
-                if not self._delete_by_target and cs["free_percent"] >= self._min_free_percent:
+                if not opts["delete_by_target"] and cs["free_percent"] >= self._min_free_percent:
                     logger.info(f"SC 空间已恢复至触发阈值 {self._min_free_percent}% (当前 {cs['free_percent']:.1f}%)，停止清理")
                     fr = "space_ok"
                     break
             # 完整删除一个资源（种子+文件+记录），删除完成后立即使空间缓存失效，
             # 下一次循环重新查询真实剩余空间，达标即停，否则继续删除下一个
-            self._delete_unit(unit, chain, cs or space_info, torrent_index)
+            self._delete_unit(unit, chain, cs or space_info, torrent_index, options=opts)
             dc += 1
             self._cached_space_info = None
             # 单元之间稍作停顿，把删种/删文件/清目录带来的瞬时占用摊平
-            if not self._dry_run and self._unit_delete_interval > 0:
-                time.sleep(self._unit_delete_interval)
-        reason = {"limit": "达到单次删除数量上限", "space_ok": "空间已达标"}.get(fr, "已处理全部候选资源")
+            if not opts["dry_run"] and opts["unit_delete_interval"] > 0:
+                time.sleep(opts["unit_delete_interval"])
+        reason = {"limit": "达到单次删除数量上限", "space_ok": "空间已达标",
+                  "stopped": "收到停止信号"}.get(fr, "已处理全部候选资源")
         logger.info(f"SC 清理完成，删除 {dc} 个资源（{reason}）")
 
     def _dry_run_preview(self, limit: int = 10) -> dict:
@@ -2405,30 +2540,39 @@ class SpaceCleaner(_PluginBase):
                     _add_tv_season_unit(recs)
                     return
 
-                # 多季度电视剧：只检查最后一季最后一集
-                last_season = seasons[-1]
-                last_season_records = [r for r in recs if self._norm_season(r.seasons or "") == last_season]
-                t, reason = _season_last_watched_time(last_season_records)
-                mark_time = _unit_earliest_show_mark_time(self._tmdbid_of(recs[0]), seasons)
-                if t is None:
-                    title = recs[0].title or "未知"
-                    skip_logs.append((mark_time, f"{title}: 多季度整剧最后一季 S{last_season:02d} 最后一集未看完，跳过全部季度"))
+                show_tmdbid = self._tmdbid_of(recs[0])
+                season_recs = {
+                    season: [r for r in recs if self._norm_season(r.seasons or "") == season]
+                    for season in seasons
+                }
+                watched = {}
+                for season in seasons:
+                    t, reason = _season_last_watched_time(season_recs[season])
+                    watched[season] = t
+                    if t is None and reason:
+                        skip_logs.append((_unit_earliest_mark_time(show_tmdbid, season), reason))
+
+                # 只有每一季的最后一集都已看完，才允许整剧合并删除；
+                # 否则按季生成单元，未看完的季保留，避免连带删除从未观看的旧季。
+                if any(t is None for t in watched.values()):
+                    for season in seasons:
+                        if watched[season] is not None:
+                            _add_tv_season_unit(season_recs[season])
                     return
 
                 rep = max(recs, key=_ep_max)
-                tmdbid = self._tmdbid_of(rep)
                 dh = next((r.download_hash for r in recs if r.download_hash), "")
                 ep_count = len({e for r in recs for e in self._episode_set(r.episodes or "")})
                 delete_units.append({
                     "records": [_snap(r) for r in recs],
                     "hash": dh,
-                    "tmdbid": tmdbid,
+                    "tmdbid": show_tmdbid,
                     "season": None,
                     "is_tv": True,
                     "display": f"{rep.title or '未知'}（整剧 {len(seasons)} 季 {ep_count} 集）",
-                    "sort_time": mark_time,
+                    "sort_time": _unit_earliest_show_mark_time(show_tmdbid, seasons),
                     "lib_time": _unit_earliest_lib_time(recs),
-                    "prio": str(tmdbid) in prio_tmdbids,
+                    "prio": str(show_tmdbid) in prio_tmdbids,
                 })
 
             for recs in tv_show_groups.values():
@@ -2457,12 +2601,18 @@ class SpaceCleaner(_PluginBase):
             sess.close()
         return delete_units
 
-    def _delete_unit(self, unit, chain, space_info, torrent_index=None):
+    def _delete_unit(self, unit, chain, space_info, torrent_index=None, options: Optional[dict] = None):
         """删除一个删除单元（合集的所有集一起删除）。
 
         使用预先快照的记录字典，避免跨 Session 访问 ORM 懒加载属性。
         torrent_index 为调用方预建的种子索引（见 _build_torrent_index），一轮清理复用同一份。
+        options 为 _clean_resources 开始时快照的配置；不传时现取，兼容单独调用。
         """
+        opts = options or self._snapshot_run_options()
+        stop_event = opts.get("stop_event") or self._stop_event
+        if stop_event.is_set():
+            logger.info(f"SC 收到停止信号，跳过删除单元: {unit.get('display', '')}")
+            return
         records = unit["records"]
         display_name = unit["display"]
         download_hash = unit["hash"]
@@ -2470,11 +2620,11 @@ class SpaceCleaner(_PluginBase):
         season = unit.get("season")
         is_tv = unit.get("is_tv", False)
         # 其他版本：同一集/同一部电影的不同发布版本（分辨率、字幕组、编码等）
-        other_versions = self._find_other_version_records(records) if self._delete_other_versions else []
+        other_versions = self._find_other_version_records(records) if opts["delete_other_versions"] else []
         all_recs = records + other_versions
         if torrent_index is None:
             torrent_index = self._build_torrent_index(self._get_cached_torrents(chain))
-        if self._dry_run:
+        if opts["dry_run"]:
             # 统计将删除的种子（主种子 + 辅种）。部分不同版本整理记录没有
             # download_hash，需要通过源文件路径反查下载器任务及其辅种。
             main_hashes = self._collect_record_torrent_hashes(all_recs, torrent_index)
@@ -2510,7 +2660,7 @@ class SpaceCleaner(_PluginBase):
             torrents_deleted = 0
             main_hashes = self._collect_record_torrent_hashes(all_recs, torrent_index)
             if not main_hashes and download_hash:
-                main_hashes = [(download_hash, True)]
+                main_hashes = [(download_hash, False)]
             # 记录归属下载器：主种子若落在扫描下载器范围外，仍按当初下载它的
             # 下载器定向删除，避免退回默认下载器时 qb 对不存在的 hash 假成功
             rec_owners = {rec.get("download_hash", ""): rec.get("downloader", "")
@@ -2606,14 +2756,14 @@ class SpaceCleaner(_PluginBase):
             self._add_delete_history(
                 display_name,
                 f"已删除（记录 {len(records)} 条{extra}，种子 {torrents_deleted} 个）")
-            if self._notify:
+            if opts["notify"]:
                 ver_line = f"\n不同版本: {len(other_versions)} 条" if other_versions else ""
                 leftover_line = ""
                 if leftover_dirs:
                     leftover_line = "\n残留目录:\n" + "\n".join(str(path) for path in leftover_dirs)
                 # 传入的 space_info 是删除本资源之前的空间快照，通知里应展示删除后的真实剩余空间：
                 # 删种/删文件是异步的，稍等磁盘回收后实时查询一次（失败时回退到快照），避免报出删除前的旧值。
-                if not self._dry_run:
+                if not opts["dry_run"]:
                     time.sleep(2)
                 fresh = self._get_space_info() or space_info
                 self.post_message(title="空间清理器 - 资源已删除",
@@ -2930,10 +3080,11 @@ class SpaceCleaner(_PluginBase):
         种子（不同站点辅种）仍在保种且占用文件。始终反查一次，能命中仍在的种子
         作为入口，避免整个资源组的辅种被漏删。
 
-        安全性：只有当命中的任务根目录就是记录自身或其直接父目录时，才允许
-        `delete_file=True`。命中的是更上层的目录（多季合包、多剧合集等）时只删任务
-        不删文件——否则会把同包里未观看的其他季/其他剧集一起删掉；本单元自己的
-        文件随后由整理记录逐条删除，不影响清理效果。
+        安全性：记录自带的 download_hash 只移除任务、不连带删文件——合集/跨季包
+        无法仅凭 hash 判断文件是否全部属于本单元，盲删会带走同包里未观看的资源。
+        路径反查只有在任务路径与记录源文件路径完全一致（单文件种子）时才允许
+        `delete_file=True`；命中父目录（多文件合包）时只删任务。本单元自己的文件
+        随后由整理记录逐条删除，不影响清理效果。
         """
         hashes: List[Tuple[str, bool]] = []
         order: Dict[str, int] = {}
@@ -2958,12 +3109,12 @@ class SpaceCleaner(_PluginBase):
         for record in records:
             download_hash = record.get("download_hash", "")
             if download_hash:
-                _add(download_hash)
+                # 合集/跨季包的记录共享同一个 hash，不能据此删除整包文件。
+                _add(download_hash, False)
             src = record.get("src", "")
             if not src or not by_path:
                 continue
             src_path = Path(src)
-            own_keys = {str(src_path), str(src_path.parent)}
             for level, candidate in enumerate((src_path, *src_path.parents)):
                 key = str(candidate)
                 # 不向上越过配置的下载/媒体库根目录，也不无限上溯（最多 3 层）
@@ -2972,7 +3123,9 @@ class SpaceCleaner(_PluginBase):
                 torrent_hash = by_path.get(key)
                 if not torrent_hash:
                     continue
-                safe_files = key in own_keys
+                # 只有任务路径与记录源文件完全相同时才可删除文件；父目录命中
+                # 可能是多文件合包，删文件会带走同包其他资源。
+                safe_files = key == str(src_path)
                 if not safe_files:
                     logger.info(f"SC 反查命中上级目录任务 {torrent_hash}（{key}），"
                                 f"仅删除任务不删文件: {src}")
@@ -3040,7 +3193,8 @@ class SpaceCleaner(_PluginBase):
         主种子不在扫描范围时，优先按整理记录归属的下载器（owner_downloader）定向下发，
         避免退回默认下载器造成「删除不存在的 hash 却返回成功」的静默漏删。
         delete_file=False 用于命中上级目录任务（多季合包/合集）的场景：只移除任务，
-        不连带删除同包内其他未观看资源。
+        不连带删除同包内其他未观看资源。辅种一律只移除任务、不删文件——辅种可能
+        是另一下载器/另一路径上的独立副本，无法安全证明文件归属。
         """
         if not download_hash:
             logger.warning(f"SC 无 download_hash，跳过删种: {display_name}")
@@ -3069,9 +3223,12 @@ class SpaceCleaner(_PluginBase):
         for h, name, is_cross, downloader in to_delete:
             role = "辅种" if is_cross else "主种子"
             dl_label = f" @{downloader}" if downloader else ""
+            # 辅种只移除任务：跨下载器/跨路径的同名同体积副本可能是独立文件，
+            # 连带删除会产生不可恢复的数据丢失。
+            item_delete_file = bool(delete_file and not is_cross)
             try:
                 # remove_torrents 返回布尔，失败时不能计入删除数，否则统计虚高且失败被静默
-                if chain.remove_torrents(hashs=h, delete_file=delete_file,
+                if chain.remove_torrents(hashs=h, delete_file=item_delete_file,
                                          downloader=downloader or None):
                     logger.info(f"SC   已删除{role}: {name} ({h}){dl_label}")
                     deleted += 1
@@ -3348,6 +3505,7 @@ class SpaceCleaner(_PluginBase):
         self._rss_anibt_calls = 0
         self._rss_ai_calls = 0
         self._rss_ai_failed = {}
+        stop_event = self._stop_event
         try:
             if self._rss_wash_mode:
                 # 洗版模式：先收集所有 URL 的条目，统一去重后再下载
@@ -3355,6 +3513,9 @@ class SpaceCleaner(_PluginBase):
             else:
                 # 普通模式：逐个 URL 处理
                 for url, _is_anibt in sources:
+                    if stop_event.is_set():
+                        logger.info("SC-RSS 收到停止信号，结束本轮")
+                        break
                     try:
                         self._rss_proc(url)
                     except Exception as e:
@@ -3403,7 +3564,11 @@ class SpaceCleaner(_PluginBase):
         from collections import OrderedDict
         all_candidates = OrderedDict()  # dedup_key -> (item, m, meta, s_season, se_fmt, ts)
         total_items = 0
+        stop_event = self._stop_event
         for url, is_anibt in sources:
+            if stop_event.is_set():
+                logger.info("SC-RSS 收到停止信号，结束本轮")
+                break
             feed = self._rss_feed_params(url)
             items = self._rss_parse(url)
             if not items:
@@ -3411,6 +3576,9 @@ class SpaceCleaner(_PluginBase):
                 continue
             total_items += len(items)
             for item in items:
+                if stop_event.is_set():
+                    logger.info("SC-RSS 收到停止信号，结束本轮")
+                    break
                 t = item.get("title", "")
                 e = item.get("enclosure", "") or item.get("link", "")
                 if not t or not e:
@@ -4999,8 +5167,7 @@ class SpaceCleaner(_PluginBase):
 
     # ==================== 智能助手识别兜底 ====================
 
-    @staticmethod
-    def _run_coro(coro):
+    def _run_coro(self, coro):
         """在插件线程里同步执行协程；当前线程已有事件循环时另起线程执行。"""
         try:
             asyncio.get_running_loop()
@@ -5014,9 +5181,11 @@ class SpaceCleaner(_PluginBase):
             except BaseException as exc:  # noqa: BLE001
                 box["error"] = exc
 
-        t = threading.Thread(target=_worker, daemon=True, name="SC-RSS-AI")
-        t.start()
-        t.join()
+        t = self._start_thread(_worker, "SC-RSS-AI")
+        t.join(timeout=getattr(self, "_rss_ai_timeout", 90) + 10)
+        if t.is_alive():
+            logger.warning("SC-RSS 智能助手调用超时未返回，放弃本次识别")
+            raise TimeoutError("智能助手调用超时")
         if "error" in box:
             raise box["error"]
         return box.get("value")
@@ -5125,7 +5294,7 @@ class SpaceCleaner(_PluginBase):
 
     @staticmethod
     def _rss_ai_word_format_ok(word: str) -> bool:
-        """校验识别词格式：必须是替换型，且被替换词是可编译的正则、不是空泛匹配。"""
+        """校验识别词格式：必须是替换型，且被替换词足够具体、不得使用通配。"""
         text = str(word or "").strip()
         if " => " not in text or text.startswith("#"):
             return False
@@ -5133,9 +5302,25 @@ class SpaceCleaner(_PluginBase):
         replaced, replace = replaced.strip(), replace.strip()
         if not replaced or not replace:
             return False
+        # 通配符会跨标题匹配，直接把一条规则扩散到无关资源；合法兜底词只需要
+        # 字面前缀 + 数字捕获，因此一律拒绝 .* / .+。
+        if re.search(r"\.\*|\.\+", replaced):
+            return False
         # 拒绝过短或纯数字捕获的空泛规则，避免全局误伤其他资源
-        bare = re.sub(r"\\d\{[\d,]*\}|\\d|[\\()\[\]{}?*+.^$|]", "", replaced)
-        if len(bare.strip()) < 3:
+        # 去掉正则转义（\d、\s、\ 等）后再提取字面词，避免把转义字母算进关键词。
+        literal = re.sub(r"\\.", "", replaced)
+        bare = re.sub(r"\d\{[\d,]*\}|\d|[()\[\]{}?*+.^$|]", "", literal)
+        tokens = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]{2,}", bare)
+        if not tokens:
+            return False
+        generic = {
+            "1080p", "720p", "2160p", "480p", "4k", "8k", "web", "webdl",
+            "webrip", "bluray", "bdrip", "brrip", "dvdrip", "hdtv", "remux",
+            "x264", "x265", "h264", "h265", "hevc", "avc", "aac", "ac3",
+            "flac", "dts", "hdr", "sdr", "proper", "repack", "internal",
+            "complete", "vostfr", "subbed", "dubbed",
+        }
+        if all(token.lower() in generic for token in tokens):
             return False
         try:
             re.compile(replaced)
@@ -5143,9 +5328,30 @@ class SpaceCleaner(_PluginBase):
             return False
         return True
 
+    def _rss_ai_negative_titles(self, meta, limit: int = 20) -> List[str]:
+        """从播放缓存取与本条媒体无关的标题，作为识别词负样本。"""
+        target = self._normalize_api_media_name(getattr(meta, "name", "") or "")
+        titles: List[str] = []
+        with self._pb_lock:
+            pb = list(self._pb)
+        for record in pb:
+            name = str(record.get("n") or "").strip()
+            if not name:
+                continue
+            normalized = self._normalize_api_media_name(name)
+            # 同剧不同集/不同季的标题不算负样本，避免把合法窄词误杀。
+            if target and (target in normalized or normalized in target):
+                continue
+            if name in titles:
+                continue
+            titles.append(name)
+            if len(titles) >= limit:
+                break
+        return titles
+
     def _rss_ai_word_verify(self, word: str, rt: str, season: Optional[int], episode: Optional[int],
                             tmdb_id: Optional[int], is_tv: bool) -> bool:
-        """用「现有识别词 + 新识别词」实际解析一次原始标题，验证新词能得到期望的季集。"""
+        """用「现有识别词 + 新识别词」解析原始标题，并用无关标题做负样本校验。"""
         if not self._rss_ai_word_format_ok(word):
             self._rss_log("识别词校验失败", word, "格式或正则无效")
             return False
@@ -5172,6 +5378,16 @@ class SpaceCleaner(_PluginBase):
         if tmdb_id and parsed_tmdbid and parsed_tmdbid != int(tmdb_id):
             self._rss_log("识别词校验失败", word, f"解析 TMDB {parsed_tmdbid} != 期望 {tmdb_id}")
             return False
+        # 负样本：规则命中无关标题时拒绝写入，防止宽泛规则污染全局识别。
+        for negative in self._rss_ai_negative_titles(meta):
+            try:
+                negative_meta = MetaInfo(title=negative, custom_words=words)
+            except Exception:
+                continue
+            if word in (getattr(negative_meta, "apply_words", None) or []):
+                self._rss_log("识别词校验失败", word,
+                              f"规则会命中无关标题「{negative[:80]}」，拒绝写入全局识别词")
+                return False
         return True
 
     @staticmethod
@@ -5313,6 +5529,11 @@ class SpaceCleaner(_PluginBase):
         episode = self._rss_ai_int(guess.get("episode")) if is_tv else None
         if is_tv and season is None:
             season = 1
+        if is_tv and (season is None or int(season) < 1):
+            self._rss_log("智能助手识别失败", rt, "电视剧季号必须大于 0")
+            if key:
+                self._rss_ai_failed[key] = "季号无效"
+            return None, None, ""
         self._rss_log("智能助手结果", rt,
                       f"《{title}》 TMDB={tmdb_id or '无'} "
                       f"{'S%02d' % season if season is not None else ''}"
@@ -5323,10 +5544,10 @@ class SpaceCleaner(_PluginBase):
             if key:
                 self._rss_ai_failed[key] = "结果不完整"
             return None, None, ""
-        if is_tv and episode is None:
-            self._rss_log("智能助手识别失败", rt, "电视剧未给出集号")
+        if is_tv and (episode is None or int(episode) < 1):
+            self._rss_log("智能助手识别失败", rt, "电视剧集号必须大于 0")
             if key:
-                self._rss_ai_failed[key] = "缺少集号"
+                self._rss_ai_failed[key] = "集号无效"
             return None, None, ""
         if cached_seasons and is_tv and season is not None and int(season) not in cached_seasons:
             cached_text = "、".join(f"S{s:02d}" for s in cached_seasons)
@@ -5347,8 +5568,9 @@ class SpaceCleaner(_PluginBase):
                     self._rss_ai_failed[key] = "集号仍超跨度"
                 return None, None, ""
 
-        # 生成并校验自定义识别词：优先用智能助手给出的，无效时自造窄匹配规则
-        word_saved = ""
+        # 生成并校验自定义识别词：优先用智能助手给出的，无效时自造窄匹配规则。
+        # 先只做预演，TMDB 查询成功且调用方最终采用后才写入全局识别词。
+        word_pending = ""
         if self._rss_ai_add_words:
             candidates = [str(guess.get("word") or "").strip(),
                           self._rss_ai_build_word(rt, title, season, episode, tmdb_id, is_tv)]
@@ -5356,16 +5578,15 @@ class SpaceCleaner(_PluginBase):
                 if not cand:
                     continue
                 if self._rss_ai_word_verify(cand, rt, season, episode, tmdb_id, is_tv):
-                    if self._rss_ai_save_word(cand):
-                        word_saved = cand
+                    word_pending = cand
                     break
 
-        # 识别词生效后重新解析原始标题；未写入识别词时直接用智能助手给出的季集
+        # 预演识别词时只在本次解析中临时附加，不写入全局配置。
         meta = None
-        if word_saved:
+        if word_pending:
             try:
-                meta = MetaInfo(title=rt)
-                self._rss_log_meta("识别词生效后重解析", rt, meta)
+                meta = MetaInfo(title=rt, custom_words=list(self._current_custom_words()) + [word_pending])
+                self._rss_log_meta("识别词预演后重解析", rt, meta)
             except Exception:
                 meta = None
         if meta is None:
@@ -5396,6 +5617,10 @@ class SpaceCleaner(_PluginBase):
                 meta.begin_episode = int(episode)
             if getattr(meta, "begin_season", None) is None:
                 meta.begin_season = int(season)
+        # 只有 TMDB 已确认媒体、季集也通过后续校验后才提交全局识别词。
+        word_saved = ""
+        if word_pending and self._rss_ai_save_word(word_pending):
+            word_saved = word_pending
         self._drop_api_negative_cache_by_title(rt)
         try:
             self._save_api_success_cache(self._api_recognize_cache_key(meta), getattr(meta, "name", "") or title, media)
@@ -5997,6 +6222,7 @@ class SpaceCleaner(_PluginBase):
                 return
             self._rename_busy = True
         renamed = skipped = failed = 0
+        stop_event = self._stop_event
         try:
             try:
                 services = DownloaderHelper().get_services(name_filters=self._rename_downloader or None)
@@ -6008,6 +6234,9 @@ class SpaceCleaner(_PluginBase):
                 return
             tag = (self._rename_tag or "SC-renamed").strip()
             for name, service in services.items():
+                if stop_event.is_set():
+                    self._rename_log("结束", name, "收到停止信号")
+                    break
                 instance = getattr(service, "instance", None)
                 stype = (getattr(service, "type", "") or "").lower()
                 if not instance:
@@ -6034,6 +6263,9 @@ class SpaceCleaner(_PluginBase):
                     self._rename_log("取种失败", name, "下载器返回异常")
                     continue
                 for t in torrents or []:
+                    if stop_event.is_set():
+                        self._rename_log("结束", name, "收到停止信号")
+                        break
                     try:
                         thash = t.get("hash")
                         cur_name = (t.get("name") or "").strip()
@@ -6088,9 +6320,8 @@ class SpaceCleaner(_PluginBase):
         if not (self._rename_on and self._rss_rename_listen and thash):
             return
         try:
-            threading.Thread(target=self._rss_rename_after_add,
-                             args=(str(thash).strip(), media, meta, orig_name or ""),
-                             daemon=True, name="SC-RSSRename").start()
+            self._start_thread(self._rss_rename_after_add, "SC-RSSRename",
+                               str(thash).strip(), media, meta, orig_name or "")
         except Exception as exc:
             self._rename_log("RSS监听", orig_name or str(thash), f"启动重命名线程失败: {exc}")
 
@@ -6206,10 +6437,8 @@ class SpaceCleaner(_PluginBase):
         label = "本地监听"
         orig_name = str(source or username or "")
         try:
-            threading.Thread(
-                target=self._rss_rename_after_add,
-                args=(str(thash).strip(), None, None, orig_name),
-                kwargs={"write_cache": False, "label": label},
-                daemon=True, name="SC-NativeRename").start()
+            self._start_thread(self._rss_rename_after_add, "SC-NativeRename",
+                               str(thash).strip(), None, None, orig_name,
+                               write_cache=False, label=label)
         except Exception as exc:
             self._rename_log(label, orig_name or str(thash), f"启动重命名线程失败: {exc}")

@@ -6,6 +6,9 @@
 """
 from unittest.mock import patch
 
+import pytest
+
+pytest.importorskip("agenttokens")
 from agenttokens import AgentTokens  # noqa: E402
 
 
