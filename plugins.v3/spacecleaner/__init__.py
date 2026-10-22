@@ -1,18 +1,27 @@
 """
 SpaceCleaner: 空间清理 + AniBT/RSS 洗版下载，共用播放进度缓存。
 """
-import asyncio, json, os, re, time, threading, shutil
+import asyncio
+import json
+import os
+import re
+import shutil
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+from app import schemas
 from app.chain.download import DownloadChain
 from app.chain.storage import StorageChain
 from app.db.models.transferhistory import TransferHistory
 from app.plugins import _PluginBase
-from app import schemas
+from app.schemas.types import EventType, MediaSource, MediaType
 from app.sdk.chain import ChainBase
 from app.sdk.config import settings
 from app.sdk.events import Event, eventmanager
@@ -21,7 +30,6 @@ from app.sdk.media import Context, MediaInfo, MetaInfo, TorrentInfo
 from app.sdk.network import RequestUtils, RssHelper
 from app.sdk.services import DownloaderHelper, RuleHelper
 from app.sdk.utilities import SystemUtils
-from app.schemas.types import EventType, MediaSource, MediaType
 
 
 class RawTorrent:
@@ -2303,8 +2311,9 @@ class SpaceCleaner(_PluginBase):
         只读操作：不删除任何种子、文件或记录。真实清理与详情页试运行预览共用，
         保证预览列出的资源与顺序就是真实清理会处理的资源与顺序。
         """
-        from app.db import ScopedSession
         from sqlalchemy import asc
+
+        from app.db import ScopedSession
         sess = ScopedSession()
         try:
             pb = self._get_playback_pb()
@@ -2337,7 +2346,7 @@ class SpaceCleaner(_PluginBase):
             hash_groups: Dict[str, List[TransferHistory]] = {}
             no_hash_records = []
             while True:
-                recs = sess.query(TransferHistory).filter(TransferHistory.status == True).order_by(asc(TransferHistory.id)).offset(offset).limit(25).all()
+                recs = sess.query(TransferHistory).filter(TransferHistory.status.is_(True)).order_by(asc(TransferHistory.id)).offset(offset).limit(25).all()
                 if not recs:
                     break
                 for r in recs:
@@ -2835,7 +2844,7 @@ class SpaceCleaner(_PluginBase):
                     # v3 媒体身份为 media_source + media_id 成对字段，不再有 tmdbid 列
                     TransferHistory.media_source == "themoviedb",
                     TransferHistory.media_id.in_([str(t) for t in tmdbids]),
-                    TransferHistory.status == True
+                    TransferHistory.status.is_(True)
                 ).all()
                 for r in recs:
                     if r.id in unit_ids or r.id in found:
@@ -2933,7 +2942,7 @@ class SpaceCleaner(_PluginBase):
                     # v3 媒体身份为 media_source + media_id 成对字段，不再有 tmdbid 列
                     TransferHistory.media_source == "themoviedb",
                     TransferHistory.media_id.in_([str(t) for t in tmdbids]),
-                    TransferHistory.status == True
+                    TransferHistory.status.is_(True)
                 ).all()
                 for r in recs:
                     tid = self._tmdbid_of(r)
