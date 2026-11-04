@@ -26,10 +26,10 @@
     }
   },
   "agentconfigprofile": {
-    "name": "API聚合自动切换",
-    "description": "保存智能助手 LLM 配置模板，一键切换，探测端点可用模型自动建模板，并在模型失效时自动切换。",
+    "name": "MP Switch",
+    "description": "参考CC Switch制作，仓库地址https://github.com/farion1231/cc-switch?tab=readme-ov-file",
     "labels": "智能助手",
-    "version": "2.8.0",
+    "version": "3.0.0",
     "icon": "agentresourceofficer.png",
     "author": "tafei",
     "author_url": "https://github.com/cudamin",
@@ -37,6 +37,7 @@
     "release": true,
     "system_version": ">=3.0.1",
     "history": {
+      "v3.0.0": "更名 MP Switch；参考 CC Switch 实现直连、路由、聚合三模式与本机网关；重构供应商工作台，复用 User-Agent 预设并移植熔断与有序故障转移；适配亮暗主题与窄屏。",
       "v2.8.0": "重绘数据详情页；修复重置后旧配置复活、同模型多密钥无法切换、并发写入串配置、过期健康状态接管与跨端点密钥复用；新增健康有效期与切换失败冷却。",
       "v2.7.0": "白名单合并为单框并支持 LLM 提供商多选；全局参数新增 API 协议/联网搜索/User-Agent/定时唤醒；修复探活中断后状态卡死等问题。",
       "v2.6.2": "修复BUG",

@@ -1,0 +1,2 @@
+# 原样保存上游资源字节，避免 Windows 自动换行转换使校验失效。
+userAgentPresets.ts -text
