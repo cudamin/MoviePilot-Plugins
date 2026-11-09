@@ -56,7 +56,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理&AniBT洗版"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；AniBT/RSS 洗版下载自动跳过已看完剧集：AniBT 源优先用 RSS 链接里的 bgmId 与 episode 锁定番剧与集号，识别失败时依次由 AniBT 识别补强、智能助手接管识别并自动写入自定义识别词；识别集号比播放缓存中该季最新集数大出阈值时视为识别异常，自动跳过下载（开启智能助手后先由智能助手复核）。"
     plugin_icon = "delete.png"
-    plugin_version = "5.7.3"
+    plugin_version = "5.7.4"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -108,6 +108,7 @@ class SpaceCleaner(_PluginBase):
     _ANIBT_SHOW_MAX = 300  # bgmId → TMDB 剧集 映射缓存上限
     _ANIBT_TMDB_SEASON_MAX = 200  # TMDB 季清单缓存上限
     _ANIBT_TMDB_EP_MAX = 300  # TMDB 季集清单缓存上限
+    _ANIBT_IDENTITY_CACHE_VERSION = 1  # 候选标题必须来自同一个已确认的 AniBT 作品
 
     # === 种子自动重命名配置 ===
     _rename_on = False  # 启用种子自动重命名
@@ -4578,6 +4579,15 @@ class SpaceCleaner(_PluginBase):
         self._rss_anibt_shows = _slice("shows", self._ANIBT_SHOW_MAX)
         self._rss_tmdb_seasons = _slice("seasons", self._ANIBT_TMDB_SEASON_MAX)
         self._rss_tmdb_episodes = _slice("eps", self._ANIBT_TMDB_EP_MAX)
+        if raw.get("identity_version") != self._ANIBT_IDENTITY_CACHE_VERSION:
+            # 旧版 rt: 包混合前三个候选的标题，其派生 shows 已无法追溯来源。
+            # 只重建这两类身份缓存，保留直接按 bgmId 查询的资料和用户播放/下载状态。
+            self._rss_anibt_packs = {
+                key: pack for key, pack in self._rss_anibt_packs.items()
+                if key.startswith("bgm:")
+            }
+            self._rss_anibt_shows = {}
+            self._save_anibt_cache(force=True)
 
     def _save_anibt_cache(self, force: bool = False) -> None:
         """落盘 AniBT/TMDB 映射缓存，超出上限时丢弃最早的条目。
@@ -4590,6 +4600,7 @@ class SpaceCleaner(_PluginBase):
             return
         try:
             self.save_data("rss_anibt_cache", {
+                "identity_version": self._ANIBT_IDENTITY_CACHE_VERSION,
                 "packs": dict(list(self._rss_anibt_packs.items())[-self._ANIBT_PACK_MAX:]),
                 "shows": dict(list(self._rss_anibt_shows.items())[-self._ANIBT_SHOW_MAX:]),
                 "seasons": dict(list(self._rss_tmdb_seasons.items())[-self._ANIBT_TMDB_SEASON_MAX:]),
@@ -4701,37 +4712,45 @@ class SpaceCleaner(_PluginBase):
             return None
         if not isinstance(resp, dict):
             return None
-        decision = resp.get("decision") or {}
-        if decision.get("kind") not in ("auto", "manual"):
+        decision = resp.get("decision")
+        if not isinstance(decision, dict):
+            return None
+        # AniBT 的 manual 表示仍需人工确认，不能自动取首个候选。
+        if decision.get("kind") != "auto":
             self._rss_log("AniBT 无匹配", rt, f"decision={decision.get('kind')}")
             return None
         candidates = resp.get("candidates") or []
         hit_id = decision.get("animeId")
-        # decision 命中的 animeId 提到最前，其余保持接口返回的相关度顺序
-        ordered = sorted(
-            candidates,
-            key=lambda c: 0 if (c.get("animeId") or (c.get("anime") or {}).get("_id")) == hit_id else 1,
-        )
-        pack: Optional[dict] = None
-        titles: List[str] = []
-        for cand in ordered[:3]:
-            anime = cand.get("anime") or {}
-            if pack is None and anime:
-                pack = self._pack_from_anibt_anime(anime)
-            localized = anime.get("title") or {}
-            for name in (localized.get("chinese"), localized.get("native"),
-                         localized.get("english"), localized.get("romaji"),
-                         anime.get("titleRomaji")):
-                text = name.strip() if isinstance(name, str) else ""
-                if text and text not in titles:
-                    titles.append(text)
-        if pack is None and not titles:
+        if not hit_id or not isinstance(candidates, list):
             return None
-        pack = pack or {}
-        merged = list(dict.fromkeys(list(pack.get("titles") or []) + titles))
-        pack["titles"] = merged
-        if str(decision.get("bgmId") or "").isdigit() and not pack.get("bgmId"):
-            pack["bgmId"] = int(decision["bgmId"])
+        selected = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("anime"), dict):
+                continue
+            anime = candidate["anime"]
+            if candidate.get("animeId") == hit_id or anime.get("_id") == hit_id:
+                selected.append(candidate)
+        if len(selected) != 1:
+            self._rss_log("AniBT 匹配跳过", rt, "自动决策未对应唯一候选，回退通用识别")
+            return None
+        candidate = selected[0]
+        anime = candidate["anime"]
+        if any(value and value != hit_id for value in (candidate.get("animeId"), anime.get("_id"))):
+            self._rss_log("AniBT 匹配跳过", rt, "候选 animeId 不一致，回退通用识别")
+            return None
+        bgm_ids = [str(value) for value in
+                   (decision.get("bgmId"), candidate.get("bgmId"), anime.get("bgmId"))
+                   if value is not None]
+        if any(not value.isdigit() or int(value) <= 0 for value in bgm_ids) or len(set(bgm_ids)) > 1:
+            self._rss_log("AniBT 匹配跳过", rt, "候选 bgmId 不一致，回退通用识别")
+            return None
+        # 其它候选是不同作品，不是选中作品的别名，不能参与后续 TMDB 识别。
+        pack = self._pack_from_anibt_anime(anime)
+        pack["animeId"] = hit_id
+        if bgm_ids:
+            pack["bgmId"] = int(bgm_ids[0])
+        if not pack.get("titles"):
+            return None
         self._rss_anibt_packs[cache_key] = pack
         self._save_anibt_cache()
         return pack
@@ -4804,9 +4823,14 @@ class SpaceCleaner(_PluginBase):
         probe_title = titles[0] if titles else (str(bgm_id) if bgm_id else str(tmdb_id))
         cached = self._rss_anibt_shows.get(key)
         if cached and cached.get("tmdb_id"):
-            return MediaInfo(media_source=MediaSource.TMDB, media_id=str(int(cached["tmdb_id"])),
-                             type=MediaType.TV, title=cached.get("title") or probe_title,
-                             tmdb_id=int(cached["tmdb_id"]))
+            if not tmdb_id or int(cached["tmdb_id"]) == int(tmdb_id):
+                return MediaInfo(media_source=MediaSource.TMDB, media_id=str(int(cached["tmdb_id"])),
+                                 type=MediaType.TV, title=cached.get("title") or probe_title,
+                                 tmdb_id=int(cached["tmdb_id"]))
+            self._rss_log("AniBT 映射冲突", probe_title,
+                          f"缓存 TMDB={cached['tmdb_id']} 与报文 TMDB={tmdb_id} 不同，重新按明确 ID 查询")
+            self._rss_anibt_shows.pop(key, None)
+            self._save_anibt_cache()
         tmdb_module = self.chain.modulemanager.get_running_module("TheMovieDbModule")
         if not tmdb_module:
             self._rss_log("AniBT识别异常", probe_title, "TMDB 官方识别模块未运行")
@@ -4815,13 +4839,15 @@ class SpaceCleaner(_PluginBase):
             try:
                 media = tmdb_module.recognize_media(meta=MetaInfo(title=probe_title), mtype=MediaType.TV,
                                                     media_source=MediaSource.TMDB,
-                                                    media_id=str(int(tmdb_id)))
-                if media and getattr(media, "tmdb_id", None):
+                                                    media_id=str(int(tmdb_id)), cache=False)
+                if media and self._tmdbid_of(media) == int(tmdb_id) and media.type == MediaType.TV:
                     self._rss_anibt_shows[key] = {"tmdb_id": int(media.tmdb_id), "title": media.title}
                     self._save_anibt_cache()
                     return media
             except Exception as exc:
                 self._rss_log("AniBT识别异常", probe_title, f"按 TMDB ID 查询失败: {exc}")
+            # 明确身份查询失败时交回通用识别，不能改用另一部同名作品覆盖这个映射。
+            return None
         cands: List[str] = []
         for name in titles:
             base = self._strip_season_suffix(name)
@@ -5097,6 +5123,10 @@ class SpaceCleaner(_PluginBase):
         if not pack and self._rss_anibt_match:
             # AniBT 识别补强：先用 torrent-match 解析番剧（不再是兜底）
             pack = self._rss_anibt_match_pack(rt)
+        if bgm_id and pack and str(pack.get("bgmId") or "") != str(bgm_id):
+            self._rss_log("AniBT 身份冲突", rt,
+                          f"RSS bgmId={bgm_id} 与候选 bgmId={pack.get('bgmId')} 不同，回退通用识别")
+            return None, None, ""
         if pack and pack.get("bgmId") and not bgm_id:
             bgm_id = int(pack["bgmId"])
             bgm_pack = self._rss_anibt_bgm_pack(bgm_id)
