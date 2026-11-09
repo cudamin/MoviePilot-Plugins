@@ -56,7 +56,7 @@
     "name": "JackettBridge",
     "description": "将 Jackett 中已配置的索引器接入 MoviePilot 搜索与订阅。",
     "labels": "站点",
-    "version": "1.3.10",
+    "version": "1.4.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Jackett_A.png",
     "author": "tafei",
     "author_url": "https://github.com/cudamin",
@@ -64,6 +64,7 @@
     "release": true,
     "system_version": ">=3.0.1",
     "history": {
+      "v1.4.0": "修复分身站点隔离、关闭及重配后的旧同步写入、订阅与手动分页站点选择、站点设置被覆盖、媒体类型筛选、发布时间时区及空索引器清理；音乐订阅建议使用爬虫刷新模式。",
       "v1.3.10": "修复关闭状态立即同步、配置变更后完整同步、站点删除残留、重复更新与单条坏数据丢批；新增总检索时限与同步线程停止收尾",
       "v1.3.9": "插件更新后自动完整同步一次，卸载插件时自动清理虚拟站点",
       "v1.3.6": "修复索引器注册结构不随分类声明更新，音乐站点列表需完整同步一次后生效",

@@ -48,7 +48,7 @@ class JackettBridge(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     # 插件标签
     plugin_label = "站点"
     # 插件作者
@@ -368,7 +368,6 @@ class JackettBridge(_PluginBase):
             res = RequestUtils(headers=self.__headers(), session=session).post_res(
                 url=f"{self._host}/UI/Dashboard",
                 data={"password": self._password},
-                params={"password": self._password},
             )
             if res and session.cookies:
                 return session.cookies.get_dict()
@@ -383,7 +382,7 @@ class JackettBridge(_PluginBase):
 
         该接口仅需 apikey，即使 Jackett 设置了管理密码也可访问，返回 XML。
 
-        :return: 索引器原始信息列表，失败时返回 None
+        :return: 索引器原始信息列表，有效空列表返回 []，失败时返回 None
         """
         try:
             res = RequestUtils(
@@ -420,6 +419,9 @@ class JackettBridge(_PluginBase):
                 f"{root.attrib.get('description') or root.attrib.get('code')}"
             )
             return None
+        if root.tag != "indexers":
+            logger.warn(f"【{self.plugin_name}】Torznab 索引器列表根节点异常：{root.tag}")
+            return None
         items: List[Dict[str, Any]] = []
         for node in root.findall("indexer"):
             indexer_id = str(node.attrib.get("id") or "").strip()
@@ -434,7 +436,6 @@ class JackettBridge(_PluginBase):
             })
         if not items:
             logger.warn(f"【{self.plugin_name}】Jackett 未返回任何索引器，请先在 Jackett 中添加索引器")
-            return None
         return items
 
     def __fetch_indexers_admin_api(self) -> Optional[List[Dict[str, Any]]]:
@@ -998,20 +999,27 @@ class JackettBridge(_PluginBase):
     @staticmethod
     def __parse_pubdate(value: Optional[str]) -> Optional[str]:
         """
-        将 RFC822 发布时间转换为标准时间字符串。
+        将 RFC822 或 ISO 发布时间转换为标准时间字符串；带时区时先转换到本地时间。
         """
         text = (value or "").strip()
         if not text:
             return None
         try:
-            return parsedate_to_datetime(text).strftime("%Y-%m-%d %H:%M:%S")
+            pubdate = parsedate_to_datetime(text)
         except Exception:
-            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+            # ISO 的 Z 明确表示 UTC，使用偏移解析，避免当作无时区的字面量。
+            iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
                 try:
-                    return datetime.strptime(text, fmt).strftime("%Y-%m-%d %H:%M:%S")
+                    pubdate = datetime.strptime(iso_text, fmt)
+                    break
                 except ValueError:
                     continue
-        return text
+            else:
+                return text
+        if pubdate.utcoffset() is not None:
+            pubdate = pubdate.astimezone()
+        return pubdate.strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
     def __parse_imdbid(value: Any) -> Optional[str]:
