@@ -57,7 +57,7 @@ class SpaceCleaner(_PluginBase):
     plugin_name = "空间清理&AniBT洗版"
     plugin_desc = "剩余空间不足时自动删除已观看资源（优先删除最早看完/标记的资源，电视剧按整理记录中该季最后一集看完即删整季，含辅种及同集/同片的不同版本，删种后一并删除媒体库文件及其所在目录）；AniBT/RSS 洗版下载自动跳过已看完剧集：AniBT 源优先用 RSS 链接里的 bgmId 与 episode 锁定番剧与集号，识别失败时依次由 AniBT 识别补强、智能助手接管识别并自动写入自定义识别词；识别集号比播放缓存中该季最新集数大出阈值时视为识别异常，自动跳过下载（开启智能助手后先由智能助手复核）。"
     plugin_icon = "delete.png"
-    plugin_version = "5.7.5"
+    plugin_version = "5.8.0"
     plugin_label = "系统工具"
     plugin_author = "tafei"
     author_url = "https://github.com/cudamin"
@@ -639,6 +639,8 @@ class SpaceCleaner(_PluginBase):
             {"path": "/rename_run_once", "endpoint": self.rename_run_once, "methods": ["GET"], "summary": "立即执行种子重命名"},
             # ---- 识别缓存 ----
             {"path": "/cache_clear", "endpoint": self.cache_clear, "methods": ["GET"], "summary": "清空识别缓存"},
+            {"path": "/del_cache_item", "endpoint": self.del_cache_item, "methods": ["GET"],
+             "summary": "删除单条识别缓存"},
         ]
 
     # ---------- 详情页视图状态 ----------
@@ -939,6 +941,51 @@ class SpaceCleaner(_PluginBase):
                 self.save_data("api_recognize_cache", [])
         self._set_notice(f"已清空{labels[kind]}", "success")
         logger.info(f"SC 已清空{labels[kind]}")
+        return schemas.Response(success=True)
+
+    def del_cache_item(self, key: str = "", kind: str = "success", apikey: str = ""):
+        """删除单条识别缓存：kind=success 正缓存 / negative 负缓存。
+
+        识别缓存按「解析名称」做标题级键，一条脏记录会让同一标题的所有报文
+        持续命中错误媒体（例如 LLM 兜底把某番剧误判成另一部剧后写入正缓存）。
+        这里提供按 key 精确删除，避免只能整表清空。
+        """
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False)
+        key = str(key or "").strip()
+        kind = (kind or "success").strip().lower()
+        if not key:
+            return schemas.Response(success=False, message="缺少缓存键")
+        if kind not in ("success", "negative"):
+            return schemas.Response(success=False, message="无效缓存类型")
+        removed = None
+        with self._api_recognize_cache_lock:
+            if kind == "success":
+                before = len(self._api_recognize_success_cache)
+                kept = [item for item in self._api_recognize_success_cache
+                        if str(item.get("key") or "").strip() != key]
+                if len(kept) != before:
+                    removed = next((item for item in self._api_recognize_success_cache
+                                    if str(item.get("key") or "").strip() == key), None)
+                    self._api_recognize_success_cache = kept
+                    self.save_data("api_recognize_success_cache", list(kept))
+            else:
+                before = len(self._api_recognize_cache)
+                kept = [item for item in self._api_recognize_cache
+                        if str(item.get("key") or "").strip() != key]
+                if len(kept) != before:
+                    removed = next((item for item in self._api_recognize_cache
+                                    if str(item.get("key") or "").strip() == key), None)
+                    self._api_recognize_cache = kept
+                    self.save_data("api_recognize_cache", list(kept))
+        label = "识别成功缓存" if kind == "success" else "识别失败缓存"
+        if removed is None:
+            self._set_notice(f"{label}中未找到「{key}」", "warning")
+            return schemas.Response(success=False, message="未找到该缓存条目")
+        detail = f"{key} -> TMDB={removed.get('tmdb_id')} 《{removed.get('title') or ''}》" \
+            if kind == "success" else key
+        self._set_notice(f"已删除{label}：{detail}", "success")
+        logger.info(f"SC 删除单条{label}: {detail}")
         return schemas.Response(success=True)
 
     @staticmethod
@@ -1841,47 +1888,97 @@ class SpaceCleaner(_PluginBase):
 
     # ---------- 识别缓存 ----------
 
+    def _page_cache_row(self, cells: List[dict], key: str, kind: str, tip: str) -> dict:
+        """单条识别缓存行：各列 + 行内删除按钮。
+
+        缓存表不能用 VDataTableVirtual 渲染操作列（渲染器只透传 props，无法注入
+        单元格插槽），因此与播放缓存一致，用自定义 div 行承载行内图标按钮。
+        """
+        content = list(cells)
+        content.append({"component": "div",
+                        "props": {"style": "width: 56px;", "class": "d-flex align-center justify-end"},
+                        "content": [self._icon_btn("mdi-close-circle-outline", tip, "del_cache_item",
+                                                   color="error", key=key, kind=kind)]})
+        return {"component": "div",
+                "props": {"class": "d-flex align-center px-3 py-1 border-t text-body-2"},
+                "content": content}
+
+    @staticmethod
+    def _page_cache_cell(text: str, style: str, title: str = "") -> dict:
+        props = {"style": style, "class": "text-truncate"}
+        if title:
+            props["title"] = title
+        return {"component": "div", "props": props, "text": text}
+
     def _page_tab_cache(self, view: dict, success_cache: List[dict], negative_cache: List[dict]) -> List[dict]:
-        success_items = []
+        success_rows = [{"component": "div",
+                         "props": {"class": "d-flex align-center px-3 py-1 text-caption "
+                                            "text-medium-emphasis border-b"},
+                         "content": [
+                             self._page_cache_cell("解析名称", "flex: 1 1 140px; min-width: 0;"),
+                             self._page_cache_cell("标题", "flex: 1 1 140px; min-width: 0;"),
+                             self._page_cache_cell("年份", "width: 70px;"),
+                             self._page_cache_cell("类型", "width: 80px;"),
+                             self._page_cache_cell("TMDB ID", "width: 100px;"),
+                             self._page_cache_cell("操作", "width: 56px; text-align: right;"),
+                         ]}]
         for item in reversed(success_cache or []):
-            success_items.append({"key": str(item.get("key") or ""),
-                                  "title": str(item.get("title") or ""),
-                                  "year": str(item.get("year") or "") or "-",
-                                  "media_type": str(item.get("media_type") or "") or "-",
-                                  "tmdb_id": str(item.get("tmdb_id") or "")})
-        negative_items = []
+            key = str(item.get("key") or "")
+            title = str(item.get("title") or "")
+            success_rows.append(self._page_cache_row([
+                self._page_cache_cell(key, "flex: 1 1 140px; min-width: 0;", key),
+                self._page_cache_cell(title, "flex: 1 1 140px; min-width: 0;", title),
+                self._page_cache_cell(str(item.get("year") or "") or "-", "width: 70px;"),
+                self._page_cache_cell(str(item.get("media_type") or "") or "-", "width: 80px;"),
+                self._page_cache_cell(str(item.get("tmdb_id") or ""), "width: 100px;"),
+            ], key, "success", "删除这条识别成功缓存"))
+        if not success_cache:
+            success_rows.append({"component": "div",
+                                 "props": {"class": "pa-6 text-center text-body-2 text-medium-emphasis"},
+                                 "text": "暂无识别成功缓存"})
+
+        negative_rows = [{"component": "div",
+                          "props": {"class": "d-flex align-center px-3 py-1 text-caption "
+                                             "text-medium-emphasis border-b"},
+                          "content": [
+                              self._page_cache_cell("解析名称", "flex: 1 1 200px; min-width: 0;"),
+                              self._page_cache_cell("原始名称", "flex: 1 1 200px; min-width: 0;"),
+                              self._page_cache_cell("操作", "width: 56px; text-align: right;"),
+                          ]}]
         for item in reversed(negative_cache or []):
-            negative_items.append({"key": str(item.get("key") or ""),
-                                   "name": str(item.get("name") or "")})
+            key = str(item.get("key") or "")
+            name = str(item.get("name") or "")
+            negative_rows.append(self._page_cache_row([
+                self._page_cache_cell(key, "flex: 1 1 200px; min-width: 0;", key),
+                self._page_cache_cell(name, "flex: 1 1 200px; min-width: 0;", name),
+            ], key, "negative", "删除这条识别失败缓存"))
+        if not negative_cache:
+            negative_rows.append({"component": "div",
+                                  "props": {"class": "pa-6 text-center text-body-2 text-medium-emphasis"},
+                                  "text": "暂无识别失败缓存"})
+
         blocks = [
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2 px-3 pt-3 pb-2"}, "content": [
                 {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"}, "text": "识别成功缓存"},
-                self._chip(f"{len(success_items)} / {self._api_recognize_success_cache_max}", color="success"),
+                self._chip(f"{len(success_cache or [])} / {self._api_recognize_success_cache_max}", color="success"),
                 {"component": "div", "props": {"style": "flex: 1 1 auto;"}},
                 self._btn("清空", "cache_clear", color="error", icon="mdi-delete-outline", kind="success"),
             ]},
-            self._table([{"title": "解析名称", "key": "key"},
-                         {"title": "标题", "key": "title"},
-                         {"title": "年份", "key": "year", "width": 90},
-                         {"title": "类型", "key": "media_type", "width": 90},
-                         {"title": "TMDB ID", "key": "tmdb_id", "width": 110}],
-                        success_items, "暂无识别成功缓存"),
+            {"component": "div", "content": success_rows},
             {"component": "VDivider", "props": {"class": "my-2"}},
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-2 px-3 pt-2 pb-2"}, "content": [
                 {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"}, "text": "识别失败缓存"},
-                self._chip(f"{len(negative_items)} / {self._api_recognize_cache_max}", color="warning"),
+                self._chip(f"{len(negative_cache or [])} / {self._api_recognize_cache_max}", color="warning"),
                 {"component": "div", "props": {"style": "flex: 1 1 auto;"}},
                 self._btn("清空", "cache_clear", color="error", icon="mdi-delete-outline", kind="negative"),
             ]},
-            self._table([{"title": "解析名称", "key": "key"},
-                         {"title": "原始名称", "key": "name"}],
-                        negative_items, "暂无识别失败缓存"),
+            {"component": "div", "content": negative_rows},
             {"component": "div", "props": {"class": "pa-3"}, "content": [
                 {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact"},
                  "content": [self._caption("识别顺序：MoviePilot 本地缓存 → 识别成功缓存 → 识别失败缓存（命中则跳过）→ "
                                            "TMDB API → AniBT 识别 → 智能助手（每轮最多 1 次）。"
-                                           "新增自定义识别词后建议清空识别失败缓存，"
-                                           "让对应报文重新识别。")]},
+                                           "识别错误时可直接删除对应单条缓存，让该标题重新识别；"
+                                           "新增自定义识别词后建议清空识别失败缓存。")]},
             ]},
         ]
         return blocks
@@ -4514,9 +4611,56 @@ class SpaceCleaner(_PluginBase):
             self.save_data("api_recognize_success_cache", cache)
         return cache
 
+    @staticmethod
+    def _normalize_media_name(name: str) -> str:
+        """规范化媒体名称用于一致性比对：只保留字母、数字和汉字。"""
+        return re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", str(name or "").strip().casefold())
+
+    @classmethod
+    def _media_name_candidates(cls, media: Any) -> List[str]:
+        """收集 TMDB 结果里可用于比对的全部名称（标题、原名、别名）。"""
+        names: List[str] = []
+        for attr in ("title", "en_title", "original_title", "hk_title", "tw_title",
+                     "sg_title", "original_name"):
+            value = getattr(media, attr, None)
+            if value:
+                names.append(str(value))
+        for value in (getattr(media, "names", None) or []):
+            if value:
+                names.append(str(value))
+        return names
+
+    @classmethod
+    def _media_name_matches(cls, parsed_name: str, media: Any) -> bool:
+        """判断解析名称与 TMDB 结果是否指向同一部作品。
+
+        智能助手兜底时 LLM 可能给出与资源无关的 TMDB ID（实测把「青之箱」判成
+        「华氏风云」258780），一旦写入识别成功缓存，该标题后续所有报文都会持续
+        命中错误媒体。这里用「解析名称必须与 TMDB 标题/原名/别名之一互相包含」
+        做兜底校验：无解析名称时不做限制，避免影响正常识别。
+        """
+        target = cls._normalize_media_name(parsed_name)
+        if not target:
+            return True
+        for candidate in cls._media_name_candidates(media):
+            normalized = cls._normalize_media_name(candidate)
+            if not normalized:
+                continue
+            if target in normalized or normalized in target:
+                return True
+        return False
+
     def _save_api_success_cache(self, key: str, name: str, media: MediaInfo) -> None:
-        """保存一次识别成功结果到独立正缓存，超过 100 条时覆盖最早记录。"""
+        """保存一次识别成功结果到独立正缓存，超过 100 条时覆盖最早记录。
+
+        写入前做名称一致性校验：解析名称与 TMDB 结果完全对不上时拒绝写入，
+        避免错误识别结果被缓存后长期污染同一标题的所有报文。
+        """
         if not key or not media or not media.tmdb_id:
+            return
+        if not self._media_name_matches(name, media):
+            logger.warning(f"SC-RSS 拒绝写入识别成功缓存（名称不一致）: {name} -> "
+                           f"TMDB={media.tmdb_id} 《{media.title}》")
             return
         entry = {
             "key": key,
@@ -5921,13 +6065,23 @@ class SpaceCleaner(_PluginBase):
                 meta.begin_episode = int(episode)
             if getattr(meta, "begin_season", None) is None:
                 meta.begin_season = int(season)
+        # 名称一致性校验：LLM 可能给出与资源无关的 TMDB ID（实测把「青之箱」判成
+        # 「华氏风云」258780），此时既不能写识别词，也不能写识别成功缓存，否则
+        # 该标题后续所有报文都会持续命中错误媒体。
+        parsed_name = getattr(meta, "name", "") or title
+        if not self._media_name_matches(parsed_name, media):
+            self._rss_log("智能助手结果不采用", rt,
+                          f"《{media.title}》(TMDB={media.tmdb_id}) 与解析名称「{parsed_name}」不一致")
+            if key:
+                self._rss_ai_failed[key] = "结果与解析名称不一致"
+            return None, None, ""
         # 只有 TMDB 已确认媒体、季集也通过后续校验后才提交全局识别词。
         word_saved = ""
         if word_pending and self._rss_ai_save_word(word_pending):
             word_saved = word_pending
         self._drop_api_negative_cache_by_title(rt)
         try:
-            self._save_api_success_cache(self._api_recognize_cache_key(meta), getattr(meta, "name", "") or title, media)
+            self._save_api_success_cache(self._api_recognize_cache_key(meta), parsed_name, media)
         except Exception:
             pass
         se_text = f"S{int(meta.begin_season or 1):02d}E{int(meta.begin_episode):02d}" if is_tv else "电影"
